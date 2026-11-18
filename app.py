@@ -1,6 +1,8 @@
 import glob
+import inspect
 import io
 import os
+import re
 import tempfile
 import numpy as np
 import pandas as pd
@@ -40,25 +42,43 @@ st.markdown(
 
 
 # -----------------------------------------------------------------------------
-# CONEXION CON GOOGLE DRIVE (CARPETA COMPARTIDA)
+# CONEXION CON GOOGLE DRIVE (PERSISTENTE PARA TODOS LOS USUARIOS)
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=3600, show_spinner="Descargando archivos actualizados desde Google Drive...")
+def _extract_folder_id(url: str) -> str:
+    m = re.search(r"/folders/([a-zA-Z0-9_-]+)", url or "")
+    return m.group(1) if m else ""
+
+
+@st.cache_data(ttl=1800, show_spinner="Sincronizando reportes desde Google Drive...")
 def fetch_from_drive_folder(folder_url: str):
     if not HAS_GDOWN:
         raise RuntimeError("La librería 'gdown' no está instalada en el entorno.")
     if not folder_url or "drive.google.com" not in folder_url:
         raise ValueError("Ingresá un enlace válido de carpeta compartida de Google Drive.")
 
+    folder_id = _extract_folder_id(folder_url.strip())
+    clean_url = (
+        f"https://drive.google.com/drive/folders/{folder_id}"
+        if folder_id
+        else folder_url.strip()
+    )
+
     with tempfile.TemporaryDirectory() as tmpdir:
-        gdown.download_folder(
-            url=folder_url.strip(),
-            output=tmpdir,
-            quiet=True,
-            use_cookies=False,
-            remaining_ok=True,
-        )
+        sig = inspect.signature(gdown.download_folder)
+        kwargs = {
+            "url": clean_url,
+            "output": tmpdir,
+            "quiet": True,
+        }
+        if "use_cookies" in sig.parameters:
+            kwargs["use_cookies"] = False
+
+        gdown.download_folder(**kwargs)
+
         all_xlsx = glob.glob(os.path.join(tmpdir, "**", "*.xlsx"), recursive=True)
-        amrepa_files = sorted([f for f in all_xlsx if "amrepa" in os.path.basename(f).lower()])
+        amrepa_files = sorted(
+            [f for f in all_xlsx if "amrepa" in os.path.basename(f).lower()]
+        )
         unigis_files = sorted(
             [
                 f
@@ -72,8 +92,8 @@ def fetch_from_drive_folder(folder_url: str):
         if not amrepa_files or not unigis_files:
             found_names = [os.path.basename(f) for f in all_xlsx]
             raise FileNotFoundError(
-                f"No se encontraron ambos archivos en la carpeta de Drive. "
-                f"Archivos detectados: {found_names if found_names else 'ninguno (verificá que la carpeta sea pública con el enlace)'}."
+                f"No se encontraron ambos archivos Excel en la carpeta de Drive. "
+                f"Detectados: {found_names if found_names else 'ninguno (verificá que la carpeta tenga permiso Cualquier persona con el enlace - Lector)'}."
             )
 
         with open(amrepa_files[-1], "rb") as fa:
@@ -81,7 +101,12 @@ def fetch_from_drive_folder(folder_url: str):
         with open(unigis_files[-1], "rb") as fu:
             u_bytes = fu.read()
 
-        return a_bytes, u_bytes, os.path.basename(amrepa_files[-1]), os.path.basename(unigis_files[-1])
+        return (
+            a_bytes,
+            u_bytes,
+            os.path.basename(amrepa_files[-1]),
+            os.path.basename(unigis_files[-1]),
+        )
 
 
 # -----------------------------------------------------------------------------
@@ -304,8 +329,25 @@ def build_audit_excel(df_gap, df_store_diff, df_dup, df_inv) -> bytes:
 
 
 # -----------------------------------------------------------------------------
-# SIDEBAR: FUENTES DE DATOS (GOOGLE DRIVE O SUBIDA MANUAL)
+# SIDEBAR: FUENTES DE DATOS (GITHUB DATA/, GOOGLE DRIVE O SUBIDA MANUAL)
 # -----------------------------------------------------------------------------
+def find_repo_excel_files():
+    candidates = glob.glob("data/*.xlsx") + glob.glob("*.xlsx")
+    amrepa_f = sorted([f for f in candidates if "amrepa" in os.path.basename(f).lower()])
+    unigis_f = sorted(
+        [
+            f
+            for f in candidates
+            if "seguimiento" in os.path.basename(f).lower()
+            or "unigis" in os.path.basename(f).lower()
+            or "supply" in os.path.basename(f).lower()
+        ]
+    )
+    if amrepa_f and unigis_f:
+        return amrepa_f[-1], unigis_f[-1]
+    return None, None
+
+
 st.sidebar.title("📂 Fuentes de Datos")
 
 default_drive_url = ""
@@ -314,22 +356,43 @@ try:
 except Exception:
     default_drive_url = ""
 
+repo_a, repo_u = find_repo_excel_files()
+has_repo_files = repo_a is not None and repo_u is not None
+
+opciones_fuente = ["📦 Base Persistente (GitHub)", "☁️ Carpeta Google Drive", "📤 Subir archivos manual"]
+default_idx = 0 if has_repo_files else (1 if default_drive_url else 0)
+
 modo_carga = st.sidebar.radio(
     "Origen de los reportes:",
-    options=["☁️ Carpeta Google Drive", "📤 Subir archivos manual"],
-    index=0 if default_drive_url else 1,
+    options=opciones_fuente,
+    index=default_idx,
 )
 
 amrepa_bytes = None
 unigis_bytes = None
 fuente_label = ""
 
-if modo_carga == "☁️ Carpeta Google Drive":
+if modo_carga == "📦 Base Persistente (GitHub)":
+    if has_repo_files:
+        with open(repo_a, "rb") as fa:
+            amrepa_bytes = fa.read()
+        with open(repo_u, "rb") as fu:
+            unigis_bytes = fu.read()
+        name_a = os.path.basename(repo_a)
+        name_u = os.path.basename(repo_u)
+        fuente_label = f"Base Persistente (`{name_a}` + `{name_u}`)"
+        st.sidebar.success(f"Activo: {name_a} | {name_u}")
+    else:
+        st.sidebar.warning(
+            "Aún no hay archivos Excel en la carpeta `data/` de tu repositorio de GitHub."
+        )
+
+elif modo_carga == "☁️ Carpeta Google Drive":
     drive_url = st.sidebar.text_input(
         "Link de carpeta compartida en Drive:",
         value=default_drive_url,
         placeholder="https://drive.google.com/drive/folders/...",
-        help="La carpeta debe tener acceso 'Cualquier persona con el enlace (Lector)' y contener los Excel de AMREPA y Seguimiento Detalle.",
+        help="Debe ser una carpeta con acceso 'Cualquier persona con el enlace (Lector)'.",
     )
     if st.sidebar.button("🔄 Actualizar desde Drive"):
         fetch_from_drive_folder.clear()
@@ -342,36 +405,24 @@ if modo_carga == "☁️ Carpeta Google Drive":
             st.sidebar.success(f"Sincronizado: {name_a} | {name_u}")
         except Exception as e:
             st.sidebar.error(f"Error al leer Drive: {e}")
+    else:
+        st.sidebar.warning("Pegá el link de tu carpeta pública de Google Drive.")
+
 else:
     up_amrepa = st.sidebar.file_uploader("1. Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
     up_unigis = st.sidebar.file_uploader("2. Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
 
-    if up_amrepa is not None:
+    if up_amrepa is not None and up_unigis is not None:
         amrepa_bytes = up_amrepa.getvalue()
-        name_a = up_amrepa.name
-    elif os.path.exists("AMREPA.xlsx"):
-        with open("AMREPA.xlsx", "rb") as f:
-            amrepa_bytes = f.read()
-        name_a = "AMREPA.xlsx"
-
-    if up_unigis is not None:
         unigis_bytes = up_unigis.getvalue()
-        name_u = up_unigis.name
-    else:
-        local_unigis = sorted(glob.glob("Supply - Reporte Seguimiento Detalle*.xlsx"))
-        if local_unigis:
-            with open(local_unigis[0], "rb") as f:
-                unigis_bytes = f.read()
-            name_u = os.path.basename(local_unigis[0])
-
-    if amrepa_bytes and unigis_bytes:
-        fuente_label = f"Archivos cargados (`{name_a}` + `{name_u}`)"
+        fuente_label = f"Carga temporal (`{up_amrepa.name}` + `{up_unigis.name}`)"
 
 if amrepa_bytes is None or unigis_bytes is None:
     st.title("🚚 Torre de Control de Transporte — Retail")
     st.info(
-        "👈 Seleccioná el origen en el panel izquierdo: pegá el **link de tu carpeta de Google Drive** "
-        "(con los Excel de AMREPA y UNIGIS adentro) o **subí los archivos manualmente** para comenzar."
+        "👈 Pegá el **link de tu carpeta compartida de Google Drive** en el panel izquierdo. "
+        "Si además lo guardás en **Settings → Secrets** de Streamlit Cloud como `DRIVE_FOLDER_URL`, "
+        "los datos quedarán cargados automáticamente para cualquier persona que abra esta web."
     )
     st.stop()
 
