@@ -659,12 +659,53 @@ with tab1:
         )
 
     df_time = df_filt[df_filt["_merge"].isin(["both", "left_only"])].copy()
+    df_time["Semana_Sort"] = df_time["Fecha_Base"].dt.to_period("W").apply(lambda p: p.start_time)
+    df_time["Semana_Label"] = "Sem " + df_time["Semana_Sort"].dt.strftime("%d/%m")
+
+    # Drill-down inteligente cuando se elige vista por Dia
+    if gran_tiempo == "Día" and not df_time.empty:
+        semanas_disp = (
+            df_time[["Semana_Sort", "Semana_Label"]]
+            .drop_duplicates()
+            .sort_values("Semana_Sort")["Semana_Label"]
+            .tolist()
+        )
+        default_sems = semanas_disp[-2:] if len(semanas_disp) >= 2 else semanas_disp
+
+        d_col1, d_col2 = st.columns([2, 1])
+        with d_col1:
+            sems_elegidas = st.multiselect(
+                "Drill-down — Seleccioná semana(s) para abrir por día (por defecto últimas 2):",
+                options=semanas_disp,
+                default=default_sems,
+                placeholder="Todas las semanas",
+            )
+        with d_col2:
+            st.write("")
+            excluir_guardias = st.checkbox(
+                "Ocultar domingos/feriados (<30 viajes)",
+                value=False,
+                help="Evita caídas visuales artificiales en días de guardia con muy pocos despachos.",
+            )
+
+        if sems_elegidas:
+            df_time = df_time[df_time["Semana_Label"].isin(sems_elegidas)].copy()
+
+        if excluir_guardias and not df_time.empty:
+            day_vols = df_time.groupby(df_time["Fecha_Base"].dt.floor("D"))["Ref_Clean"].transform("count")
+            df_time = df_time[day_vols >= 30].copy()
+
+    dias_es = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
     if gran_tiempo == "Día":
         df_time["Periodo_Sort"] = df_time["Fecha_Base"].dt.floor("D")
-        df_time["Periodo"] = df_time["Periodo_Sort"].dt.strftime("%d/%m/%Y")
+        df_time["Periodo"] = (
+            df_time["Periodo_Sort"].dt.dayofweek.map(dias_es)
+            + " "
+            + df_time["Periodo_Sort"].dt.strftime("%d/%m")
+        )
     elif gran_tiempo == "Semana":
-        df_time["Periodo_Sort"] = df_time["Fecha_Base"].dt.to_period("W").apply(lambda p: p.start_time)
-        df_time["Periodo"] = "Sem " + df_time["Periodo_Sort"].dt.strftime("%d/%m")
+        df_time["Periodo_Sort"] = df_time["Semana_Sort"]
+        df_time["Periodo"] = df_time["Semana_Label"]
     else:
         df_time["Periodo_Sort"] = df_time["Fecha_Base"].dt.to_period("M").apply(lambda p: p.start_time)
         df_time["Periodo"] = df_time["Periodo_Sort"].dt.strftime("%Y-%m")
@@ -686,6 +727,9 @@ with tab1:
             (agg_t["Match"] / agg_t["Viajes_WMS"] * 100).round(2),
             0.0,
         )
+
+        n_pts = len(agg_t)
+        show_text_labels = n_pts <= 16
 
         fig = make_subplots(specs=[[{"secondary_y": True}]])
         fig.add_trace(
@@ -713,11 +757,11 @@ with tab1:
                 x=agg_t["Periodo"],
                 y=agg_t["Pct_Cobertura"],
                 name="% Cobertura TMS",
-                mode="lines+markers+text",
-                text=[f"{v:.1f}%" for v in agg_t["Pct_Cobertura"]],
+                mode="lines+markers+text" if show_text_labels else "lines+markers",
+                text=[f"{v:.1f}%" for v in agg_t["Pct_Cobertura"]] if show_text_labels else None,
                 textposition="top center",
                 line=dict(color="#2ca02c", width=3),
-                marker=dict(size=8),
+                marker=dict(size=8 if show_text_labels else 6),
                 hovertemplate="<b>%{x}</b><br>Cobertura: %{y:.2f}%<extra></extra>",
             ),
             secondary_y=True,
@@ -728,19 +772,30 @@ with tab1:
             line_dash="dot",
             line_color="gray",
             annotation_text="Objetivo 98%",
+            annotation_position="bottom right",
             secondary_y=True,
         )
 
         fig.update_layout(
             barmode="stack",
-            height=430,
-            margin=dict(l=20, r=20, t=30, b=20),
+            height=450 if gran_tiempo == "Día" else 420,
+            margin=dict(l=20, r=20, t=35, b=20),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             hovermode="x unified",
+            xaxis=dict(
+                rangeslider=dict(visible=(gran_tiempo == "Día" and n_pts > 14), thickness=0.06),
+                tickangle=-35 if n_pts > 14 else 0,
+            ),
         )
         fig.update_yaxes(title_text="Cantidad de Viajes", secondary_y=False)
-        fig.update_yaxes(title_text="% Cobertura TMS", range=[0, 112], secondary_y=True)
-        st.plotly_chart(fig)
+        fig.update_yaxes(
+            title_text="% Cobertura TMS",
+            range=[0, 112],
+            dtick=20,
+            showgrid=False,
+            secondary_y=True,
+        )
+        st.plotly_chart(fig, use_container_width=True)
 
     else:
         agg_op_t = (
@@ -777,6 +832,7 @@ with tab1:
             index=ordered_ops, columns=ordered_periods
         )
 
+        show_cell_text = len(ordered_periods) <= 22
         text_matrix = np.where(
             piv_pct.notna(),
             piv_pct.map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
@@ -789,8 +845,11 @@ with tab1:
                 z=piv_pct.values,
                 x=ordered_periods,
                 y=ordered_ops,
-                text=text_matrix,
-                texttemplate="%{text}",
+                text=text_matrix if show_cell_text else None,
+                texttemplate="%{text}" if show_cell_text else None,
+                textfont=dict(size=11),
+                xgap=2,
+                ygap=2,
                 colorscale="RdYlGn",
                 zmin=40,
                 zmax=100,
@@ -805,12 +864,13 @@ with tab1:
             )
         )
         fig_hm.update_layout(
-            height=380,
+            height=390,
             margin=dict(l=20, r=20, t=30, b=20),
             xaxis_title=f"Período ({gran_tiempo})",
             yaxis_title="Almacén / Operación",
+            xaxis=dict(tickangle=-35 if len(ordered_periods) > 14 else 0),
         )
-        st.plotly_chart(fig_hm)
+        st.plotly_chart(fig_hm, use_container_width=True)
 
     st.divider()
 
