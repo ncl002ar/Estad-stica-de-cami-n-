@@ -577,38 +577,82 @@ with tab1:
     cant_dup_refs = int(dup_filt["Ref_Clean"].nunique())
     cant_inv_trips = int(inv_filt["Id Viaje"].nunique())
 
-    c1, c2, c3, c4, c5, c6 = st.columns(6)
-    c1.metric("Viajes WMS", f"{viajes_wms:,}".replace(",", "."))
-    c2.metric("Viajes TMS", f"{viajes_tms:,}".replace(",", "."))
-    c3.metric(
-        "% Cob. Viajes",
-        f"{pct_cob_viajes:.2f}%",
-        delta=f"-{viajes_gap:,} sin TMS".replace(",", "."),
-        delta_color="inverse" if viajes_gap > 0 else "off",
-    )
-    c4.metric(
-        "% Cob. Tiendas Global",
-        f"{pct_cob_tiendas_global:.2f}%",
-        delta=f"-{tiendas_faltan_total:,} sin TMS".replace(",", "."),
-        delta_color="inverse" if tiendas_faltan_total > 0 else "off",
-    )
-    c5.metric(
-        "% Cob. Tiendas Match",
-        f"{pct_cob_tiendas_match:.2f}%",
-        delta=f"-{tiendas_faltan_viaje:,} viaje | -{tiendas_faltan_match:,} parada".replace(",", "."),
-        delta_color="off",
-    )
-    c6.metric(
-        "Alertas TMS",
-        f"{cant_dup_refs + cant_inv_trips}",
-        delta=f"{cant_dup_refs} dup | {cant_inv_trips} inv.",
-        delta_color="off",
-    )
+    def _fmt_int(val: int) -> str:
+        return f"{val:,}".replace(",", ".")
+
+    def _fmt_pct(val: float) -> str:
+        return f"{val:.2f}%".replace(".", ",")
+
+    def _kpi_card_html(title: str, value: str, line1: str, line1_color: str = "#475569", line2: str = "") -> str:
+        line2_html = (
+            f'<div style="font-size:12px; color:#64748b; margin-top:2px; line-height:1.3;">{line2}</div>'
+            if line2
+            else ""
+        )
+        return f"""
+        <div style="background-color:#f8f9fb; border:1px solid #e2e8f0; border-radius:10px; padding:14px 16px; height:100%;">
+            <div style="font-size:12.5px; font-weight:600; color:#475569; margin-bottom:4px;">{title}</div>
+            <div style="font-size:28px; font-weight:700; color:#0f172a; line-height:1.15; margin-bottom:6px;">{value}</div>
+            <div style="font-size:12.5px; font-weight:600; color:{line1_color}; line-height:1.3;">{line1}</div>
+            {line2_html}
+        </div>
+        """
+
+    c1, c2, c3, c4, c5 = st.columns([1, 1, 1.15, 1.45, 1.05])
+    with c1:
+        st.markdown(
+            _kpi_card_html(
+                "Viajes Despachados (WMS)",
+                _fmt_int(viajes_wms),
+                "Base AMREPA",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c2:
+        st.markdown(
+            _kpi_card_html(
+                "Viajes Válidos (TMS)",
+                _fmt_int(viajes_tms),
+                f"{_fmt_int(viajes_match)} matcheados",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c3:
+        st.markdown(
+            _kpi_card_html(
+                "% Cobertura Viajes",
+                _fmt_pct(pct_cob_viajes),
+                f"Faltan {_fmt_int(viajes_gap)} viajes en TMS",
+                "#dc2626" if viajes_gap > 0 else "#16a34a",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c4:
+        st.markdown(
+            _kpi_card_html(
+                "% Cobertura Tiendas",
+                _fmt_pct(pct_cob_tiendas_global),
+                f"Faltan {_fmt_int(tiendas_faltan_total)} tiendas en TMS:",
+                "#dc2626" if tiendas_faltan_total > 0 else "#16a34a",
+                f"• <b>{_fmt_int(tiendas_faltan_viaje)}</b> por viaje caído &nbsp;|&nbsp; <b>{_fmt_int(tiendas_faltan_match)}</b> en viaje activo",
+            ),
+            unsafe_allow_html=True,
+        )
+    with c5:
+        st.markdown(
+            _kpi_card_html(
+                "Alertas Integridad TMS",
+                _fmt_int(cant_dup_refs + cant_inv_trips),
+                f"{cant_dup_refs} duplicadas | {cant_inv_trips} inválidas",
+                "#d97706" if (cant_dup_refs + cant_inv_trips) > 0 else "#475569",
+            ),
+            unsafe_allow_html=True,
+        )
 
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE A: TABLA RESUMEN POR OPERACION (OPCION B: GLOBAL + EN VIAJE MATCH)
+    # BLOQUE A: TABLA RESUMEN POR OPERACION (ALINEADA CON TARJETA UNIFICADA)
     # -------------------------------------------------------------------------
     st.markdown("### 1. Resumen por Operación (Centro de Distribución)")
 
@@ -629,10 +673,7 @@ with tab1:
         t_ambos = int(sub_m["Tiendas_Match"].sum())
         t_faltan_v = int(sub_g["Tiendas_WMS"].sum())
         t_faltan_m = int(sub_m["Cant_Tiendas_Faltan_TMS"].sum())
-        t_wms_m = int(sub_m["Tiendas_WMS"].sum())
-
         cob_t_glob = (t_ambos / t_wms_tot * 100) if t_wms_tot > 0 else 0.0
-        cob_t_match = (t_ambos / t_wms_m * 100) if t_wms_m > 0 else 0.0
 
         rows_op.append(
             {
@@ -645,9 +686,8 @@ with tab1:
                 "Tiendas WMS": t_wms_tot,
                 "En TMS": t_ambos,
                 "Faltan x Viaje": t_faltan_v,
-                "Faltan en Match": t_faltan_m,
-                "% Cob. Global": round(cob_t_glob, 2),
-                "% Cob. Match": round(cob_t_match, 2),
+                "Faltan x Parada": t_faltan_m,
+                "% Cob. Tiendas": round(cob_t_glob, 2),
             }
         )
 
@@ -665,9 +705,8 @@ with tab1:
                     "Tiendas WMS": df_resumen_op["Tiendas WMS"].sum(),
                     "En TMS": df_resumen_op["En TMS"].sum(),
                     "Faltan x Viaje": df_resumen_op["Faltan x Viaje"].sum(),
-                    "Faltan en Match": df_resumen_op["Faltan en Match"].sum(),
-                    "% Cob. Global": round(pct_cob_tiendas_global, 2),
-                    "% Cob. Match": round(pct_cob_tiendas_match, 2),
+                    "Faltan x Parada": df_resumen_op["Faltan x Parada"].sum(),
+                    "% Cob. Tiendas": round(pct_cob_tiendas_global, 2),
                 }
             ]
         )
@@ -693,16 +732,9 @@ with tab1:
                 "Tiendas WMS": st.column_config.NumberColumn("Tiendas WMS", format="%d", width="small"),
                 "En TMS": st.column_config.NumberColumn("En TMS", format="%d", width="small"),
                 "Faltan x Viaje": st.column_config.NumberColumn("Faltan x Viaje", format="%d", width="small"),
-                "Faltan en Match": st.column_config.NumberColumn("Faltan en Match", format="%d", width="small"),
-                "% Cob. Global": st.column_config.ProgressColumn(
-                    "% Cob. Global",
-                    format="%.1f%%",
-                    min_value=0,
-                    max_value=100,
-                    width="small",
-                ),
-                "% Cob. Match": st.column_config.ProgressColumn(
-                    "% Cob. Match",
+                "Faltan x Parada": st.column_config.NumberColumn("Faltan x Parada", format="%d", width="small"),
+                "% Cob. Tiendas": st.column_config.ProgressColumn(
+                    "% Cob. Tiendas",
                     format="%.1f%%",
                     min_value=0,
                     max_value=100,
