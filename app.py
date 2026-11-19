@@ -341,10 +341,77 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         .sort_values(["Operacion", "Fecha_Reparto", "Id Viaje"])
     )
 
+    # 5. Tabla maestra a nivel Parada en Tienda para Solapa 2 (Visitas GPS y Geocercas)
+    a_trans_map = (
+        df_a.groupby(["Operacion", "Ref_Clean"], as_index=False)
+        .agg(Transportista=("Transportista", lambda s: " / ".join(sorted(s.unique()))))
+    )
+
+    stores_gps = u_stores_only.copy()
+    stores_gps = stores_gps.merge(a_trans_map, on=["Operacion", "Ref_Clean"], how="left")
+    stores_gps["Transportista"] = stores_gps["Transportista"].fillna("Sin dato WMS")
+    stores_gps["Dominio"] = stores_gps["Dominio"].fillna("Sin dominio").astype(str).str.strip()
+    stores_gps["Interno"] = stores_gps["Interno"].fillna("S/D").astype(str).str.strip()
+    stores_gps["Tipo de Camion"] = stores_gps["Tipo de Camion"].fillna("Sin dato").astype(str).str.strip()
+
+    stores_gps["Mes_Label"] = stores_gps["Fecha_Reparto"].dt.strftime("%Y-%m").fillna("Sin fecha")
+    stores_gps["Semana_Sort"] = stores_gps["Fecha_Reparto"].dt.to_period("W").apply(
+        lambda p: p.start_time if pd.notna(p) else pd.NaT
+    )
+    stores_gps["Semana_Label"] = np.where(
+        stores_gps["Semana_Sort"].notna(),
+        "Sem " + stores_gps["Semana_Sort"].dt.strftime("%d/%m"),
+        "Sin semana",
+    )
+
+    # Cantidad de tiendas efectivamente visitadas dentro del mismo Id Viaje
+    stores_gps["Visitadas_En_IdViaje"] = stores_gps.groupby("Id Viaje")["Observacion"].transform(
+        lambda s: int(s.isna().sum())
+    )
+
+    conds_gps = [
+        stores_gps["Observacion"].isna(),
+        stores_gps["Tipo de Zona"] == "Sin zona",
+        (stores_gps["Observacion"] == "No visitada") & (stores_gps["Visitadas_En_IdViaje"] == 0),
+        (stores_gps["Observacion"] == "No visitada") & (stores_gps["Visitadas_En_IdViaje"] > 0),
+    ]
+    choices_gps = [
+        "Visitada (OK)",
+        "Sin coordenadas",
+        "Viaje Ciego (GPS/Unidad)",
+        "Falla Geocerca (Parcial)",
+    ]
+    stores_gps["Diagnostico_GPS"] = np.select(conds_gps, choices_gps, default="Otro")
+
+    keep_store_cols = [
+        "Operacion",
+        "Fecha_Reparto",
+        "Hora Reparto",
+        "Mes_Label",
+        "Semana_Sort",
+        "Semana_Label",
+        "Id Viaje",
+        "Ref_Clean",
+        "Transportista",
+        "Dominio",
+        "Interno",
+        "Tipo de Camion",
+        "Tienda_Cod",
+        "Tipo de Zona",
+        "Categoria",
+        "Tiempo de Estadia",
+        "Cantidad Visitas",
+        "Observacion",
+        "Visitadas_En_IdViaje",
+        "Diagnostico_GPS",
+    ]
+    stores_gps = stores_gps[keep_store_cols].copy()
+
     return {
         "master_trips": master_trips,
         "dup_detail": dup_detail,
         "invalid_detail": invalid_detail,
+        "stores_gps": stores_gps,
     }
 
 
@@ -356,6 +423,16 @@ def build_audit_excel(df_gap, df_solo_tms, df_store_diff, df_dup, df_inv) -> byt
         df_store_diff.to_excel(writer, sheet_name="3_Diferencias_Tiendas", index=False)
         df_dup.to_excel(writer, sheet_name="4_Alerta_Ref_Duplicadas", index=False)
         df_inv.to_excel(writer, sheet_name="5_Alerta_Ref_Invalidas", index=False)
+    return output.getvalue()
+
+
+def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_geo.to_excel(writer, sheet_name="1_Tiendas_Geocerca", index=False)
+        df_fleet.to_excel(writer, sheet_name="2_Unidades_Viajes_Ciegos", index=False)
+        df_sin_coord.to_excel(writer, sheet_name="3_Tiendas_Sin_Coordenadas", index=False)
+        df_raw_fails.to_excel(writer, sheet_name="4_Detalle_Paradas_Sin_GPS", index=False)
     return output.getvalue()
 
 
@@ -410,6 +487,7 @@ data = load_and_process_data(amrepa_bytes, unigis_bytes)
 master = data["master_trips"].copy()
 dup_detail = data["dup_detail"].copy()
 invalid_detail = data["invalid_detail"].copy()
+stores_gps = data["stores_gps"].copy()
 
 # -----------------------------------------------------------------------------
 # SIDEBAR: FILTROS GLOBALES ARRIBA (ACTUALIZAN TODAS LAS TABLAS Y GRAFICOS)
@@ -510,6 +588,20 @@ if selected_weeks:
 
 dup_filt = dup_detail[mask_dup].copy()
 inv_filt = invalid_detail[mask_inv].copy()
+
+mask_gps = (
+    (stores_gps["Fecha_Reparto"] >= d_start)
+    & (stores_gps["Fecha_Reparto"] <= d_end)
+    & (stores_gps["Operacion"].isin(selected_ops))
+)
+if selected_months:
+    mask_gps = mask_gps & (stores_gps["Mes_Label"].isin(selected_months))
+if selected_weeks:
+    mask_gps = mask_gps & (stores_gps["Semana_Label"].isin(selected_weeks))
+if selected_trans:
+    mask_gps = mask_gps & (stores_gps["Transportista"].isin(selected_trans))
+
+gps_filt = stores_gps[mask_gps].copy()
 
 # Seccion colapsada al final del sidebar para carga manual / info de base
 st.sidebar.divider()
@@ -1192,11 +1284,756 @@ with tab1:
 # PLACEHOLDERS PARA PROXIMAS SOLAPAS
 # =============================================================================
 with tab2:
-    st.info(
-        "🚧 **Próximo paso (Solapa 2):** Auditoría de Visitas GPS y Geocercas — "
-        "Análisis de tiendas 'No visitada' vs. visitadas, ranking de tiendas con geocerca defectuosa "
-        "y efectividad GPS por transportista y tipo de camión."
+    st.subheader("Auditoría de Visitas GPS y Geocercas (Paradas en Tienda TMS)")
+
+    tot_paradas = len(gps_filt)
+    paradas_ok = int((gps_filt["Diagnostico_GPS"] == "Visitada (OK)").sum())
+    paradas_ciego = int((gps_filt["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)").sum())
+    paradas_geo = int((gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)").sum())
+    paradas_sin_coord = int((gps_filt["Diagnostico_GPS"] == "Sin coordenadas").sum())
+    paradas_sin_dato = paradas_ciego + paradas_geo + paradas_sin_coord
+
+    viajes_gps_tot = int(gps_filt["Id Viaje"].nunique())
+    viajes_ciegos_cnt = int(
+        gps_filt[gps_filt["Visitadas_En_IdViaje"] == 0]["Id Viaje"].nunique()
     )
+
+    pct_efec_gps = (paradas_ok / tot_paradas * 100) if tot_paradas > 0 else 0.0
+    pct_ciego = (paradas_ciego / tot_paradas * 100) if tot_paradas > 0 else 0.0
+    pct_geo = (paradas_geo / tot_paradas * 100) if tot_paradas > 0 else 0.0
+    pct_sin_coord = (paradas_sin_coord / tot_paradas * 100) if tot_paradas > 0 else 0.0
+
+    g1, g2, g3, g4, g5 = st.columns([1.05, 1.15, 1.25, 1.25, 1.0])
+    with g1:
+        st.markdown(
+            _kpi_card_html(
+                "Paradas Planificadas",
+                _fmt_int(tot_paradas),
+                f"En {_fmt_int(viajes_gps_tot)} viajes TMS",
+            ),
+            unsafe_allow_html=True,
+        )
+    with g2:
+        st.markdown(
+            _kpi_card_html(
+                "% Efectividad GPS",
+                _fmt_pct(pct_efec_gps),
+                f"{_fmt_int(paradas_ok)} visitas con estadía OK",
+                "#16a34a" if pct_efec_gps >= 90 else "#d97706",
+                f"Sin dato GPS: <b>{_fmt_int(paradas_sin_dato)}</b> paradas",
+            ),
+            unsafe_allow_html=True,
+        )
+    with g3:
+        st.markdown(
+            _kpi_card_html(
+                "Falla GPS / Unidad (Viaje Ciego)",
+                _fmt_int(paradas_ciego),
+                f"{_fmt_pct(pct_ciego)} del total de paradas",
+                "#dc2626" if paradas_ciego > 0 else "#16a34a",
+                f"En <b>{_fmt_int(viajes_ciegos_cnt)}</b> viajes con 0% señal GPS",
+            ),
+            unsafe_allow_html=True,
+        )
+    with g4:
+        st.markdown(
+            _kpi_card_html(
+                "Falla Geocerca (Parcial)",
+                _fmt_int(paradas_geo),
+                f"{_fmt_pct(pct_geo)} del total de paradas",
+                "#d97706" if paradas_geo > 0 else "#16a34a",
+                "Camión reportó en otras tiendas del viaje",
+            ),
+            unsafe_allow_html=True,
+        )
+    with g5:
+        st.markdown(
+            _kpi_card_html(
+                "Sin Coordenadas",
+                _fmt_int(paradas_sin_coord),
+                f"{_fmt_pct(pct_sin_coord)} del total",
+                "#64748b",
+                f"{gps_filt[gps_filt['Diagnostico_GPS'] == 'Sin coordenadas']['Tienda_Cod'].nunique()} tiendas sin lat/long",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 1: EFECTIVIDAD GPS POR OPERACION (CD)
+    # -------------------------------------------------------------------------
+    st.markdown("### 1. Efectividad GPS y Diagnóstico de Fallas por Operación (CD)")
+
+    rows_gps_op = []
+    for op in sorted(gps_filt["Operacion"].dropna().unique()):
+        sub = gps_filt[gps_filt["Operacion"] == op]
+        v_tot = int(sub["Id Viaje"].nunique())
+        v_ciegos = int(sub[sub["Visitadas_En_IdViaje"] == 0]["Id Viaje"].nunique())
+        p_tot = len(sub)
+        p_ok = int((sub["Diagnostico_GPS"] == "Visitada (OK)").sum())
+        p_ciego = int((sub["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)").sum())
+        p_geo = int((sub["Diagnostico_GPS"] == "Falla Geocerca (Parcial)").sum())
+        p_sc = int((sub["Diagnostico_GPS"] == "Sin coordenadas").sum())
+        efec = (p_ok / p_tot * 100) if p_tot > 0 else 0.0
+
+        rows_gps_op.append(
+            {
+                "CD": str(int(op)),
+                "Viajes TMS": v_tot,
+                "Viajes Ciegos": v_ciegos,
+                "Paradas Plan.": p_tot,
+                "Visitadas OK": p_ok,
+                "Falla GPS (Ciego)": p_ciego,
+                "Falla Geocerca": p_geo,
+                "Sin Coord.": p_sc,
+                "% Efectividad GPS": round(efec, 2),
+            }
+        )
+
+    df_gps_op = pd.DataFrame(rows_gps_op)
+    if not df_gps_op.empty:
+        tot_gps_row = pd.DataFrame(
+            [
+                {
+                    "CD": "TOTAL",
+                    "Viajes TMS": df_gps_op["Viajes TMS"].sum(),
+                    "Viajes Ciegos": df_gps_op["Viajes Ciegos"].sum(),
+                    "Paradas Plan.": df_gps_op["Paradas Plan."].sum(),
+                    "Visitadas OK": df_gps_op["Visitadas OK"].sum(),
+                    "Falla GPS (Ciego)": df_gps_op["Falla GPS (Ciego)"].sum(),
+                    "Falla Geocerca": df_gps_op["Falla Geocerca"].sum(),
+                    "Sin Coord.": df_gps_op["Sin Coord."].sum(),
+                    "% Efectividad GPS": round(pct_efec_gps, 2),
+                }
+            ]
+        )
+        df_gps_op_disp = pd.concat([df_gps_op, tot_gps_row], ignore_index=True)
+
+        st.dataframe(
+            df_gps_op_disp,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "CD": st.column_config.TextColumn("CD", width="small"),
+                "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
+                "Viajes Ciegos": st.column_config.NumberColumn("Viajes Ciegos", format="%d", width="small"),
+                "Paradas Plan.": st.column_config.NumberColumn("Paradas Plan.", format="%d", width="small"),
+                "Visitadas OK": st.column_config.NumberColumn("Visitadas OK", format="%d", width="small"),
+                "Falla GPS (Ciego)": st.column_config.NumberColumn("Falla GPS (Ciego)", format="%d", width="small"),
+                "Falla Geocerca": st.column_config.NumberColumn("Falla Geocerca", format="%d", width="small"),
+                "Sin Coord.": st.column_config.NumberColumn("Sin Coord.", format="%d", width="small"),
+                "% Efectividad GPS": st.column_config.ProgressColumn(
+                    "% Efectividad GPS",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="medium",
+                ),
+            },
+        )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 2: EVOLUCION TEMPORAL DE EFECTIVIDAD GPS
+    # -------------------------------------------------------------------------
+    st.markdown("### 2. Evolución Temporal de Efectividad GPS y Fallas")
+
+    gctrl1, gctrl2 = st.columns([1, 1.5])
+    with gctrl1:
+        gran_gps = st.radio(
+            "Agrupar eje temporal por:",
+            options=["Día", "Semana", "Mes"],
+            index=1,
+            horizontal=True,
+            key="gran_gps",
+        )
+    with gctrl2:
+        modo_gps = st.radio(
+            "Modo de visualización:",
+            options=[
+                "Consolidado (Barras por Causa + Línea %)",
+                "Abierto por Almacén (Mapa de Calor %)",
+            ],
+            index=0,
+            horizontal=True,
+            key="modo_gps",
+        )
+
+    df_gps_time = gps_filt.copy()
+
+    if gran_gps == "Día" and not df_gps_time.empty:
+        sems_gps_disp = (
+            df_gps_time[["Semana_Sort", "Semana_Label"]]
+            .drop_duplicates()
+            .sort_values("Semana_Sort")["Semana_Label"]
+            .tolist()
+        )
+        def_sems_gps = sems_gps_disp[-2:] if len(sems_gps_disp) >= 2 else sems_gps_disp
+
+        gd1, gd2 = st.columns([2, 1])
+        with gd1:
+            sems_gps_sel = st.multiselect(
+                "Drill-down — Seleccioná semana(s) para abrir por día (por defecto últimas 2):",
+                options=sems_gps_disp,
+                default=def_sems_gps,
+                placeholder="Todas las semanas",
+                key="sems_gps_sel",
+            )
+        with gd2:
+            st.write("")
+            exc_guardias_gps = st.checkbox(
+                "Ocultar domingos/feriados (<50 paradas)",
+                value=False,
+                key="exc_guardias_gps",
+            )
+
+        if sems_gps_sel:
+            df_gps_time = df_gps_time[df_gps_time["Semana_Label"].isin(sems_gps_sel)].copy()
+        if exc_guardias_gps and not df_gps_time.empty:
+            d_cnts = df_gps_time.groupby(df_gps_time["Fecha_Reparto"].dt.floor("D"))["Id Viaje"].transform("count")
+            df_gps_time = df_gps_time[d_cnts >= 50].copy()
+
+    if gran_gps == "Día":
+        df_gps_time["Periodo_Sort"] = df_gps_time["Fecha_Reparto"].dt.floor("D")
+        df_gps_time["Periodo"] = (
+            df_gps_time["Periodo_Sort"].dt.dayofweek.map(dias_es)
+            + " "
+            + df_gps_time["Periodo_Sort"].dt.strftime("%d/%m")
+        )
+    elif gran_gps == "Semana":
+        df_gps_time["Periodo_Sort"] = df_gps_time["Semana_Sort"]
+        df_gps_time["Periodo"] = df_gps_time["Semana_Label"]
+    else:
+        df_gps_time["Periodo_Sort"] = df_gps_time["Fecha_Reparto"].dt.to_period("M").apply(lambda p: p.start_time)
+        df_gps_time["Periodo"] = df_gps_time["Periodo_Sort"].dt.strftime("%Y-%m")
+
+    if df_gps_time.empty:
+        st.info("No hay paradas registradas en el rango y filtros seleccionados.")
+    elif modo_gps == "Consolidado (Barras por Causa + Línea %)":
+        agg_gt = (
+            df_gps_time.groupby(["Periodo_Sort", "Periodo"], as_index=False)
+            .agg(
+                Total=("Diagnostico_GPS", "count"),
+                OK=("Diagnostico_GPS", lambda s: int((s == "Visitada (OK)").sum())),
+                Geocerca=("Diagnostico_GPS", lambda s: int((s == "Falla Geocerca (Parcial)").sum())),
+                Ciego=("Diagnostico_GPS", lambda s: int((s == "Viaje Ciego (GPS/Unidad)").sum())),
+                SinCoord=("Diagnostico_GPS", lambda s: int((s == "Sin coordenadas").sum())),
+            )
+            .sort_values("Periodo_Sort")
+        )
+        agg_gt["Pct_OK"] = np.where(
+            agg_gt["Total"] > 0,
+            (agg_gt["OK"] / agg_gt["Total"] * 100).round(2),
+            0.0,
+        )
+
+        n_pts_g = len(agg_gt)
+        show_lbl_g = n_pts_g <= 16
+
+        fig_g = make_subplots(specs=[[{"secondary_y": True}]])
+        fig_g.add_trace(
+            go.Bar(
+                x=agg_gt["Periodo"],
+                y=agg_gt["OK"],
+                name="Visitadas OK",
+                marker_color="#1d4ed8",
+                hovertemplate="<b>%{x}</b><br>Visitadas OK: %{y:,}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_g.add_trace(
+            go.Bar(
+                x=agg_gt["Periodo"],
+                y=agg_gt["Geocerca"],
+                name="Falla Geocerca (Parcial)",
+                marker_color="#f59e0b",
+                hovertemplate="<b>%{x}</b><br>Falla Geocerca: %{y:,}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_g.add_trace(
+            go.Bar(
+                x=agg_gt["Periodo"],
+                y=agg_gt["Ciego"],
+                name="Viaje Ciego (GPS/Unidad)",
+                marker_color="#dc2626",
+                hovertemplate="<b>%{x}</b><br>Viaje Ciego: %{y:,}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_g.add_trace(
+            go.Bar(
+                x=agg_gt["Periodo"],
+                y=agg_gt["SinCoord"],
+                name="Sin Coordenadas",
+                marker_color="#64748b",
+                hovertemplate="<b>%{x}</b><br>Sin Coordenadas: %{y:,}<extra></extra>",
+            ),
+            secondary_y=False,
+        )
+        fig_g.add_trace(
+            go.Scatter(
+                x=agg_gt["Periodo"],
+                y=agg_gt["Pct_OK"],
+                name="% Efectividad GPS",
+                mode="lines+markers",
+                line=dict(color="#16a34a", width=3.5),
+                marker=dict(
+                    size=10 if show_lbl_g else 7,
+                    color="#16a34a",
+                    line=dict(width=2, color="#0f172a"),
+                ),
+                hovertemplate="<b>%{x}</b><br>Efectividad GPS: %{y:.2f}%<extra></extra>",
+            ),
+            secondary_y=True,
+        )
+
+        if show_lbl_g:
+            for rt in agg_gt.itertuples(index=False):
+                fig_g.add_annotation(
+                    x=rt.Periodo,
+                    y=rt.Pct_OK,
+                    yref="y2",
+                    text=f"<b>{rt.Pct_OK:.1f}%</b>",
+                    showarrow=False,
+                    yshift=18,
+                    font=dict(color="#0f172a", size=11),
+                    bgcolor="rgba(255, 255, 255, 0.92)",
+                    bordercolor="#16a34a",
+                    borderwidth=1.2,
+                    borderpad=3,
+                )
+
+        fig_g.add_shape(
+            type="line",
+            xref="paper",
+            x0=0,
+            x1=1,
+            yref="y2",
+            y0=95,
+            y1=95,
+            line=dict(color="#334155", width=1.5, dash="dot"),
+        )
+        fig_g.add_annotation(
+            xref="paper",
+            x=0.99,
+            yref="y2",
+            y=95,
+            text="Objetivo 95%",
+            showarrow=False,
+            yshift=-12,
+            xanchor="right",
+            font=dict(color="#334155", size=11),
+            bgcolor="rgba(255, 255, 255, 0.85)",
+        )
+
+        fig_g.update_layout(
+            barmode="stack",
+            height=450 if gran_gps == "Día" else 420,
+            margin=dict(l=20, r=20, t=35, b=20),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="x unified",
+            xaxis=dict(
+                rangeslider=dict(visible=(gran_gps == "Día" and n_pts_g > 14), thickness=0.06),
+                tickangle=-35 if n_pts_g > 14 else 0,
+            ),
+        )
+        fig_g.update_yaxes(title_text="Cantidad de Paradas", secondary_y=False)
+        fig_g.update_yaxes(
+            title_text="% Efectividad GPS",
+            range=[0, 114],
+            dtick=20,
+            showgrid=False,
+            secondary_y=True,
+        )
+        st.plotly_chart(fig_g, use_container_width=True)
+
+    else:
+        agg_gop = (
+            df_gps_time.groupby(["Operacion", "Periodo_Sort", "Periodo"], as_index=False)
+            .agg(
+                Total=("Diagnostico_GPS", "count"),
+                OK=("Diagnostico_GPS", lambda s: int((s == "Visitada (OK)").sum())),
+                Fallas=("Diagnostico_GPS", lambda s: int((s != "Visitada (OK)").sum())),
+            )
+            .sort_values(["Operacion", "Periodo_Sort"])
+        )
+        agg_gop["Pct_OK"] = np.where(
+            agg_gop["Total"] > 0,
+            (agg_gop["OK"] / agg_gop["Total"] * 100).round(1),
+            np.nan,
+        )
+        agg_gop["Operacion_Str"] = "CD " + agg_gop["Operacion"].astype(str)
+
+        ord_per_g = (
+            agg_gop[["Periodo_Sort", "Periodo"]]
+            .drop_duplicates()
+            .sort_values("Periodo_Sort")["Periodo"]
+            .tolist()
+        )
+        ord_ops_g = sorted(agg_gop["Operacion_Str"].unique().tolist())
+
+        piv_g_pct = agg_gop.pivot(index="Operacion_Str", columns="Periodo", values="Pct_OK").reindex(
+            index=ord_ops_g, columns=ord_per_g
+        )
+        piv_g_tot = agg_gop.pivot(index="Operacion_Str", columns="Periodo", values="Total").reindex(
+            index=ord_ops_g, columns=ord_per_g
+        )
+        piv_g_fal = agg_gop.pivot(index="Operacion_Str", columns="Periodo", values="Fallas").reindex(
+            index=ord_ops_g, columns=ord_per_g
+        )
+
+        show_txt_hm_g = len(ord_per_g) <= 22
+        txt_mat_g = np.where(
+            piv_g_pct.notna(),
+            piv_g_pct.map(lambda v: f"{v:.1f}%" if pd.notna(v) else ""),
+            "S/D",
+        )
+        cdata_g = np.dstack([piv_g_tot.fillna(0).values, piv_g_fal.fillna(0).values])
+
+        fig_hm_g = go.Figure(
+            data=go.Heatmap(
+                z=piv_g_pct.values,
+                x=ord_per_g,
+                y=ord_ops_g,
+                text=txt_mat_g if show_txt_hm_g else None,
+                texttemplate="%{text}" if show_txt_hm_g else None,
+                textfont=dict(size=11),
+                xgap=2,
+                ygap=2,
+                colorscale="RdYlGn",
+                zmin=50,
+                zmax=100,
+                customdata=cdata_g,
+                hovertemplate=(
+                    "<b>%{y} — %{x}</b><br>"
+                    "Efectividad GPS: %{z:.1f}%<br>"
+                    "Paradas Plan.: %{customdata[0]:,.0f}<br>"
+                    "Sin Dato GPS: %{customdata[1]:,.0f}<extra></extra>"
+                ),
+                colorbar=dict(title="% GPS"),
+            )
+        )
+        fig_hm_g.update_layout(
+            height=390,
+            margin=dict(l=20, r=20, t=30, b=20),
+            xaxis_title=f"Período ({gran_gps})",
+            yaxis_title="Almacén / Operación",
+            xaxis=dict(tickangle=-35 if len(ord_per_g) > 14 else 0),
+        )
+        st.plotly_chart(fig_hm_g, use_container_width=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 3: RANKINGS ACCIONABLES (GEOCERCAS, UNIDADES CIEGAS, SIN COORD.)
+    # -------------------------------------------------------------------------
+    st.markdown("### 3. Diagnóstico Accionable: Geocercas vs. Unidades Sin Señal")
+
+    # 3A. Ranking de Tiendas por Falla de Geocerca
+    st_rank_all = (
+        gps_filt[gps_filt["Tipo de Zona"] == "Tienda"]
+        .groupby(["Operacion", "Tienda_Cod"], as_index=False)
+        .agg(
+            Paradas_Plan=("Diagnostico_GPS", "count"),
+            Visitadas_OK=("Diagnostico_GPS", lambda s: int((s == "Visitada (OK)").sum())),
+            Falla_Geocerca=("Diagnostico_GPS", lambda s: int((s == "Falla Geocerca (Parcial)").sum())),
+            Falla_Viaje_Ciego=("Diagnostico_GPS", lambda s: int((s == "Viaje Ciego (GPS/Unidad)").sum())),
+            Reentradas_Geocerca=("Cantidad Visitas", lambda s: int((s > 1).sum())),
+        )
+    )
+    st_rank_all["% Falla Geocerca"] = np.where(
+        st_rank_all["Paradas_Plan"] > 0,
+        (st_rank_all["Falla_Geocerca"] / st_rank_all["Paradas_Plan"] * 100).round(1),
+        0.0,
+    )
+    st_rank_all["% Efectividad OK"] = np.where(
+        st_rank_all["Paradas_Plan"] > 0,
+        (st_rank_all["Visitadas_OK"] / st_rank_all["Paradas_Plan"] * 100).round(1),
+        0.0,
+    )
+    st_rank_all = st_rank_all.sort_values(
+        ["Falla_Geocerca", "% Falla Geocerca", "Paradas_Plan"], ascending=[False, False, False]
+    ).rename(
+        columns={
+            "Operacion": "CD",
+            "Tienda_Cod": "Tienda",
+            "Paradas_Plan": "Paradas Plan.",
+            "Visitadas_OK": "Visitadas OK",
+            "Falla_Geocerca": "Falla Geocerca",
+            "Falla_Viaje_Ciego": "Falla Viaje Ciego",
+            "Reentradas_Geocerca": "Re-entradas (>1)",
+        }
+    )
+
+    # 3B. Ranking de Unidades (Dominio) y Transportistas por Viajes Ciegos
+    dom_trip_lvl = (
+        gps_filt.groupby(
+            ["Operacion", "Dominio", "Interno", "Tipo de Camion", "Transportista", "Id Viaje"],
+            as_index=False,
+        )
+        .agg(
+            Paradas=("Diagnostico_GPS", "count"),
+            Visitadas=("Diagnostico_GPS", lambda s: int((s == "Visitada (OK)").sum())),
+            Es_Ciego=("Visitadas_En_IdViaje", lambda s: int(s.iloc[0] == 0)),
+        )
+    )
+    dom_rank_all = (
+        dom_trip_lvl.groupby(
+            ["Operacion", "Dominio", "Interno", "Tipo de Camion", "Transportista"],
+            as_index=False,
+        )
+        .agg(
+            Viajes_TMS=("Id Viaje", "nunique"),
+            Viajes_Ciegos=("Es_Ciego", "sum"),
+            Paradas_Plan=("Paradas", "sum"),
+            Paradas_OK=("Visitadas", "sum"),
+        )
+    )
+    dom_rank_all["% Viajes Ciegos"] = np.where(
+        dom_rank_all["Viajes_TMS"] > 0,
+        (dom_rank_all["Viajes_Ciegos"] / dom_rank_all["Viajes_TMS"] * 100).round(1),
+        0.0,
+    )
+    dom_rank_all["% Efectividad GPS"] = np.where(
+        dom_rank_all["Paradas_Plan"] > 0,
+        (dom_rank_all["Paradas_OK"] / dom_rank_all["Paradas_Plan"] * 100).round(1),
+        0.0,
+    )
+    dom_rank_all = dom_rank_all.sort_values(
+        ["Viajes_Ciegos", "% Viajes Ciegos", "Viajes_TMS"], ascending=[False, False, False]
+    ).rename(
+        columns={
+            "Operacion": "CD",
+            "Tipo de Camion": "Tipo Camión",
+            "Viajes_TMS": "Viajes TMS",
+            "Viajes_Ciegos": "Viajes Ciegos",
+            "Paradas_Plan": "Paradas Plan.",
+            "Paradas_OK": "Paradas OK",
+        }
+    )
+
+    # 3C. Tiendas Sin Coordenadas
+    sin_coord_tbl = (
+        gps_filt[gps_filt["Diagnostico_GPS"] == "Sin coordenadas"]
+        .groupby(["Operacion", "Tienda_Cod"], as_index=False)
+        .agg(
+            Paradas_Afectadas=("Id Viaje", "count"),
+            Viajes_Unicos=("Ref_Clean", "nunique"),
+            Primera_Fecha=("Fecha_Reparto", "min"),
+            Ultima_Fecha=("Fecha_Reparto", "max"),
+        )
+        .sort_values(["Paradas_Afectadas", "Operacion"], ascending=[False, True])
+    )
+    if not sin_coord_tbl.empty:
+        sin_coord_tbl["Primera Fecha"] = sin_coord_tbl["Primera_Fecha"].dt.strftime("%d/%m/%Y").fillna("")
+        sin_coord_tbl["Última Fecha"] = sin_coord_tbl["Ultima_Fecha"].dt.strftime("%d/%m/%Y").fillna("")
+        sin_coord_tbl = sin_coord_tbl[
+            ["Operacion", "Tienda_Cod", "Paradas_Afectadas", "Viajes_Unicos", "Primera Fecha", "Última Fecha"]
+        ].rename(
+            columns={
+                "Operacion": "CD",
+                "Tienda_Cod": "Tienda",
+                "Paradas_Afectadas": "Paradas Afectadas",
+                "Viajes_Unicos": "Viajes Únicos",
+            }
+        )
+    else:
+        sin_coord_tbl = pd.DataFrame(
+            columns=["CD", "Tienda", "Paradas Afectadas", "Viajes Únicos", "Primera Fecha", "Última Fecha"]
+        )
+
+    # 3D. Detalle de paradas sin GPS para exportacion
+    raw_fails_export = (
+        gps_filt[gps_filt["Diagnostico_GPS"] != "Visitada (OK)"][
+            [
+                "Operacion",
+                "Fecha_Reparto",
+                "Hora Reparto",
+                "Ref_Clean",
+                "Id Viaje",
+                "Transportista",
+                "Dominio",
+                "Tipo de Camion",
+                "Tienda_Cod",
+                "Diagnostico_GPS",
+            ]
+        ]
+        .copy()
+        .sort_values(["Operacion", "Fecha_Reparto", "Ref_Clean"])
+    )
+    raw_fails_export["Fecha Reparto"] = raw_fails_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    raw_fails_export = raw_fails_export[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Hora Reparto",
+            "Ref_Clean",
+            "Id Viaje",
+            "Transportista",
+            "Dominio",
+            "Tipo de Camion",
+            "Tienda_Cod",
+            "Diagnostico_GPS",
+        ]
+    ].rename(
+        columns={
+            "Operacion": "CD",
+            "Ref_Clean": "Ref Externa Viaje",
+            "Tipo de Camion": "Tipo Camión",
+            "Tienda_Cod": "Tienda",
+            "Diagnostico_GPS": "Diagnóstico GPS",
+        }
+    )
+
+    gps_excel_bytes = build_gps_audit_excel(
+        st_rank_all, dom_rank_all, sin_coord_tbl, raw_fails_export
+    )
+    st.download_button(
+        label="📥 Descargar Auditoría GPS y Geocercas en Excel (.xlsx)",
+        data=gps_excel_bytes,
+        file_name="Auditoria_GPS_y_Geocercas.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    gtab1, gtab2, gtab3 = st.tabs(
+        [
+            f"🗺️ Tiendas a Re-geocercar ({len(st_rank_all[st_rank_all['Falla Geocerca'] > 0])})",
+            f"📡 Unidades / Transportistas Ciegos ({len(dom_rank_all[dom_rank_all['Viajes Ciegos'] > 0])})",
+            f"📌 Tiendas Sin Coordenadas ({len(sin_coord_tbl)})",
+        ]
+    )
+
+    with gtab1:
+        st.caption(
+            "Tiendas donde el camión sí registró visitas GPS en otras paradas del mismo viaje, "
+            "pero marcó 'No visitada' aquí (indicio directo de polígono/geocerca mal dibujada)."
+        )
+        min_paradas_geo = st.number_input(
+            "Mínimo de paradas planificadas en la tienda:",
+            min_value=1,
+            max_value=100,
+            value=5,
+            step=1,
+            key="min_paradas_geo",
+        )
+        st_geo_view = st_rank_all[
+            (st_rank_all["Paradas Plan."] >= min_paradas_geo) & (st_rank_all["Falla Geocerca"] > 0)
+        ]
+        st.dataframe(
+            st_geo_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Falla Geocerca": st.column_config.ProgressColumn(
+                    "% Falla Geocerca",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
+                ),
+                "% Efectividad OK": st.column_config.ProgressColumn(
+                    "% Efectividad OK",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
+                ),
+            },
+        )
+
+    with gtab2:
+        st.caption(
+            "Unidades (patentes) y transportistas con viajes donde ninguna tienda registró entrada a geocerca (0% señal GPS)."
+        )
+        fcol1, fcol2 = st.columns([1.2, 1])
+        with fcol1:
+            nivel_flota = st.radio(
+                "Agrupar ranking por:",
+                options=["Por Patente (Dominio)", "Por Código de Transportista"],
+                index=0,
+                horizontal=True,
+                key="nivel_flota_gps",
+            )
+        with fcol2:
+            min_viajes_gps = st.number_input(
+                "Mínimo de viajes realizados:",
+                min_value=1,
+                max_value=100,
+                value=5,
+                step=1,
+                key="min_viajes_gps",
+            )
+
+        if nivel_flota == "Por Patente (Dominio)":
+            fleet_view = dom_rank_all[
+                (dom_rank_all["Viajes TMS"] >= min_viajes_gps) & (dom_rank_all["Viajes Ciegos"] > 0)
+            ]
+        else:
+            trans_rank = (
+                dom_trip_lvl.groupby(["Operacion", "Transportista"], as_index=False)
+                .agg(
+                    Unidades=("Dominio", "nunique"),
+                    Viajes_TMS=("Id Viaje", "nunique"),
+                    Viajes_Ciegos=("Es_Ciego", "sum"),
+                    Paradas_Plan=("Paradas", "sum"),
+                    Paradas_OK=("Visitadas", "sum"),
+                )
+            )
+            trans_rank["% Viajes Ciegos"] = np.where(
+                trans_rank["Viajes_TMS"] > 0,
+                (trans_rank["Viajes_Ciegos"] / trans_rank["Viajes_TMS"] * 100).round(1),
+                0.0,
+            )
+            trans_rank["% Efectividad GPS"] = np.where(
+                trans_rank["Paradas_Plan"] > 0,
+                (trans_rank["Paradas_OK"] / trans_rank["Paradas_Plan"] * 100).round(1),
+                0.0,
+            )
+            trans_rank = trans_rank.sort_values(
+                ["Viajes_Ciegos", "% Viajes Ciegos"], ascending=[False, False]
+            ).rename(
+                columns={
+                    "Operacion": "CD",
+                    "Viajes_TMS": "Viajes TMS",
+                    "Viajes_Ciegos": "Viajes Ciegos",
+                    "Paradas_Plan": "Paradas Plan.",
+                    "Paradas_OK": "Paradas OK",
+                }
+            )
+            fleet_view = trans_rank[
+                (trans_rank["Viajes TMS"] >= min_viajes_gps) & (trans_rank["Viajes Ciegos"] > 0)
+            ]
+
+        st.dataframe(
+            fleet_view,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Viajes Ciegos": st.column_config.ProgressColumn(
+                    "% Viajes Ciegos",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
+                ),
+                "% Efectividad GPS": st.column_config.ProgressColumn(
+                    "% Efectividad GPS",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
+                ),
+            },
+        )
+
+    with gtab3:
+        st.caption(
+            "Tiendas clasificadas como 'Sin zona / Sin coordenadas' en UNIGIS: requieren carga de latitud/longitud en el maestro."
+        )
+        st.dataframe(sin_coord_tbl, use_container_width=True, hide_index=True)
 
 with tab3:
     st.info(
