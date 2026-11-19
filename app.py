@@ -395,7 +395,7 @@ if "manual_u" in st.session_state and st.session_state["manual_u"] is not None:
     unigis_bytes = st.session_state["manual_u"]
 
 if amrepa_bytes is None or unigis_bytes is None:
-    st.title("🚚 Torre de Control de Transporte — Retail")
+    st.title("🚚 Estadística de Camión — Retail")
     st.warning("No se detectaron archivos base. Cargalos desde el menú lateral.")
     up_a = st.sidebar.file_uploader("Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
     up_u = st.sidebar.file_uploader("Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
@@ -528,7 +528,7 @@ with st.sidebar.expander("⚙️ Base de Datos / Carga Manual", expanded=False):
 # -----------------------------------------------------------------------------
 # CABECERA PRINCIPAL Y NAVEGACION POR SOLAPAS
 # -----------------------------------------------------------------------------
-st.title("🚚 Torre de Control de Transporte — Estadística de Camión")
+st.title("🚚 Estadística de Camión")
 st.caption(
     f"Período activo: **{d_start.strftime('%d/%m/%Y')}** al **{d_end.strftime('%d/%m/%Y')}** | "
     f"CDs: **{', '.join(map(str, selected_ops))}** | Todos los filtros laterales actualizan todas las vistas."
