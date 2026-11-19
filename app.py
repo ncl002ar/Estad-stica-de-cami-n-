@@ -2001,34 +2001,35 @@ with tab2:
         }
     )
 
-    # 3C. Tiendas Sin Coordenadas
+    # 3C. Tiendas Sin Coordenadas (agrupado por Tienda única para coincidir 1:1 con KPI)
     sin_coord_tbl = (
         gps_filt[gps_filt["Diagnostico_GPS"] == "Sin coordenadas"]
-        .groupby(["Operacion", "Tienda_Cod"], as_index=False)
+        .groupby("Tienda_Cod", as_index=False)
         .agg(
+            CDs=("Operacion", lambda s: " / ".join(sorted(s.dropna().astype(int).astype(str).unique()))),
             Paradas_Afectadas=("Id Viaje", "count"),
             Viajes_Unicos=("Ref_Clean", "nunique"),
             Primera_Fecha=("Fecha_Reparto", "min"),
             Ultima_Fecha=("Fecha_Reparto", "max"),
         )
-        .sort_values(["Paradas_Afectadas", "Operacion"], ascending=[False, True])
+        .sort_values(["Paradas_Afectadas", "Tienda_Cod"], ascending=[False, True])
     )
     if not sin_coord_tbl.empty:
         sin_coord_tbl["Primera Fecha"] = sin_coord_tbl["Primera_Fecha"].dt.strftime("%d/%m/%Y").fillna("")
         sin_coord_tbl["Última Fecha"] = sin_coord_tbl["Ultima_Fecha"].dt.strftime("%d/%m/%Y").fillna("")
         sin_coord_tbl = sin_coord_tbl[
-            ["Operacion", "Tienda_Cod", "Paradas_Afectadas", "Viajes_Unicos", "Primera Fecha", "Última Fecha"]
+            ["Tienda_Cod", "CDs", "Paradas_Afectadas", "Viajes_Unicos", "Primera Fecha", "Última Fecha"]
         ].rename(
             columns={
-                "Operacion": "CD",
                 "Tienda_Cod": "Tienda",
+                "CDs": "CD(s)",
                 "Paradas_Afectadas": "Paradas Afectadas",
                 "Viajes_Unicos": "Viajes Únicos",
             }
         )
     else:
         sin_coord_tbl = pd.DataFrame(
-            columns=["CD", "Tienda", "Paradas Afectadas", "Viajes Únicos", "Primera Fecha", "Última Fecha"]
+            columns=["Tienda", "CD(s)", "Paradas Afectadas", "Viajes Únicos", "Primera Fecha", "Última Fecha"]
         )
 
     # 3D. Detalle de paradas sin GPS para exportacion
