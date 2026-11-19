@@ -1472,52 +1472,63 @@ with tab2:
     viajes_ciegos_cnt = int(
         gps_filt[gps_filt["Visitadas_En_IdViaje"] == 0]["Id Viaje"].nunique()
     )
+    viajes_100_ok_cnt = int(
+        gps_filt.groupby("Id Viaje")["Observacion"]
+        .apply(lambda s: int(s.isna().sum()) == len(s))
+        .sum()
+    )
 
     pct_efec_gps = (paradas_ok / tot_paradas * 100) if tot_paradas > 0 else 0.0
-    pct_ciego = (paradas_ciego / tot_paradas * 100) if tot_paradas > 0 else 0.0
+    pct_viajes_ciegos = (viajes_ciegos_cnt / viajes_gps_tot * 100) if viajes_gps_tot > 0 else 0.0
     pct_geo = (paradas_geo / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_sin_coord = (paradas_sin_coord / tot_paradas * 100) if tot_paradas > 0 else 0.0
 
-    g1, g2, g3, g4, g5 = st.columns([1.05, 1.15, 1.25, 1.25, 1.0])
+    g1, g2, g3, g4, g5 = st.columns([1.05, 1.45, 1.25, 1.15, 0.95])
     with g1:
         st.markdown(
             _kpi_card_html(
                 "Paradas Planificadas",
                 _fmt_int(tot_paradas),
                 f"En {_fmt_int(viajes_gps_tot)} viajes TMS",
+                "#475569",
+                f"<b>{_fmt_int(viajes_100_ok_cnt)}</b> viajes con 100% GPS",
             ),
             unsafe_allow_html=True,
         )
     with g2:
         st.markdown(
             _kpi_card_html(
-                "% Efectividad GPS",
+                "% Efectividad GPS (Paradas)",
                 _fmt_pct(pct_efec_gps),
-                f"{_fmt_int(paradas_ok)} visitas con estadía OK",
+                f"{_fmt_int(paradas_ok)} visitas OK | {_fmt_int(paradas_sin_dato)} sin dato:",
                 "#16a34a" if pct_efec_gps >= 90 else "#d97706",
-                f"Sin dato GPS: <b>{_fmt_int(paradas_sin_dato)}</b> paradas",
+                f"• <b>{_fmt_int(paradas_ciego)}</b> viaje ciego | <b>{_fmt_int(paradas_geo)}</b> geocerca | <b>{_fmt_int(paradas_sin_coord)}</b> s/coord.",
             ),
             unsafe_allow_html=True,
         )
     with g3:
         st.markdown(
             _kpi_card_html(
-                "Falla GPS / Unidad (Viaje Ciego)",
-                _fmt_int(paradas_ciego),
-                f"{_fmt_pct(pct_ciego)} del total de paradas",
-                "#dc2626" if paradas_ciego > 0 else "#16a34a",
-                f"En <b>{_fmt_int(viajes_ciegos_cnt)}</b> viajes con 0% señal GPS",
+                "Viajes Ciegos (0% GPS)",
+                _fmt_int(viajes_ciegos_cnt),
+                f"{_fmt_pct(pct_viajes_ciegos)} de los viajes sin señal",
+                "#dc2626" if viajes_ciegos_cnt > 0 else "#16a34a",
+                f"Abarca <b>{_fmt_int(paradas_ciego)}</b> paradas sin visita",
             ),
             unsafe_allow_html=True,
         )
+    geo_only_df = gps_filt[gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)"]
+    tiendas_geo_unicas = int(geo_only_df["Tienda_Cod"].nunique())
+    tiendas_geo_rec = int((geo_only_df.groupby("Tienda_Cod").size() >= 2).sum())
+
     with g4:
         st.markdown(
             _kpi_card_html(
-                "Falla Geocerca (Parcial)",
+                "Falla Geocerca (Paradas)",
                 _fmt_int(paradas_geo),
                 f"{_fmt_pct(pct_geo)} del total de paradas",
                 "#d97706" if paradas_geo > 0 else "#16a34a",
-                "Camión reportó en otras tiendas del viaje",
+                f"En <b>{_fmt_int(tiendas_geo_unicas)}</b> tiendas (<b>{_fmt_int(tiendas_geo_rec)}</b> recurrentes)",
             ),
             unsafe_allow_html=True,
         )
@@ -1526,7 +1537,7 @@ with tab2:
             _kpi_card_html(
                 "Sin Coordenadas",
                 _fmt_int(paradas_sin_coord),
-                f"{_fmt_pct(pct_sin_coord)} del total",
+                f"{_fmt_pct(pct_sin_coord)} de paradas",
                 "#64748b",
                 f"{gps_filt[gps_filt['Diagnostico_GPS'] == 'Sin coordenadas']['Tienda_Cod'].nunique()} tiendas sin lat/long",
             ),
