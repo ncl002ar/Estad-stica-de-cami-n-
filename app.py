@@ -32,8 +32,11 @@ st.markdown(
     div[data-testid="stMetric"] {
         background-color: #f8f9fb;
         border: 1px solid #e6e9ef;
-        padding: 14px 18px;
+        padding: 12px 16px;
         border-radius: 10px;
+    }
+    section[data-testid="stSidebar"] div.block-container {
+        padding-top: 1.2rem;
     }
     </style>
     """,
@@ -42,8 +45,25 @@ st.markdown(
 
 
 # -----------------------------------------------------------------------------
-# CONEXION CON GOOGLE DRIVE (PERSISTENTE PARA TODOS LOS USUARIOS)
+# CONEXION CON REPOSITORIO / GOOGLE DRIVE
 # -----------------------------------------------------------------------------
+def find_repo_excel_files():
+    candidates = glob.glob("data/*.xlsx") + glob.glob("*.xlsx")
+    amrepa_f = sorted([f for f in candidates if "amrepa" in os.path.basename(f).lower()])
+    unigis_f = sorted(
+        [
+            f
+            for f in candidates
+            if "seguimiento" in os.path.basename(f).lower()
+            or "unigis" in os.path.basename(f).lower()
+            or "supply" in os.path.basename(f).lower()
+        ]
+    )
+    if amrepa_f and unigis_f:
+        return amrepa_f[-1], unigis_f[-1]
+    return None, None
+
+
 def _extract_folder_id(url: str) -> str:
     m = re.search(r"/folders/([a-zA-Z0-9_-]+)", url or "")
     return m.group(1) if m else ""
@@ -93,7 +113,7 @@ def fetch_from_drive_folder(folder_url: str):
             found_names = [os.path.basename(f) for f in all_xlsx]
             raise FileNotFoundError(
                 f"No se encontraron ambos archivos Excel en la carpeta de Drive. "
-                f"Detectados: {found_names if found_names else 'ninguno (verificá que la carpeta tenga permiso Cualquier persona con el enlace - Lector)'}."
+                f"Detectados: {found_names if found_names else 'ninguno'}."
             )
 
         with open(amrepa_files[-1], "rb") as fa:
@@ -237,6 +257,16 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         }
     )
     master_trips["Fecha_Base"] = master_trips["Fecha_Reparto"].fillna(master_trips["Fecha_Reparto_TMS"])
+    master_trips["Mes_Label"] = master_trips["Fecha_Base"].dt.strftime("%Y-%m").fillna("Sin fecha")
+    master_trips["Semana_Sort"] = master_trips["Fecha_Base"].dt.to_period("W").apply(
+        lambda p: p.start_time if pd.notna(p) else pd.NaT
+    )
+    master_trips["Semana_Label"] = np.where(
+        master_trips["Semana_Sort"].notna(),
+        "Sem " + master_trips["Semana_Sort"].dt.strftime("%d/%m"),
+        "Sin semana",
+    )
+
     master_trips["Transportista"] = master_trips["Transportista"].fillna("Sin dato WMS")
     master_trips["Tiendas_WMS"] = master_trips["Tiendas_WMS"].fillna(0).astype(int)
     master_trips["Tiendas_TMS"] = master_trips["Tiendas_TMS"].fillna(0).astype(int)
@@ -329,27 +359,8 @@ def build_audit_excel(df_gap, df_store_diff, df_dup, df_inv) -> bytes:
 
 
 # -----------------------------------------------------------------------------
-# SIDEBAR: FUENTES DE DATOS (GITHUB DATA/, GOOGLE DRIVE O SUBIDA MANUAL)
+# CARGA AUTOMATICA DE DATOS (SILENCIOSA PARA PRIORIZAR FILTROS EN SIDEBAR)
 # -----------------------------------------------------------------------------
-def find_repo_excel_files():
-    candidates = glob.glob("data/*.xlsx") + glob.glob("*.xlsx")
-    amrepa_f = sorted([f for f in candidates if "amrepa" in os.path.basename(f).lower()])
-    unigis_f = sorted(
-        [
-            f
-            for f in candidates
-            if "seguimiento" in os.path.basename(f).lower()
-            or "unigis" in os.path.basename(f).lower()
-            or "supply" in os.path.basename(f).lower()
-        ]
-    )
-    if amrepa_f and unigis_f:
-        return amrepa_f[-1], unigis_f[-1]
-    return None, None
-
-
-st.sidebar.title("📂 Fuentes de Datos")
-
 default_drive_url = ""
 try:
     default_drive_url = st.secrets.get("DRIVE_FOLDER_URL", "")
@@ -359,71 +370,39 @@ except Exception:
 repo_a, repo_u = find_repo_excel_files()
 has_repo_files = repo_a is not None and repo_u is not None
 
-opciones_fuente = ["📦 Base Persistente (GitHub)", "☁️ Carpeta Google Drive", "📤 Subir archivos manual"]
-default_idx = 0 if has_repo_files else (1 if default_drive_url else 0)
-
-modo_carga = st.sidebar.radio(
-    "Origen de los reportes:",
-    options=opciones_fuente,
-    index=default_idx,
-)
-
 amrepa_bytes = None
 unigis_bytes = None
 fuente_label = ""
 
-if modo_carga == "📦 Base Persistente (GitHub)":
-    if has_repo_files:
-        with open(repo_a, "rb") as fa:
-            amrepa_bytes = fa.read()
-        with open(repo_u, "rb") as fu:
-            unigis_bytes = fu.read()
-        name_a = os.path.basename(repo_a)
-        name_u = os.path.basename(repo_u)
-        fuente_label = f"Base Persistente (`{name_a}` + `{name_u}`)"
-        st.sidebar.success(f"Activo: {name_a} | {name_u}")
-    else:
-        st.sidebar.warning(
-            "Aún no hay archivos Excel en la carpeta `data/` de tu repositorio de GitHub."
-        )
+# Prioridad 1: Base persistente en GitHub | Prioridad 2: Google Drive Secret | Prioridad 3: Manual
+if has_repo_files:
+    with open(repo_a, "rb") as fa:
+        amrepa_bytes = fa.read()
+    with open(repo_u, "rb") as fu:
+        unigis_bytes = fu.read()
+    fuente_label = f"`{os.path.basename(repo_a)}` + `{os.path.basename(repo_u)}`"
+elif default_drive_url:
+    try:
+        amrepa_bytes, unigis_bytes, name_a, name_u = fetch_from_drive_folder(default_drive_url)
+        fuente_label = f"Drive (`{name_a}` + `{name_u}`)"
+    except Exception:
+        pass
 
-elif modo_carga == "☁️ Carpeta Google Drive":
-    drive_url = st.sidebar.text_input(
-        "Link de carpeta compartida en Drive:",
-        value=default_drive_url,
-        placeholder="https://drive.google.com/drive/folders/...",
-        help="Debe ser una carpeta con acceso 'Cualquier persona con el enlace (Lector)'.",
-    )
-    if st.sidebar.button("🔄 Actualizar desde Drive"):
-        fetch_from_drive_folder.clear()
-        load_and_process_data.clear()
-
-    if drive_url:
-        try:
-            amrepa_bytes, unigis_bytes, name_a, name_u = fetch_from_drive_folder(drive_url)
-            fuente_label = f"Google Drive (`{name_a}` + `{name_u}`)"
-            st.sidebar.success(f"Sincronizado: {name_a} | {name_u}")
-        except Exception as e:
-            st.sidebar.error(f"Error al leer Drive: {e}")
-    else:
-        st.sidebar.warning("Pegá el link de tu carpeta pública de Google Drive.")
-
-else:
-    up_amrepa = st.sidebar.file_uploader("1. Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
-    up_unigis = st.sidebar.file_uploader("2. Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
-
-    if up_amrepa is not None and up_unigis is not None:
-        amrepa_bytes = up_amrepa.getvalue()
-        unigis_bytes = up_unigis.getvalue()
-        fuente_label = f"Carga temporal (`{up_amrepa.name}` + `{up_unigis.name}`)"
+# Si se subieron archivos manuales en el expander inferior, toman prioridad temporal
+if "manual_a" in st.session_state and st.session_state["manual_a"] is not None:
+    amrepa_bytes = st.session_state["manual_a"]
+if "manual_u" in st.session_state and st.session_state["manual_u"] is not None:
+    unigis_bytes = st.session_state["manual_u"]
 
 if amrepa_bytes is None or unigis_bytes is None:
     st.title("🚚 Torre de Control de Transporte — Retail")
-    st.info(
-        "👈 Pegá el **link de tu carpeta compartida de Google Drive** en el panel izquierdo. "
-        "Si además lo guardás en **Settings → Secrets** de Streamlit Cloud como `DRIVE_FOLDER_URL`, "
-        "los datos quedarán cargados automáticamente para cualquier persona que abra esta web."
-    )
+    st.warning("No se detectaron archivos base. Cargalos desde el menú lateral.")
+    up_a = st.sidebar.file_uploader("Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
+    up_u = st.sidebar.file_uploader("Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
+    if up_a and up_u:
+        st.session_state["manual_a"] = up_a.getvalue()
+        st.session_state["manual_u"] = up_u.getvalue()
+        st.rerun()
     st.stop()
 
 data = load_and_process_data(amrepa_bytes, unigis_bytes)
@@ -432,11 +411,35 @@ dup_detail = data["dup_detail"].copy()
 invalid_detail = data["invalid_detail"].copy()
 
 # -----------------------------------------------------------------------------
-# FILTROS GLOBALES
+# SIDEBAR: FILTROS GLOBALES ARRIBA (ACTUALIZAN TODAS LAS TABLAS Y GRAFICOS)
 # -----------------------------------------------------------------------------
-st.sidebar.divider()
-st.sidebar.subheader("🔎 Filtros Globales")
+st.sidebar.header("🔎 Filtros Globales")
 
+# 1. Filtro por Mes
+all_months = sorted([m for m in master["Mes_Label"].unique() if m != "Sin fecha"])
+selected_months = st.sidebar.multiselect(
+    "Mes",
+    options=all_months,
+    default=[],
+    placeholder="Todos los meses",
+)
+
+# 2. Filtro por Semana (dinamico segun mes seleccionado)
+df_for_weeks = master[master["Mes_Label"].isin(selected_months)] if selected_months else master
+weeks_df = (
+    df_for_weeks[df_for_weeks["Semana_Label"] != "Sin semana"][["Semana_Sort", "Semana_Label"]]
+    .drop_duplicates()
+    .sort_values("Semana_Sort")
+)
+all_weeks = weeks_df["Semana_Label"].tolist()
+selected_weeks = st.sidebar.multiselect(
+    "Semana",
+    options=all_weeks,
+    default=[],
+    placeholder="Todas las semanas",
+)
+
+# 3. Filtro por Rango de Fechas
 min_date = master["Fecha_Base"].dropna().min().date()
 max_date = master["Fecha_Base"].dropna().max().date()
 
@@ -447,28 +450,36 @@ date_range = st.sidebar.date_input(
     max_value=max_date,
 )
 
-all_ops = sorted(master["Operacion"].dropna().unique().tolist())
-selected_ops = st.sidebar.multiselect(
-    "Operación (Centro de Distribución)",
-    options=all_ops,
-    default=all_ops,
-)
-
 if isinstance(date_range, tuple) and len(date_range) == 2:
     d_start, d_end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 else:
     d_start = d_end = pd.to_datetime(date_range)
 
+# 4. Filtro por Operacion (CD)
+all_ops = sorted(master["Operacion"].dropna().unique().tolist())
+selected_ops = st.sidebar.multiselect(
+    "Operación (CD)",
+    options=all_ops,
+    default=all_ops,
+)
+
+# Aplicar filtros globales sobre master
 mask_base = (
     (master["Fecha_Base"] >= d_start)
     & (master["Fecha_Base"] <= d_end)
     & (master["Operacion"].isin(selected_ops))
 )
+if selected_months:
+    mask_base = mask_base & (master["Mes_Label"].isin(selected_months))
+if selected_weeks:
+    mask_base = mask_base & (master["Semana_Label"].isin(selected_weeks))
+
 df_filt = master[mask_base].copy()
 
+# 5. Filtro por Transportista
 all_trans = sorted(df_filt["Transportista"].dropna().unique().tolist())
 selected_trans = st.sidebar.multiselect(
-    "Código de Transportista (opcional)",
+    "Transportista (opcional)",
     options=all_trans,
     default=[],
     placeholder="Todos los transportistas",
@@ -476,25 +487,51 @@ selected_trans = st.sidebar.multiselect(
 if selected_trans:
     df_filt = df_filt[df_filt["Transportista"].isin(selected_trans)].copy()
 
-dup_filt = dup_detail[
+# Aplicar mismos filtros temporales y de CD a alertas
+mask_dup = (
     (dup_detail["Fecha_Reparto"] >= d_start)
     & (dup_detail["Fecha_Reparto"] <= d_end)
     & (dup_detail["Operacion"].isin(selected_ops))
-].copy()
-
-inv_filt = invalid_detail[
+)
+mask_inv = (
     (invalid_detail["Fecha_Reparto"] >= d_start)
     & (invalid_detail["Fecha_Reparto"] <= d_end)
     & (invalid_detail["Operacion"].isin(selected_ops))
-].copy()
+)
+if selected_months:
+    mask_dup = mask_dup & (dup_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(selected_months))
+    mask_inv = mask_inv & (invalid_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(selected_months))
+if selected_weeks:
+    dup_sem = "Sem " + dup_detail["Fecha_Reparto"].dt.to_period("W").apply(lambda p: p.start_time).dt.strftime("%d/%m")
+    inv_sem = "Sem " + invalid_detail["Fecha_Reparto"].dt.to_period("W").apply(lambda p: p.start_time).dt.strftime("%d/%m")
+    mask_dup = mask_dup & (dup_sem.isin(selected_weeks))
+    mask_inv = mask_inv & (inv_sem.isin(selected_weeks))
+
+dup_filt = dup_detail[mask_dup].copy()
+inv_filt = invalid_detail[mask_inv].copy()
+
+# Seccion colapsada al final del sidebar para carga manual / info de base
+st.sidebar.divider()
+with st.sidebar.expander("⚙️ Base de Datos / Carga Manual", expanded=False):
+    st.caption(f"Fuente activa: {fuente_label}")
+    up_a_alt = st.file_uploader("Reemplazar AMREPA (.xlsx)", type=["xlsx"], key="up_a_alt")
+    up_u_alt = st.file_uploader("Reemplazar UNIGIS (.xlsx)", type=["xlsx"], key="up_u_alt")
+    if up_a_alt is not None:
+        st.session_state["manual_a"] = up_a_alt.getvalue()
+    if up_u_alt is not None:
+        st.session_state["manual_u"] = up_u_alt.getvalue()
+    if st.button("Restaurar base original"):
+        st.session_state["manual_a"] = None
+        st.session_state["manual_u"] = None
+        st.rerun()
 
 # -----------------------------------------------------------------------------
 # CABECERA PRINCIPAL Y NAVEGACION POR SOLAPAS
 # -----------------------------------------------------------------------------
 st.title("🚚 Torre de Control de Transporte — Estadística de Camión")
 st.caption(
-    f"Fuente: {fuente_label} | Período: **{d_start.strftime('%d/%m/%Y')}** al **{d_end.strftime('%d/%m/%Y')}** | "
-    f"CDs: **{', '.join(map(str, selected_ops))}**"
+    f"Período activo: **{d_start.strftime('%d/%m/%Y')}** al **{d_end.strftime('%d/%m/%Y')}** | "
+    f"CDs: **{', '.join(map(str, selected_ops))}** | Todos los filtros laterales actualizan todas las vistas."
 )
 
 tab1, tab2, tab3, tab4 = st.tabs(
@@ -534,13 +571,13 @@ with tab1:
     c1.metric("Viajes Despachados (WMS)", f"{viajes_wms:,}".replace(",", "."))
     c2.metric("Viajes Válidos (TMS)", f"{viajes_tms:,}".replace(",", "."))
     c3.metric(
-        "% Cobertura de Viajes",
+        "% Cobertura Viajes",
         f"{pct_cob_viajes:.2f}%",
         delta=f"-{viajes_gap:,} sin TMS".replace(",", "."),
         delta_color="inverse" if viajes_gap > 0 else "off",
     )
     c4.metric(
-        "% Cobertura Tiendas (en Match)",
+        "% Cobertura Tiendas",
         f"{pct_cob_tiendas:.2f}%",
         delta=f"-{tiendas_faltan_tms:,} tiendas".replace(",", "."),
         delta_color="inverse" if tiendas_faltan_tms > 0 else "off",
@@ -555,7 +592,7 @@ with tab1:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE A: TABLA RESUMEN POR OPERACION (CD)
+    # BLOQUE A: TABLA RESUMEN POR OPERACION (COMPACTA SIN SCROLL HORIZONTAL)
     # -------------------------------------------------------------------------
     st.markdown("### 1. Resumen por Operación (Centro de Distribución)")
 
@@ -578,17 +615,17 @@ with tab1:
 
         rows_op.append(
             {
-                "Operación": str(int(op)),
+                "CD": str(int(op)),
                 "Viajes WMS": v_wms,
-                "Viajes TMS Válidos": v_tms,
-                "Match (Ambos)": v_match,
-                "Gap Solo WMS": v_gap,
+                "Viajes TMS": v_tms,
+                "En Ambos": v_match,
+                "Gap WMS": v_gap,
                 "Solo TMS": v_solo_tms,
-                "% Cobertura Viajes": round(cob_v, 2),
-                "Tiendas WMS (Match)": t_wms,
-                "Tiendas TMS (Match)": t_tms,
-                "Tiendas Faltan TMS": t_faltan,
-                "% Cobertura Tiendas": round(cob_t, 2),
+                "% Cob. Viajes": round(cob_v, 2),
+                "Tiendas WMS": t_wms,
+                "Tiendas TMS": t_tms,
+                "Faltan TMS": t_faltan,
+                "% Cob. Tiendas": round(cob_t, 2),
             }
         )
 
@@ -597,17 +634,17 @@ with tab1:
         total_row = pd.DataFrame(
             [
                 {
-                    "Operación": "TOTAL",
+                    "CD": "TOTAL",
                     "Viajes WMS": df_resumen_op["Viajes WMS"].sum(),
-                    "Viajes TMS Válidos": df_resumen_op["Viajes TMS Válidos"].sum(),
-                    "Match (Ambos)": df_resumen_op["Match (Ambos)"].sum(),
-                    "Gap Solo WMS": df_resumen_op["Gap Solo WMS"].sum(),
+                    "Viajes TMS": df_resumen_op["Viajes TMS"].sum(),
+                    "En Ambos": df_resumen_op["En Ambos"].sum(),
+                    "Gap WMS": df_resumen_op["Gap WMS"].sum(),
                     "Solo TMS": df_resumen_op["Solo TMS"].sum(),
-                    "% Cobertura Viajes": round(pct_cob_viajes, 2),
-                    "Tiendas WMS (Match)": df_resumen_op["Tiendas WMS (Match)"].sum(),
-                    "Tiendas TMS (Match)": df_resumen_op["Tiendas TMS (Match)"].sum(),
-                    "Tiendas Faltan TMS": df_resumen_op["Tiendas Faltan TMS"].sum(),
-                    "% Cobertura Tiendas": round(pct_cob_tiendas, 2),
+                    "% Cob. Viajes": round(pct_cob_viajes, 2),
+                    "Tiendas WMS": df_resumen_op["Tiendas WMS"].sum(),
+                    "Tiendas TMS": df_resumen_op["Tiendas TMS"].sum(),
+                    "Faltan TMS": df_resumen_op["Faltan TMS"].sum(),
+                    "% Cob. Tiendas": round(pct_cob_tiendas, 2),
                 }
             ]
         )
@@ -615,19 +652,31 @@ with tab1:
 
         st.dataframe(
             df_resumen_op_display,
+            use_container_width=True,
             hide_index=True,
             column_config={
-                "% Cobertura Viajes": st.column_config.ProgressColumn(
-                    "% Cobertura Viajes",
-                    format="%.2f%%",
+                "CD": st.column_config.TextColumn("CD", width="small"),
+                "Viajes WMS": st.column_config.NumberColumn("Viajes WMS", format="%d", width="small"),
+                "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
+                "En Ambos": st.column_config.NumberColumn("En Ambos", format="%d", width="small"),
+                "Gap WMS": st.column_config.NumberColumn("Gap WMS", format="%d", width="small"),
+                "Solo TMS": st.column_config.NumberColumn("Solo TMS", format="%d", width="small"),
+                "% Cob. Viajes": st.column_config.ProgressColumn(
+                    "% Cob. Viajes",
+                    format="%.1f%%",
                     min_value=0,
                     max_value=100,
+                    width="medium",
                 ),
-                "% Cobertura Tiendas": st.column_config.ProgressColumn(
-                    "% Cobertura Tiendas",
-                    format="%.2f%%",
+                "Tiendas WMS": st.column_config.NumberColumn("Tiendas WMS", format="%d", width="small"),
+                "Tiendas TMS": st.column_config.NumberColumn("Tiendas TMS", format="%d", width="small"),
+                "Faltan TMS": st.column_config.NumberColumn("Faltan TMS", format="%d", width="small"),
+                "% Cob. Tiendas": st.column_config.ProgressColumn(
+                    "% Cob. Tiendas",
+                    format="%.1f%%",
                     min_value=0,
                     max_value=100,
+                    width="medium",
                 ),
             },
         )
@@ -659,8 +708,6 @@ with tab1:
         )
 
     df_time = df_filt[df_filt["_merge"].isin(["both", "left_only"])].copy()
-    df_time["Semana_Sort"] = df_time["Fecha_Base"].dt.to_period("W").apply(lambda p: p.start_time)
-    df_time["Semana_Label"] = "Sem " + df_time["Semana_Sort"].dt.strftime("%d/%m")
 
     # Drill-down inteligente cuando se elige vista por Dia
     if gran_tiempo == "Día" and not df_time.empty:
@@ -736,18 +783,18 @@ with tab1:
             go.Bar(
                 x=agg_t["Periodo"],
                 y=agg_t["Match"],
-                name="Viajes Match (WMS + TMS)",
-                marker_color="#1f77b4",
-                hovertemplate="<b>%{x}</b><br>Match: %{y:,}<extra></extra>",
+                name="Viajes En Ambos (WMS + TMS)",
+                marker_color="#1d4ed8",
+                hovertemplate="<b>%{x}</b><br>En Ambos: %{y:,}<extra></extra>",
             ),
             secondary_y=False,
         )
         fig.add_trace(
             go.Bar(
                 x=agg_t["Periodo"],
-                y=agg_t["Gap_Solo_WMS"],
+                y=agg_t["Gap_WMS"] if "Gap_WMS" in agg_t else agg_t["Gap_Solo_WMS"],
                 name="Gap Solo WMS (Sin UNIGIS)",
-                marker_color="#d62728",
+                marker_color="#dc2626",
                 hovertemplate="<b>%{x}</b><br>Gap Solo WMS: %{y:,}<extra></extra>",
             ),
             secondary_y=False,
@@ -757,23 +804,57 @@ with tab1:
                 x=agg_t["Periodo"],
                 y=agg_t["Pct_Cobertura"],
                 name="% Cobertura TMS",
-                mode="lines+markers+text" if show_text_labels else "lines+markers",
-                text=[f"{v:.1f}%" for v in agg_t["Pct_Cobertura"]] if show_text_labels else None,
-                textposition="top center",
-                line=dict(color="#2ca02c", width=3),
-                marker=dict(size=8 if show_text_labels else 6),
+                mode="lines+markers",
+                line=dict(color="#f59e0b", width=3.5),
+                marker=dict(
+                    size=10 if show_text_labels else 7,
+                    color="#f59e0b",
+                    line=dict(width=2, color="#0f172a"),
+                ),
                 hovertemplate="<b>%{x}</b><br>Cobertura: %{y:.2f}%<extra></extra>",
             ),
             secondary_y=True,
         )
 
-        fig.add_hline(
+        # Etiquetas con fondo blanco de alto contraste sobre la linea
+        if show_text_labels:
+            for row_t in agg_t.itertuples(index=False):
+                fig.add_annotation(
+                    x=row_t.Periodo,
+                    y=row_t.Pct_Cobertura,
+                    yref="y2",
+                    text=f"<b>{row_t.Pct_Cobertura:.1f}%</b>",
+                    showarrow=False,
+                    yshift=18,
+                    font=dict(color="#0f172a", size=11),
+                    bgcolor="rgba(255, 255, 255, 0.92)",
+                    bordercolor="#f59e0b",
+                    borderwidth=1.2,
+                    borderpad=3,
+                )
+
+        # Linea objetivo 98% correctamente ubicada en y=98 del eje derecho
+        fig.add_shape(
+            type="line",
+            xref="paper",
+            x0=0,
+            x1=1,
+            yref="y2",
+            y0=98,
+            y1=98,
+            line=dict(color="#334155", width=1.5, dash="dot"),
+        )
+        fig.add_annotation(
+            xref="paper",
+            x=0.99,
+            yref="y2",
             y=98,
-            line_dash="dot",
-            line_color="gray",
-            annotation_text="Objetivo 98%",
-            annotation_position="bottom right",
-            secondary_y=True,
+            text="Objetivo 98%",
+            showarrow=False,
+            yshift=-12,
+            xanchor="right",
+            font=dict(color="#334155", size=11),
+            bgcolor="rgba(255, 255, 255, 0.85)",
         )
 
         fig.update_layout(
@@ -790,7 +871,7 @@ with tab1:
         fig.update_yaxes(title_text="Cantidad de Viajes", secondary_y=False)
         fig.update_yaxes(
             title_text="% Cobertura TMS",
-            range=[0, 112],
+            range=[0, 114],
             dtick=20,
             showgrid=False,
             secondary_y=True,
@@ -875,7 +956,7 @@ with tab1:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE C: DETALLE DE AUDITORIA Y ALERTAS DE INTEGRIDAD
+    # BLOQUE C: DETALLE DE AUDITORIA Y ALERTAS DE INTEGRIDAD (FECHAS SIN 00:00)
     # -------------------------------------------------------------------------
     st.markdown("### 3. Auditoría de Brechas y Alertas de Integridad")
 
@@ -886,13 +967,14 @@ with tab1:
         .copy()
         .sort_values(["Operacion", "Fecha_Base", "Ref_Clean"])
     )
-    df_gap_export["Tiendas_WMS_Lista"] = df_gap_export["Set_Tiendas_WMS"].apply(lambda x: ", ".join(x))
-    df_gap_export = df_gap_export.drop(columns=["Set_Tiendas_WMS"]).rename(
+    df_gap_export["Fecha Reparto"] = df_gap_export["Fecha_Base"].dt.strftime("%d/%m/%Y").fillna("")
+    df_gap_export["Tiendas Despachadas WMS"] = df_gap_export["Set_Tiendas_WMS"].apply(lambda x: ", ".join(x))
+    df_gap_export = df_gap_export[
+        ["Operacion", "Fecha Reparto", "Ref_Clean", "Transportista", "Tiendas_WMS", "Tiendas Despachadas WMS"]
+    ].rename(
         columns={
-            "Fecha_Base": "Fecha Reparto",
             "Ref_Clean": "Ref Externa Viaje",
             "Tiendas_WMS": "Cant. Tiendas WMS",
-            "Tiendas_WMS_Lista": "Tiendas Despachadas WMS",
         }
     )
 
@@ -914,19 +996,74 @@ with tab1:
         ]
         .copy()
         .sort_values(["Operacion", "Fecha_Base", "Ref_Clean"])
-        .rename(
-            columns={
-                "Fecha_Base": "Fecha Reparto",
-                "Ref_Clean": "Ref Externa Viaje",
-                "Tiendas_WMS": "Cant. Tiendas WMS",
-                "Tiendas_TMS": "Cant. Tiendas TMS",
-                "Lista_Faltan_TMS": "Tiendas en WMS pero NO en TMS",
-                "Lista_Extra_TMS": "Tiendas en TMS pero NO en WMS",
-            }
-        )
+    )
+    df_store_diff_export["Fecha Reparto"] = df_store_diff_export["Fecha_Base"].dt.strftime("%d/%m/%Y").fillna("")
+    df_store_diff_export = df_store_diff_export[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Ref_Clean",
+            "Transportista",
+            "Tiendas_WMS",
+            "Tiendas_TMS",
+            "Lista_Faltan_TMS",
+            "Lista_Extra_TMS",
+        ]
+    ].rename(
+        columns={
+            "Ref_Clean": "Ref Externa Viaje",
+            "Tiendas_WMS": "Cant. Tiendas WMS",
+            "Tiendas_TMS": "Cant. Tiendas TMS",
+            "Lista_Faltan_TMS": "Tiendas en WMS pero NO en TMS",
+            "Lista_Extra_TMS": "Tiendas en TMS pero NO en WMS",
+        }
     )
 
-    excel_bytes = build_audit_excel(df_gap_export, df_store_diff_export, dup_filt, inv_filt)
+    dup_display = dup_filt.copy()
+    dup_display["Fecha Reparto"] = dup_display["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    dup_display = dup_display[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Hora Reparto",
+            "Ref_Clean",
+            "Id Viaje",
+            "Dominio",
+            "Tipo de Camion",
+            "Tiendas_Planificadas",
+            "Tiendas_Con_Visita_GPS",
+        ]
+    ].rename(
+        columns={
+            "Ref_Clean": "Ref Externa Viaje",
+            "Tiendas_Planificadas": "Tiendas Plan.",
+            "Tiendas_Con_Visita_GPS": "Con Visita GPS",
+        }
+    )
+
+    inv_display = inv_filt.copy()
+    inv_display["Fecha Reparto"] = inv_display["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    inv_display = inv_display[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Hora Reparto",
+            "Id Viaje",
+            "Dominio",
+            "Tipo de Camion",
+            "Ref_Externa_Original",
+            "Tiendas_Planificadas",
+            "Observacion_Principal",
+        ]
+    ].rename(
+        columns={
+            "Ref_Externa_Original": "Ref Externa Original",
+            "Tiendas_Planificadas": "Tiendas Plan.",
+            "Observacion_Principal": "Observación",
+        }
+    )
+
+    excel_bytes = build_audit_excel(df_gap_export, df_store_diff_export, dup_display, inv_display)
     st.download_button(
         label="📥 Descargar Auditoría Completa en Excel (.xlsx)",
         data=excel_bytes,
@@ -944,18 +1081,18 @@ with tab1:
 
     with sub_t1:
         st.caption("Viajes despachados en AMREPA (WMS) que no ingresaron o no matchearon en UNIGIS.")
-        st.dataframe(df_gap_export, hide_index=True)
+        st.dataframe(df_gap_export, use_container_width=True, hide_index=True)
 
     with sub_t2:
         st.caption("Viajes que sí existen en ambos sistemas, pero difieren en las tiendas asignadas.")
-        st.dataframe(df_store_diff_export, hide_index=True)
+        st.dataframe(df_store_diff_export, use_container_width=True, hide_index=True)
 
     with sub_t3:
         st.markdown("**A. Ref Externa Viaje duplicadas en múltiples `Id Viaje` (ambos conservados como alerta)**")
-        st.dataframe(dup_filt, hide_index=True)
+        st.dataframe(dup_display, use_container_width=True, hide_index=True)
 
         st.markdown("**B. Viajes descartados de UNIGIS por `Ref Externa Viaje` vacía o con formato inválido**")
-        st.dataframe(inv_filt, hide_index=True)
+        st.dataframe(inv_display, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # PLACEHOLDERS PARA PROXIMAS SOLAPAS
