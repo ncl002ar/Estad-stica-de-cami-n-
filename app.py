@@ -1470,7 +1470,7 @@ with tab2:
 
     viajes_gps_tot = int(gps_filt["Id Viaje"].nunique())
     viajes_ciegos_cnt = int(
-        gps_filt[gps_filt["Visitadas_En_IdViaje"] == 0]["Id Viaje"].nunique()
+        gps_filt[gps_filt["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)"]["Id Viaje"].nunique()
     )
     viajes_100_ok_cnt = int(
         gps_filt.groupby("Id Viaje")["Observacion"]
@@ -1479,11 +1479,11 @@ with tab2:
     )
 
     pct_efec_gps = (paradas_ok / tot_paradas * 100) if tot_paradas > 0 else 0.0
-    pct_viajes_ciegos = (viajes_ciegos_cnt / viajes_gps_tot * 100) if viajes_gps_tot > 0 else 0.0
+    pct_ciego = (paradas_ciego / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_geo = (paradas_geo / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_sin_coord = (paradas_sin_coord / tot_paradas * 100) if tot_paradas > 0 else 0.0
 
-    g1, g2, g3, g4, g5 = st.columns([1.05, 1.45, 1.25, 1.15, 0.95])
+    g1, g2, g3, g4, g5 = st.columns([1.05, 1.45, 1.25, 1.20, 0.95])
     with g1:
         st.markdown(
             _kpi_card_html(
@@ -1509,11 +1509,11 @@ with tab2:
     with g3:
         st.markdown(
             _kpi_card_html(
-                "Viajes Ciegos (0% GPS)",
-                _fmt_int(viajes_ciegos_cnt),
-                f"{_fmt_pct(pct_viajes_ciegos)} de los viajes sin señal",
-                "#dc2626" if viajes_ciegos_cnt > 0 else "#16a34a",
-                f"Abarca <b>{_fmt_int(paradas_ciego)}</b> paradas sin visita",
+                "Falla GPS / Unidad (Paradas)",
+                _fmt_int(paradas_ciego),
+                f"{_fmt_pct(pct_ciego)} del total de paradas",
+                "#dc2626" if paradas_ciego > 0 else "#16a34a",
+                f"En <b>{_fmt_int(viajes_ciegos_cnt)}</b> viajes con 0% tiendas GPS",
             ),
             unsafe_allow_html=True,
         )
@@ -2084,10 +2084,13 @@ with tab2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
+    cant_geo_rec_pairs = int((st_rank_all["Falla Geocerca"] >= 2).sum())
+    cant_dom_ciegos = int((dom_rank_all["Viajes Ciegos"] > 0).sum())
+
     gtab1, gtab2, gtab3 = st.tabs(
         [
-            f"🗺️ Tiendas a Re-geocercar ({len(st_rank_all[st_rank_all['Falla Geocerca'] > 0])})",
-            f"📡 Unidades / Transportistas Ciegos ({len(dom_rank_all[dom_rank_all['Viajes Ciegos'] > 0])})",
+            f"🗺️ Tiendas a Revisar Geozona ({cant_geo_rec_pairs} recurrentes)",
+            f"📡 Unidades Sin Señal GPS ({cant_dom_ciegos})",
             f"📌 Tiendas Sin Coordenadas ({len(sin_coord_tbl)})",
         ]
     )
@@ -2095,18 +2098,30 @@ with tab2:
     with gtab1:
         st.caption(
             "Tiendas donde el camión sí registró visitas GPS en otras paradas del mismo viaje, "
-            "pero marcó 'No visitada' aquí (indicio directo de polígono/geocerca mal dibujada)."
+            "pero marcó 'No visitada' aquí (falla parcial atribuible a geozona/polígono)."
         )
-        min_paradas_geo = st.number_input(
-            "Mínimo de paradas planificadas en la tienda:",
-            min_value=1,
-            max_value=100,
-            value=5,
-            step=1,
-            key="min_paradas_geo",
-        )
+        gc1, gc2 = st.columns(2)
+        with gc1:
+            min_fallas_geo = st.number_input(
+                "Mínimo de fallas de geozona (2 = excluye casos aislados de 1 vez):",
+                min_value=1,
+                max_value=50,
+                value=2,
+                step=1,
+                key="min_fallas_geo",
+            )
+        with gc2:
+            min_paradas_geo = st.number_input(
+                "Mínimo de paradas planificadas en la tienda:",
+                min_value=1,
+                max_value=100,
+                value=5,
+                step=1,
+                key="min_paradas_geo",
+            )
         st_geo_view = st_rank_all[
-            (st_rank_all["Paradas Plan."] >= min_paradas_geo) & (st_rank_all["Falla Geocerca"] > 0)
+            (st_rank_all["Falla Geocerca"] >= min_fallas_geo)
+            & (st_rank_all["Paradas Plan."] >= min_paradas_geo)
         ]
         st.dataframe(
             st_geo_view,
@@ -2132,66 +2147,19 @@ with tab2:
 
     with gtab2:
         st.caption(
-            "Unidades (patentes) y transportistas con viajes donde ninguna tienda registró entrada a geocerca (0% señal GPS)."
+            "Unidades (patentes) con viajes donde ninguna tienda registró entrada a geocerca (0% señal GPS en el recorrido)."
         )
-        fcol1, fcol2 = st.columns([1.2, 1])
-        with fcol1:
-            nivel_flota = st.radio(
-                "Agrupar ranking por:",
-                options=["Por Patente (Dominio)", "Por Código de Transportista"],
-                index=0,
-                horizontal=True,
-                key="nivel_flota_gps",
-            )
-        with fcol2:
-            min_viajes_gps = st.number_input(
-                "Mínimo de viajes realizados:",
-                min_value=1,
-                max_value=100,
-                value=5,
-                step=1,
-                key="min_viajes_gps",
-            )
-
-        if nivel_flota == "Por Patente (Dominio)":
-            fleet_view = dom_rank_all[
-                (dom_rank_all["Viajes TMS"] >= min_viajes_gps) & (dom_rank_all["Viajes Ciegos"] > 0)
-            ]
-        else:
-            trans_rank = (
-                dom_trip_lvl.groupby(["Operacion", "Transportista"], as_index=False)
-                .agg(
-                    Unidades=("Dominio", "nunique"),
-                    Viajes_TMS=("Id Viaje", "nunique"),
-                    Viajes_Ciegos=("Es_Ciego", "sum"),
-                    Paradas_Plan=("Paradas", "sum"),
-                    Paradas_OK=("Visitadas", "sum"),
-                )
-            )
-            trans_rank["% Viajes Ciegos"] = np.where(
-                trans_rank["Viajes_TMS"] > 0,
-                (trans_rank["Viajes_Ciegos"] / trans_rank["Viajes_TMS"] * 100).round(1),
-                0.0,
-            )
-            trans_rank["% Efectividad GPS"] = np.where(
-                trans_rank["Paradas_Plan"] > 0,
-                (trans_rank["Paradas_OK"] / trans_rank["Paradas_Plan"] * 100).round(1),
-                0.0,
-            )
-            trans_rank = trans_rank.sort_values(
-                ["Viajes_Ciegos", "% Viajes Ciegos"], ascending=[False, False]
-            ).rename(
-                columns={
-                    "Operacion": "CD",
-                    "Viajes_TMS": "Viajes TMS",
-                    "Viajes_Ciegos": "Viajes Ciegos",
-                    "Paradas_Plan": "Paradas Plan.",
-                    "Paradas_OK": "Paradas OK",
-                }
-            )
-            fleet_view = trans_rank[
-                (trans_rank["Viajes TMS"] >= min_viajes_gps) & (trans_rank["Viajes Ciegos"] > 0)
-            ]
+        min_viajes_gps = st.number_input(
+            "Mínimo de viajes realizados por la patente:",
+            min_value=1,
+            max_value=100,
+            value=5,
+            step=1,
+            key="min_viajes_gps",
+        )
+        fleet_view = dom_rank_all[
+            (dom_rank_all["Viajes TMS"] >= min_viajes_gps) & (dom_rank_all["Viajes Ciegos"] > 0)
+        ]
 
         st.dataframe(
             fleet_view,
