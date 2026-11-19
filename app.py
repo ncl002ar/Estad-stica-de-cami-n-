@@ -348,13 +348,14 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     }
 
 
-def build_audit_excel(df_gap, df_store_diff, df_dup, df_inv) -> bytes:
+def build_audit_excel(df_gap, df_solo_tms, df_store_diff, df_dup, df_inv) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_gap.to_excel(writer, sheet_name="1_Viajes_Solo_WMS_Gap", index=False)
-        df_store_diff.to_excel(writer, sheet_name="2_Diferencias_Tiendas", index=False)
-        df_dup.to_excel(writer, sheet_name="3_Alerta_Ref_Duplicadas", index=False)
-        df_inv.to_excel(writer, sheet_name="4_Alerta_Ref_Invalidas", index=False)
+        df_solo_tms.to_excel(writer, sheet_name="2_Viajes_Solo_TMS", index=False)
+        df_store_diff.to_excel(writer, sheet_name="3_Diferencias_Tiendas", index=False)
+        df_dup.to_excel(writer, sheet_name="4_Alerta_Ref_Duplicadas", index=False)
+        df_inv.to_excel(writer, sheet_name="5_Alerta_Ref_Invalidas", index=False)
     return output.getvalue()
 
 
@@ -663,6 +664,7 @@ with tab1:
         v_tms = int(sub["_merge"].isin(["both", "right_only"]).sum())
         v_match = int((sub["_merge"] == "both").sum())
         v_gap = int((sub["_merge"] == "left_only").sum())
+        v_solo_tms = int((sub["_merge"] == "right_only").sum())
         cob_v = (v_match / v_wms * 100) if v_wms > 0 else 0.0
 
         sub_wms_all = sub[sub["_merge"].isin(["both", "left_only"])]
@@ -681,7 +683,8 @@ with tab1:
                 "Viajes WMS": v_wms,
                 "Viajes TMS": v_tms,
                 "Match": v_match,
-                "Gap Viajes": v_gap,
+                "Gap WMS": v_gap,
+                "Solo TMS": v_solo_tms,
                 "% Cob. Viajes": round(cob_v, 2),
                 "Tiendas WMS": t_wms_tot,
                 "En TMS": t_ambos,
@@ -700,7 +703,8 @@ with tab1:
                     "Viajes WMS": df_resumen_op["Viajes WMS"].sum(),
                     "Viajes TMS": df_resumen_op["Viajes TMS"].sum(),
                     "Match": df_resumen_op["Match"].sum(),
-                    "Gap Viajes": df_resumen_op["Gap Viajes"].sum(),
+                    "Gap WMS": df_resumen_op["Gap WMS"].sum(),
+                    "Solo TMS": df_resumen_op["Solo TMS"].sum(),
                     "% Cob. Viajes": round(pct_cob_viajes, 2),
                     "Tiendas WMS": df_resumen_op["Tiendas WMS"].sum(),
                     "En TMS": df_resumen_op["En TMS"].sum(),
@@ -721,7 +725,8 @@ with tab1:
                 "Viajes WMS": st.column_config.NumberColumn("Viajes WMS", format="%d", width="small"),
                 "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
                 "Match": st.column_config.NumberColumn("Match", format="%d", width="small"),
-                "Gap Viajes": st.column_config.NumberColumn("Gap Viajes", format="%d", width="small"),
+                "Gap WMS": st.column_config.NumberColumn("Gap WMS", format="%d", width="small"),
+                "Solo TMS": st.column_config.NumberColumn("Solo TMS", format="%d", width="small"),
                 "% Cob. Viajes": st.column_config.ProgressColumn(
                     "% Cob. Viajes",
                     format="%.1f%%",
@@ -1125,7 +1130,29 @@ with tab1:
         }
     )
 
-    excel_bytes = build_audit_excel(df_gap_export, df_store_diff_export, dup_display, inv_display)
+    df_solo_tms_export = (
+        df_filt[df_filt["_merge"] == "right_only"][
+            ["Operacion", "Fecha_Base", "Ref_Clean", "Ids_Viaje", "Dominio", "Tipo_Camion", "Tiendas_TMS", "Set_Tiendas_TMS"]
+        ]
+        .copy()
+        .sort_values(["Operacion", "Fecha_Base", "Ref_Clean"])
+    )
+    df_solo_tms_export["Fecha Reparto"] = df_solo_tms_export["Fecha_Base"].dt.strftime("%d/%m/%Y").fillna("")
+    df_solo_tms_export["Tiendas en TMS"] = df_solo_tms_export["Set_Tiendas_TMS"].apply(lambda x: ", ".join(x))
+    df_solo_tms_export = df_solo_tms_export[
+        ["Operacion", "Fecha Reparto", "Ref_Clean", "Ids_Viaje", "Dominio", "Tipo_Camion", "Tiendas_TMS", "Tiendas en TMS"]
+    ].rename(
+        columns={
+            "Ref_Clean": "Ref Externa Viaje",
+            "Ids_Viaje": "Id Viaje UNIGIS",
+            "Tipo_Camion": "Tipo Camión",
+            "Tiendas_TMS": "Cant. Tiendas TMS",
+        }
+    )
+
+    excel_bytes = build_audit_excel(
+        df_gap_export, df_solo_tms_export, df_store_diff_export, dup_display, inv_display
+    )
     st.download_button(
         label="📥 Descargar Auditoría Completa en Excel (.xlsx)",
         data=excel_bytes,
@@ -1133,9 +1160,10 @@ with tab1:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    sub_t1, sub_t2, sub_t3 = st.tabs(
+    sub_t1, sub_t_solo_tms, sub_t2, sub_t3 = st.tabs(
         [
             f"🚨 Viajes Faltantes en TMS ({len(df_gap_export)})",
+            f"🚛 Viajes Solo en TMS ({len(df_solo_tms_export)})",
             f"🏪 Diferencias de Tiendas ({len(df_store_diff_export)})",
             f"⚠️ Alertas Calidad UNIGIS ({cant_dup_refs} dup | {cant_inv_trips} inv.)",
         ]
@@ -1144,6 +1172,10 @@ with tab1:
     with sub_t1:
         st.caption("Viajes despachados en AMREPA (WMS) que no ingresaron o no matchearon en UNIGIS.")
         st.dataframe(df_gap_export, use_container_width=True, hide_index=True)
+
+    with sub_t_solo_tms:
+        st.caption("Viajes con referencia válida presentes en UNIGIS (TMS) que no figuran en el corte de AMREPA (WMS).")
+        st.dataframe(df_solo_tms_export, use_container_width=True, hide_index=True)
 
     with sub_t2:
         st.caption("Viajes que sí existen en ambos sistemas, pero difieren en las tiendas asignadas.")
