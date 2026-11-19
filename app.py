@@ -20,7 +20,7 @@ except ImportError:
 # CONFIGURACION DE PAGINA
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="Torre de Control Transporte | Retail WMS vs TMS",
+    page_title="Estadística de Camión | Retail WMS vs TMS",
     page_icon="🚚",
     layout="wide",
     initial_sidebar_state="expanded",
