@@ -395,7 +395,7 @@ if "manual_u" in st.session_state and st.session_state["manual_u"] is not None:
     unigis_bytes = st.session_state["manual_u"]
 
 if amrepa_bytes is None or unigis_bytes is None:
-    st.title("🚚 Estadística de Camión — Retail")
+    st.title("🚚 Estadística de Camión")
     st.warning("No se detectaron archivos base. Cargalos desde el menú lateral.")
     up_a = st.sidebar.file_uploader("Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
     up_u = st.sidebar.file_uploader("Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
@@ -556,43 +556,59 @@ with tab1:
 
     pct_cob_viajes = (viajes_match / viajes_wms * 100) if viajes_wms > 0 else 0.0
 
+    wms_only_trips = df_filt[df_filt["_merge"].isin(["both", "left_only"])]
     matched_only = df_filt[df_filt["_merge"] == "both"]
-    tiendas_wms_match = int(matched_only["Tiendas_WMS"].sum())
+    gap_only_trips = df_filt[df_filt["_merge"] == "left_only"]
+
+    tiendas_wms_total = int(wms_only_trips["Tiendas_WMS"].sum())
     tiendas_ambos_match = int(matched_only["Tiendas_Match"].sum())
-    tiendas_faltan_tms = int(matched_only["Cant_Tiendas_Faltan_TMS"].sum())
-    pct_cob_tiendas = (
-        (tiendas_ambos_match / tiendas_wms_match * 100) if tiendas_wms_match > 0 else 0.0
+    tiendas_faltan_viaje = int(gap_only_trips["Tiendas_WMS"].sum())
+    tiendas_faltan_match = int(matched_only["Cant_Tiendas_Faltan_TMS"].sum())
+    tiendas_faltan_total = tiendas_faltan_viaje + tiendas_faltan_match
+
+    tiendas_wms_en_match = int(matched_only["Tiendas_WMS"].sum())
+    pct_cob_tiendas_global = (
+        (tiendas_ambos_match / tiendas_wms_total * 100) if tiendas_wms_total > 0 else 0.0
+    )
+    pct_cob_tiendas_match = (
+        (tiendas_ambos_match / tiendas_wms_en_match * 100) if tiendas_wms_en_match > 0 else 0.0
     )
 
     cant_dup_refs = int(dup_filt["Ref_Clean"].nunique())
     cant_inv_trips = int(inv_filt["Id Viaje"].nunique())
 
-    c1, c2, c3, c4, c5 = st.columns(5)
-    c1.metric("Viajes Despachados (WMS)", f"{viajes_wms:,}".replace(",", "."))
-    c2.metric("Viajes Válidos (TMS)", f"{viajes_tms:,}".replace(",", "."))
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Viajes WMS", f"{viajes_wms:,}".replace(",", "."))
+    c2.metric("Viajes TMS", f"{viajes_tms:,}".replace(",", "."))
     c3.metric(
-        "% Cobertura Viajes",
+        "% Cob. Viajes",
         f"{pct_cob_viajes:.2f}%",
         delta=f"-{viajes_gap:,} sin TMS".replace(",", "."),
         delta_color="inverse" if viajes_gap > 0 else "off",
     )
     c4.metric(
-        "% Cobertura Tiendas",
-        f"{pct_cob_tiendas:.2f}%",
-        delta=f"-{tiendas_faltan_tms:,} tiendas".replace(",", "."),
-        delta_color="inverse" if tiendas_faltan_tms > 0 else "off",
+        "% Cob. Tiendas Global",
+        f"{pct_cob_tiendas_global:.2f}%",
+        delta=f"-{tiendas_faltan_total:,} sin TMS".replace(",", "."),
+        delta_color="inverse" if tiendas_faltan_total > 0 else "off",
     )
     c5.metric(
-        "Alertas Integridad TMS",
+        "% Cob. Tiendas Match",
+        f"{pct_cob_tiendas_match:.2f}%",
+        delta=f"-{tiendas_faltan_viaje:,} viaje | -{tiendas_faltan_match:,} parada".replace(",", "."),
+        delta_color="off",
+    )
+    c6.metric(
+        "Alertas TMS",
         f"{cant_dup_refs + cant_inv_trips}",
-        delta=f"{cant_dup_refs} dup | {cant_inv_trips} ref inv.",
+        delta=f"{cant_dup_refs} dup | {cant_inv_trips} inv.",
         delta_color="off",
     )
 
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE A: TABLA RESUMEN POR OPERACION (COMPACTA SIN SCROLL HORIZONTAL)
+    # BLOQUE A: TABLA RESUMEN POR OPERACION (OPCION B: GLOBAL + EN VIAJE MATCH)
     # -------------------------------------------------------------------------
     st.markdown("### 1. Resumen por Operación (Centro de Distribución)")
 
@@ -603,29 +619,35 @@ with tab1:
         v_tms = int(sub["_merge"].isin(["both", "right_only"]).sum())
         v_match = int((sub["_merge"] == "both").sum())
         v_gap = int((sub["_merge"] == "left_only").sum())
-        v_solo_tms = int((sub["_merge"] == "right_only").sum())
         cob_v = (v_match / v_wms * 100) if v_wms > 0 else 0.0
 
+        sub_wms_all = sub[sub["_merge"].isin(["both", "left_only"])]
         sub_m = sub[sub["_merge"] == "both"]
-        t_wms = int(sub_m["Tiendas_WMS"].sum())
-        t_tms = int(sub_m["Tiendas_TMS"].sum())
+        sub_g = sub[sub["_merge"] == "left_only"]
+
+        t_wms_tot = int(sub_wms_all["Tiendas_WMS"].sum())
         t_ambos = int(sub_m["Tiendas_Match"].sum())
-        t_faltan = int(sub_m["Cant_Tiendas_Faltan_TMS"].sum())
-        cob_t = (t_ambos / t_wms * 100) if t_wms > 0 else 0.0
+        t_faltan_v = int(sub_g["Tiendas_WMS"].sum())
+        t_faltan_m = int(sub_m["Cant_Tiendas_Faltan_TMS"].sum())
+        t_wms_m = int(sub_m["Tiendas_WMS"].sum())
+
+        cob_t_glob = (t_ambos / t_wms_tot * 100) if t_wms_tot > 0 else 0.0
+        cob_t_match = (t_ambos / t_wms_m * 100) if t_wms_m > 0 else 0.0
 
         rows_op.append(
             {
                 "CD": str(int(op)),
                 "Viajes WMS": v_wms,
                 "Viajes TMS": v_tms,
-                "En Ambos": v_match,
-                "Gap WMS": v_gap,
-                "Solo TMS": v_solo_tms,
+                "Match": v_match,
+                "Gap Viajes": v_gap,
                 "% Cob. Viajes": round(cob_v, 2),
-                "Tiendas WMS": t_wms,
-                "Tiendas TMS": t_tms,
-                "Faltan TMS": t_faltan,
-                "% Cob. Tiendas": round(cob_t, 2),
+                "Tiendas WMS": t_wms_tot,
+                "En TMS": t_ambos,
+                "Faltan x Viaje": t_faltan_v,
+                "Faltan en Match": t_faltan_m,
+                "% Cob. Global": round(cob_t_glob, 2),
+                "% Cob. Match": round(cob_t_match, 2),
             }
         )
 
@@ -637,14 +659,15 @@ with tab1:
                     "CD": "TOTAL",
                     "Viajes WMS": df_resumen_op["Viajes WMS"].sum(),
                     "Viajes TMS": df_resumen_op["Viajes TMS"].sum(),
-                    "En Ambos": df_resumen_op["En Ambos"].sum(),
-                    "Gap WMS": df_resumen_op["Gap WMS"].sum(),
-                    "Solo TMS": df_resumen_op["Solo TMS"].sum(),
+                    "Match": df_resumen_op["Match"].sum(),
+                    "Gap Viajes": df_resumen_op["Gap Viajes"].sum(),
                     "% Cob. Viajes": round(pct_cob_viajes, 2),
                     "Tiendas WMS": df_resumen_op["Tiendas WMS"].sum(),
-                    "Tiendas TMS": df_resumen_op["Tiendas TMS"].sum(),
-                    "Faltan TMS": df_resumen_op["Faltan TMS"].sum(),
-                    "% Cob. Tiendas": round(pct_cob_tiendas, 2),
+                    "En TMS": df_resumen_op["En TMS"].sum(),
+                    "Faltan x Viaje": df_resumen_op["Faltan x Viaje"].sum(),
+                    "Faltan en Match": df_resumen_op["Faltan en Match"].sum(),
+                    "% Cob. Global": round(pct_cob_tiendas_global, 2),
+                    "% Cob. Match": round(pct_cob_tiendas_match, 2),
                 }
             ]
         )
@@ -658,25 +681,32 @@ with tab1:
                 "CD": st.column_config.TextColumn("CD", width="small"),
                 "Viajes WMS": st.column_config.NumberColumn("Viajes WMS", format="%d", width="small"),
                 "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
-                "En Ambos": st.column_config.NumberColumn("En Ambos", format="%d", width="small"),
-                "Gap WMS": st.column_config.NumberColumn("Gap WMS", format="%d", width="small"),
-                "Solo TMS": st.column_config.NumberColumn("Solo TMS", format="%d", width="small"),
+                "Match": st.column_config.NumberColumn("Match", format="%d", width="small"),
+                "Gap Viajes": st.column_config.NumberColumn("Gap Viajes", format="%d", width="small"),
                 "% Cob. Viajes": st.column_config.ProgressColumn(
                     "% Cob. Viajes",
                     format="%.1f%%",
                     min_value=0,
                     max_value=100,
-                    width="medium",
+                    width="small",
                 ),
                 "Tiendas WMS": st.column_config.NumberColumn("Tiendas WMS", format="%d", width="small"),
-                "Tiendas TMS": st.column_config.NumberColumn("Tiendas TMS", format="%d", width="small"),
-                "Faltan TMS": st.column_config.NumberColumn("Faltan TMS", format="%d", width="small"),
-                "% Cob. Tiendas": st.column_config.ProgressColumn(
-                    "% Cob. Tiendas",
+                "En TMS": st.column_config.NumberColumn("En TMS", format="%d", width="small"),
+                "Faltan x Viaje": st.column_config.NumberColumn("Faltan x Viaje", format="%d", width="small"),
+                "Faltan en Match": st.column_config.NumberColumn("Faltan en Match", format="%d", width="small"),
+                "% Cob. Global": st.column_config.ProgressColumn(
+                    "% Cob. Global",
                     format="%.1f%%",
                     min_value=0,
                     max_value=100,
-                    width="medium",
+                    width="small",
+                ),
+                "% Cob. Match": st.column_config.ProgressColumn(
+                    "% Cob. Match",
+                    format="%.1f%%",
+                    min_value=0,
+                    max_value=100,
+                    width="small",
                 ),
             },
         )
