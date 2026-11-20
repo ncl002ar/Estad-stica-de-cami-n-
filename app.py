@@ -137,6 +137,17 @@ def _clean_int_str(series: pd.Series) -> pd.Series:
     return num.apply(lambda x: str(int(x)) if pd.notna(x) else np.nan)
 
 
+def _to_float_safe(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_numeric_dtype(series):
+        return pd.to_numeric(series, errors="coerce").astype(float)
+    cleaned = (
+        series.astype(str)
+        .str.strip()
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(cleaned, errors="coerce").astype(float)
+
+
 @st.cache_data(show_spinner="Procesando y conciliando bases AMREPA y UNIGIS...")
 def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     # 1. Lectura de archivos Excel
@@ -172,13 +183,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
 
     # Parseo de Distancia en Activacion (si viene en el reporte)
     if "Distancia en Activacion" in df_u.columns:
-        if df_u["Distancia en Activacion"].dtype == object:
-            df_u["Dist_Activacion_km"] = pd.to_numeric(
-                df_u["Distancia en Activacion"].astype(str).str.replace(",", ".", regex=False),
-                errors="coerce",
-            )
-        else:
-            df_u["Dist_Activacion_km"] = pd.to_numeric(df_u["Distancia en Activacion"], errors="coerce")
+        df_u["Dist_Activacion_km"] = _to_float_safe(df_u["Distancia en Activacion"])
     else:
         df_u["Dist_Activacion_km"] = np.nan
 
@@ -439,14 +444,12 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     # 6. Preparacion de tablas base para Solapa 3 (Data Quality) y Solapa 4 (Tiempos)
     # IMPORTANTE: Ignoramos por completo la segunda fila de CD - Carga (retorno) y NO usamos
     # tiempos ni kms de retorno para excluir viajes de la base limpia.
-    def _parse_comma_float(series: pd.Series) -> pd.Series:
-        if series.dtype == object:
-            return pd.to_numeric(series.astype(str).str.replace(",", ".", regex=False), errors="coerce")
-        return pd.to_numeric(series, errors="coerce")
-
     u_clean_num = u_valid.copy()
     for col_num in ["KMS Parada", "Velocidad Real Calculada", "KMS Total Viaje", "KMS Retorno"]:
-        u_clean_num[col_num + "_num"] = _parse_comma_float(u_clean_num[col_num])
+        u_clean_num[col_num + "_num"] = _to_float_safe(u_clean_num[col_num])
+    for col_time in ["Tiempo de Estadia", "Tiempo en Viaje", "Tiempo Retorno", "Cantidad Visitas"]:
+        if col_time in u_clean_num.columns:
+            u_clean_num[col_time] = _to_float_safe(u_clean_num[col_time])
 
     # Identificar secuencia de CD - Carga: 1 = CD Origen (Carga), >1 = Fila retorno (se descarta por completo)
     u_clean_num["cd_seq"] = np.where(
