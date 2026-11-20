@@ -437,6 +437,8 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     stores_gps = stores_gps[keep_store_cols].copy()
 
     # 6. Preparacion de tablas base para Solapa 3 (Data Quality) y Solapa 4 (Tiempos)
+    # IMPORTANTE: Ignoramos por completo la segunda fila de CD - Carga (retorno) y NO usamos
+    # tiempos ni kms de retorno para excluir viajes de la base limpia.
     def _parse_comma_float(series: pd.Series) -> pd.Series:
         if series.dtype == object:
             return pd.to_numeric(series.astype(str).str.replace(",", ".", regex=False), errors="coerce")
@@ -445,6 +447,14 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     u_clean_num = u_valid.copy()
     for col_num in ["KMS Parada", "Velocidad Real Calculada", "KMS Total Viaje", "KMS Retorno"]:
         u_clean_num[col_num + "_num"] = _parse_comma_float(u_clean_num[col_num])
+
+    # Identificar secuencia de CD - Carga: 1 = CD Origen (Carga), >1 = Fila retorno (se descarta por completo)
+    u_clean_num["cd_seq"] = np.where(
+        u_clean_num["Tipo de Zona"] == "CD - Carga",
+        u_clean_num.groupby(["Id Viaje", "Tipo de Zona"]).cumcount() + 1,
+        0,
+    )
+    u_clean_num = u_clean_num[~((u_clean_num["Tipo de Zona"] == "CD - Carga") & (u_clean_num["cd_seq"] > 1))].copy()
 
     u_clean_num = u_clean_num.merge(a_trans_map, on=["Operacion", "Ref_Clean"], how="left")
     u_clean_num["Transportista"] = u_clean_num["Transportista"].fillna("Sin dato WMS")
@@ -461,43 +471,76 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         "Sin semana",
     )
 
-    # Identificar CD Origen (primera fila CD - Carga del Id Viaje)
-    u_clean_num["cd_seq"] = np.where(
-        u_clean_num["Tipo de Zona"] == "CD - Carga",
-        u_clean_num.groupby(["Id Viaje", "Tipo de Zona"]).cumcount() + 1,
-        0,
+    # Parseo de timestamps reales para detectar solapamientos horarios entre paradas consecutivas
+    u_clean_num["dt_ini_real"] = pd.to_datetime(
+        u_clean_num["Inicio Horario Visita Real"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+    u_clean_num["dt_fin_real"] = pd.to_datetime(
+        u_clean_num["Fecha Hora Salida"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+    u_clean_num["prev_dt_fin_real"] = u_clean_num.groupby("Id Viaje")["dt_fin_real"].shift(1)
+
+    # Completitud de CD Origen (1a fila CD - Carga) y de Todas las Tiendas por Id Viaje
+    cd_orig_rows = u_clean_num[u_clean_num["Tipo de Zona"] == "CD - Carga"].copy()
+    cd_orig_rows["_cd_ok"] = cd_orig_rows["visita_efectiva"] & cd_orig_rows["Tiempo de Estadia"].notna()
+    cd_orig_map = (
+        cd_orig_rows.groupby("Id Viaje", as_index=False)
+        .agg(
+            CD_Origen_OK=("_cd_ok", "first"),
+            Estadia_CD_Origen=("Tiempo de Estadia", "first"),
+            Ini_CD_Origen=("Inicio Horario Visita Real", "first"),
+            Fin_CD_Origen=("Fecha Hora Salida", "first"),
+        )
     )
 
-    # Completitud de tiendas por Id Viaje
     is_st = u_clean_num["Tipo de Zona"].isin(["Tienda", "Sin zona"])
-    st_tot_trip = u_clean_num[is_st].groupby("Id Viaje")["Tienda_Cod"].transform("count")
-    st_ok_trip = u_clean_num[is_st].groupby("Id Viaje")["visita_efectiva"].transform("sum")
-    trip_comp_map = (
+    st_comp_map = (
         u_clean_num[is_st]
-        .assign(
-            _st_tot=st_tot_trip,
-            _st_ok=st_ok_trip,
-        )
         .groupby("Id Viaje", as_index=False)
         .agg(
-            Tiendas_Plan_Viaje=("_st_tot", "first"),
-            Tiendas_OK_Viaje=("_st_ok", "first"),
+            Tiendas_Plan_Viaje=("Tienda_Cod", "count"),
+            Tiendas_OK_Viaje=("visita_efectiva", lambda s: int(s.sum())),
+            Sum_KMS_Paradas=("KMS Parada_num", "sum"),
         )
     )
-    trip_comp_map["Ruta_Tiendas_100_OK"] = (
-        (trip_comp_map["Tiendas_Plan_Viaje"] > 0)
-        & (trip_comp_map["Tiendas_Plan_Viaje"] == trip_comp_map["Tiendas_OK_Viaje"])
+    st_comp_map["Todas_Tiendas_OK"] = (
+        (st_comp_map["Tiendas_Plan_Viaje"] > 0)
+        & (st_comp_map["Tiendas_Plan_Viaje"] == st_comp_map["Tiendas_OK_Viaje"])
     )
 
-    u_clean_num = u_clean_num.merge(trip_comp_map, on="Id Viaje", how="left")
-    u_clean_num["Tiendas_Plan_Viaje"] = u_clean_num["Tiendas_Plan_Viaje"].fillna(0).astype(int)
-    u_clean_num["Tiendas_OK_Viaje"] = u_clean_num["Tiendas_OK_Viaje"].fillna(0).astype(int)
-    u_clean_num["Ruta_Tiendas_100_OK"] = u_clean_num["Ruta_Tiendas_100_OK"].fillna(False)
+    # Tabla a nivel Viaje TMS (1 fila por Id Viaje)
+    dq_trips = (
+        u_clean_num.groupby("Id Viaje", as_index=False)
+        .agg(
+            Operacion=("Operacion", "first"),
+            Fecha_Reparto=("Fecha_Reparto", "first"),
+            Hora_Reparto=("Hora Reparto", "first"),
+            Mes_Label=("Mes_Label", "first"),
+            Semana_Sort=("Semana_Sort", "first"),
+            Semana_Label=("Semana_Label", "first"),
+            Ref_Clean=("Ref_Clean", "first"),
+            Transportista=("Transportista", "first"),
+            Dominio=("Dominio", "first"),
+            Tipo_Camion=("Tipo de Camion", "first"),
+            Categoria=("Categoria", "first"),
+            KMS_Total=("KMS Total Viaje_num", "first"),
+            KMS_Retorno=("KMS Retorno_num", "first"),
+            Tiempo_Retorno=("Tiempo Retorno", "first"),
+            Dist_Activacion_km=("Dist_Activacion_km", "first"),
+            obs_act_tarde=("obs_act_tarde", "max"),
+            obs_err_fin=("obs_err_fin", "max"),
+        )
+        .merge(cd_orig_map, on="Id Viaje", how="left")
+        .merge(st_comp_map, on="Id Viaje", how="left")
+    )
+    dq_trips["CD_Origen_OK"] = dq_trips["CD_Origen_OK"].fillna(False)
+    dq_trips["Todas_Tiendas_OK"] = dq_trips["Todas_Tiendas_OK"].fillna(False)
+    dq_trips["Tiendas_Plan_Viaje"] = dq_trips["Tiendas_Plan_Viaje"].fillna(0).astype(int)
+    dq_trips["Tiendas_OK_Viaje"] = dq_trips["Tiendas_OK_Viaje"].fillna(0).astype(int)
+    dq_trips["Viaje_Completo_Base"] = dq_trips["CD_Origen_OK"] & dq_trips["Todas_Tiendas_OK"]
 
-    # Subtabla 1: Paradas en Tienda con visita GPS (para auditoria de tiempos en tienda y transito)
-    dq_stores = u_clean_num[
-        (u_clean_num["Tipo de Zona"] == "Tienda") & (u_clean_num["visita_efectiva"])
-    ][
+    # Subtabla de Paradas en Tienda
+    dq_stores = u_clean_num[u_clean_num["Tipo de Zona"] == "Tienda"][
         [
             "Operacion",
             "Fecha_Reparto",
@@ -515,73 +558,19 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             "Categoria",
             "Inicio Horario Visita Real",
             "Fecha Hora Salida",
+            "dt_ini_real",
+            "dt_fin_real",
+            "prev_dt_fin_real",
             "Tiempo de Estadia",
             "Tiempo en Viaje",
             "KMS Parada_num",
             "Velocidad Real Calculada_num",
             "Cantidad Visitas",
-            "Dist_Activacion_km",
-            "obs_act_tarde",
-            "obs_err_fin",
-            "Ruta_Tiendas_100_OK",
+            "visita_efectiva",
         ]
     ].copy()
 
-    # Subtabla 2: Registros de CD Origen con visita GPS
-    dq_cd_orig = u_clean_num[
-        (u_clean_num["Tipo de Zona"] == "CD - Carga")
-        & (u_clean_num["cd_seq"] == 1)
-        & (u_clean_num["visita_efectiva"])
-    ][
-        [
-            "Operacion",
-            "Fecha_Reparto",
-            "Hora Reparto",
-            "Mes_Label",
-            "Semana_Sort",
-            "Semana_Label",
-            "Id Viaje",
-            "Ref_Clean",
-            "Transportista",
-            "Dominio",
-            "Tipo de Camion",
-            "Categoria",
-            "Inicio Horario Visita Real",
-            "Fecha Hora Salida",
-            "Tiempo de Estadia",
-            "Dist_Activacion_km",
-            "obs_act_tarde",
-            "obs_err_fin",
-            "Ruta_Tiendas_100_OK",
-        ]
-    ].copy()
-
-    # Subtabla 3: Nivel Viaje UNIGIS (Odometro, Retorno, Activacion y Completitud)
-    dq_trips = (
-        u_clean_num.groupby("Id Viaje", as_index=False)
-        .agg(
-            Operacion=("Operacion", "first"),
-            Fecha_Reparto=("Fecha_Reparto", "first"),
-            Hora_Reparto=("Hora Reparto", "first"),
-            Mes_Label=("Mes_Label", "first"),
-            Semana_Sort=("Semana_Sort", "first"),
-            Semana_Label=("Semana_Label", "first"),
-            Ref_Clean=("Ref_Clean", "first"),
-            Transportista=("Transportista", "first"),
-            Dominio=("Dominio", "first"),
-            Tipo_Camion=("Tipo de Camion", "first"),
-            Categoria=("Categoria", "first"),
-            Tiendas_Plan_Viaje=("Tiendas_Plan_Viaje", "first"),
-            Tiendas_OK_Viaje=("Tiendas_OK_Viaje", "first"),
-            Ruta_Tiendas_100_OK=("Ruta_Tiendas_100_OK", "first"),
-            KMS_Total=("KMS Total Viaje_num", "first"),
-            KMS_Retorno=("KMS Retorno_num", "first"),
-            Tiempo_Retorno=("Tiempo Retorno", "first"),
-            Dist_Activacion_km=("Dist_Activacion_km", "first"),
-            obs_act_tarde=("obs_act_tarde", "max"),
-            obs_err_fin=("obs_err_fin", "max"),
-        )
-    )
+    dq_cd_orig = dq_trips[dq_trips["CD_Origen_OK"]].copy()
 
     return {
         "master_trips": master_trips,
@@ -615,14 +604,14 @@ def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails) -> bytes
     return output.getvalue()
 
 
-def build_dq_excel(df_clean_st, df_clean_tr, df_excl_st, df_excl_cd, df_excl_tr) -> bytes:
+def build_dq_excel(df_clean_tr, df_clean_st, df_excl_tr, df_excl_st, df_ret_eval) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_clean_st.to_excel(writer, sheet_name="1_Base_Limpia_Paradas", index=False)
-        df_clean_tr.to_excel(writer, sheet_name="2_Base_Limpia_Viajes", index=False)
-        df_excl_st.to_excel(writer, sheet_name="3_Anomalias_Paradas", index=False)
-        df_excl_cd.to_excel(writer, sheet_name="4_Anomalias_CD_Origen", index=False)
-        df_excl_tr.to_excel(writer, sheet_name="5_Anomalias_Viajes_Retorno", index=False)
+        df_clean_tr.to_excel(writer, sheet_name="1_Base_Limpia_Viajes", index=False)
+        df_clean_st.to_excel(writer, sheet_name="2_Base_Limpia_Paradas", index=False)
+        df_excl_tr.to_excel(writer, sheet_name="3_Viajes_Excluidos_Incongr", index=False)
+        df_excl_st.to_excel(writer, sheet_name="4_Paradas_Con_Anomalia", index=False)
+        df_ret_eval.to_excel(writer, sheet_name="5_Eval_Retorno_Informativo", index=False)
     return output.getvalue()
 
 
@@ -2297,53 +2286,60 @@ with tab2:
         st.dataframe(int_cd_summary, use_container_width=True, hide_index=True)
 
 # =============================================================================
-# SOLAPA 3: DATA QUALITY, ANOMALIAS Y CONSTRUCCION DE BASE LIMPIA
+# SOLAPA 3: DATA QUALITY, INCONGRUENCIAS Y BASE FINAL DE VIAJES COMPLETOS
 # =============================================================================
 with tab3:
-    st.subheader("Saneamiento Estadístico y Construcción de Base Limpia (Input para KPIs)")
+    st.subheader("Construcción de Base Limpia de Viajes Completos (Input para KPIs)")
     st.caption(
-        "Configurá los umbrales de depuración para excluir registros corruptos o relojes abiertos de GPS "
-        "antes de calcular los KPIs de tiempos en la Solapa 4."
+        "Paso 1: Se parte de los Viajes Completos (tienen estadía en CD Origen + 100% de sus tiendas con estadía; "
+        "la 2ª fila de CD retorno y los datos de retorno NO se usan para excluir). "
+        "Paso 2: Se depuran incongruencias estadísticas en estadías, tránsitos, secuencia horaria, distancias y velocidades."
     )
 
-    with st.expander("🎛️ Parámetros de Limpieza y Umbrales de Anomalías (Ajustables)", expanded=True):
+    with st.expander("🎛️ Parámetros de Depuración de Incongruencias Logísticas", expanded=True):
         p1, p2, p3, p4 = st.columns(4)
         with p1:
-            solo_rutas_100 = st.checkbox(
-                "Exigir ruta 100% visitada",
-                value=True,
-                help="Excluye viajes donde alguna tienda quedó 'No visitada' o 'Sin coordenadas', evitando saltos en el tiempo entre paradas.",
+            min_estadia_cd = st.number_input(
+                "Estadía mín. CD Origen (min):",
+                min_value=0,
+                max_value=60,
+                value=10,
+                step=5,
+                help="Descarta activaciones sobre la barrera de salida (<10 min).",
             )
-            excluir_km_cero = st.checkbox(
-                "Excluir viajes con KMS Total = 0",
-                value=True,
-                help="Descarta viajes donde el odómetro GPS no reportó distancia.",
+            max_estadia_cd = st.number_input(
+                "Estadía máx. CD Origen (min):",
+                min_value=120,
+                max_value=1440,
+                value=360,
+                step=60,
+                help="Descarta camiones cargados el día anterior en playa (>360 min = 6h).",
             )
         with p2:
             min_estadia_st = st.number_input(
-                "Estadía mínima en tienda (min):",
+                "Estadía mín. en Tienda (min):",
                 min_value=0,
                 max_value=30,
                 value=5,
                 step=1,
-                help="Filtra pasos rápidos por la puerta de la tienda sin descarga real.",
+                help="Descarta pasos rápidos por la puerta sin descarga real.",
             )
             max_estadia_st_cerc = st.number_input(
-                "Estadía máx. tienda Cercana (min):",
+                "Estadía máx. Tienda Cercana (min):",
                 min_value=60,
                 max_value=720,
                 value=240,
                 step=30,
-                help="Por encima de este umbral se considera pernocte o reloj abierto (default: 240 min = 4h).",
+                help="Umbral máximo de descarga en tiendas Cercana (default: 240 min = 4h).",
             )
         with p3:
             max_estadia_st_lej = st.number_input(
-                "Estadía máx. tienda Lejana (min):",
+                "Estadía máx. Tienda Lejana (min):",
                 min_value=60,
                 max_value=960,
                 value=360,
                 step=30,
-                help="Umbral superior para tiendas a >100 km del CD (default: 360 min = 6h).",
+                help="Umbral máximo de descarga en tiendas Lejana >100 km (default: 360 min = 6h).",
             )
             max_vel_gps = st.number_input(
                 "Velocidad máxima válida (km/h):",
@@ -2351,159 +2347,188 @@ with tab3:
                 max_value=200,
                 value=120,
                 step=10,
-                help="Descarta tramos con saltos de coordenadas GPS irreales.",
+                help="Detecta saltos irreales de coordenadas GPS entre paradas.",
             )
         with p4:
-            max_estadia_cd = st.number_input(
-                "Estadía máx. en CD Origen (min):",
-                min_value=120,
-                max_value=1440,
-                value=360,
-                step=60,
-                help="Excluye camiones estacionados en playa desde el día anterior (default: 360 min = 6h).",
+            validar_solape_horario = st.checkbox(
+                "Excluir solapamientos horarios",
+                value=True,
+                help="Excluye viajes donde la entrada a una tienda ocurre antes de salir de la parada anterior (geocercas superpuestas).",
             )
-            max_retorno_cerc = st.number_input(
-                "Retorno máx. Cercana (min):",
-                min_value=120,
-                max_value=1440,
-                value=360,
-                step=60,
-                help="Para viajes Lejana (>100 km) se aplica automáticamente el doble de este umbral.",
+            validar_odometro = st.checkbox(
+                "Excluir odómetro incongruente",
+                value=True,
+                help="Excluye viajes con KMS Total > 1.500 km, KMS Total menor a la suma de paradas, o tramos >5 min con 0 km.",
             )
 
-    # --- Evaluacion de reglas sobre Paradas en Tienda (dq_stores_filt) ---
-    st_eval = dq_stores_filt.copy()
-    is_lej_st = st_eval["Categoria"] == "Lejana"
-    max_est_vec = np.where(is_lej_st, max_estadia_st_lej, max_estadia_st_cerc)
-    max_tv_vec = np.where(is_lej_st, 900, 360)
+    # --- PASO 1: Universo de Viajes Completos (CD Origen OK + 100% Tiendas OK) ---
+    tot_tms_trips = len(dq_trips_filt)
+    comp_trips = dq_trips_filt[dq_trips_filt["Viaje_Completo_Base"]].copy()
+    comp_ids_set = set(comp_trips["Id Viaje"].unique())
+    comp_stops = dq_stores_filt[dq_stores_filt["Id Viaje"].isin(comp_ids_set)].copy()
 
-    r_ruta_inc = (~st_eval["Ruta_Tiendas_100_OK"]) if solo_rutas_100 else pd.Series(False, index=st_eval.index)
-    r_est_corta = st_eval["Tiempo de Estadia"] < min_estadia_st
-    r_est_larga = st_eval["Tiempo de Estadia"] > max_est_vec
-    r_vel_irreal = st_eval["Velocidad Real Calculada_num"].fillna(0) > max_vel_gps
-    r_tv_abierto = st_eval["Tiempo en Viaje"].fillna(0) > max_tv_vec
+    # --- PASO 2: Evaluacion de incongruencias logísticas sobre los Viajes Completos ---
+    bad_cd_corta = set(comp_trips[comp_trips["Estadia_CD_Origen"] < min_estadia_cd]["Id Viaje"])
+    bad_cd_larga = set(comp_trips[comp_trips["Estadia_CD_Origen"] > max_estadia_cd]["Id Viaje"])
 
-    motivos_st = []
-    for idx_r in range(len(st_eval)):
-        m_list = []
-        if r_ruta_inc.iloc[idx_r]:
-            m_list.append("Ruta incompleta (<100% visitas)")
-        if r_est_corta.iloc[idx_r]:
-            m_list.append(f"Estadía < {min_estadia_st} min")
-        if r_est_larga.iloc[idx_r]:
-            m_list.append("Estadía extrema (reloj abierto)")
-        if r_vel_irreal.iloc[idx_r]:
-            m_list.append(f"Velocidad > {max_vel_gps} km/h")
-        if r_tv_abierto.iloc[idx_r]:
-            m_list.append("Tiempo viaje extremo")
-        motivos_st.append(" | ".join(m_list) if m_list else "OK (Base Limpia)")
+    is_lej_s = comp_stops["Categoria"] == "Lejana"
+    max_est_s = np.where(is_lej_s, max_estadia_st_lej, max_estadia_st_cerc)
+    max_tv_s = np.where(is_lej_s, 900, 360)
 
-    st_eval["Motivo_DQ"] = motivos_st
-    st_eval["Es_Limpia"] = st_eval["Motivo_DQ"] == "OK (Base Limpia)"
-
-    # --- Evaluacion de reglas sobre CD Origen (dq_cd_filt) ---
-    cd_eval = dq_cd_filt.copy()
-    r_cd_corta = cd_eval["Tiempo de Estadia"] < 5
-    r_cd_larga = cd_eval["Tiempo de Estadia"] > max_estadia_cd
-    cd_eval["Motivo_DQ"] = np.select(
-        [r_cd_corta, r_cd_larga],
-        ["Estadía CD < 5 min", f"Estadía CD > {max_estadia_cd} min (Playa/Abierto)"],
-        default="OK (Base Limpia)",
+    s_est_corta = comp_stops["Tiempo de Estadia"] < min_estadia_st
+    s_est_larga = comp_stops["Tiempo de Estadia"] > max_est_s
+    s_tv_null_neg = comp_stops["Tiempo en Viaje"].isna() | (comp_stops["Tiempo en Viaje"] < 0)
+    s_solape = (
+        (
+            comp_stops["dt_ini_real"].notna()
+            & comp_stops["prev_dt_fin_real"].notna()
+            & (comp_stops["dt_ini_real"] < comp_stops["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+        )
+        if validar_solape_horario
+        else pd.Series(False, index=comp_stops.index)
     )
-    cd_eval["Es_Limpia"] = cd_eval["Motivo_DQ"] == "OK (Base Limpia)"
-
-    # --- Evaluacion de reglas a nivel Viaje (dq_trips_filt) ---
-    tr_eval = dq_trips_filt.copy()
-    is_lej_tr = tr_eval["Categoria"] == "Lejana"
-    max_ret_vec = np.where(is_lej_tr, max_retorno_cerc * 2, max_retorno_cerc)
-
-    r_tr_incomp = (~tr_eval["Ruta_Tiendas_100_OK"]) if solo_rutas_100 else pd.Series(False, index=tr_eval.index)
-    r_tr_km0 = (tr_eval["KMS_Total"].fillna(0) == 0) if excluir_km_cero else pd.Series(False, index=tr_eval.index)
-    r_tr_km_ext = tr_eval["KMS_Total"].fillna(0) > 1500
-    r_tr_ret_bad = tr_eval["obs_err_fin"] | (
-        (tr_eval["Tiempo_Retorno"].notna())
-        & ((tr_eval["Tiempo_Retorno"] <= 0) | (tr_eval["Tiempo_Retorno"] > max_ret_vec))
+    s_tv_extremo = comp_stops["Tiempo en Viaje"].fillna(0) > max_tv_s
+    s_vel_irreal = (comp_stops["Velocidad Real Calculada_num"].fillna(0) > max_vel_gps) | (
+        (comp_stops["KMS Parada_num"].fillna(0) > 2.0)
+        & (comp_stops["Velocidad Real Calculada_num"].fillna(0) < 2.0)
+    )
+    s_km_parada_bad = (
+        (
+            comp_stops["KMS Parada_num"].isna()
+            | ((comp_stops["KMS Parada_num"] <= 0) & (comp_stops["Tiempo en Viaje"].fillna(0) > 5))
+        )
+        if validar_odometro
+        else pd.Series(False, index=comp_stops.index)
     )
 
-    motivos_tr = []
-    for idx_t in range(len(tr_eval)):
+    stop_motivos = []
+    for i_s in range(len(comp_stops)):
+        ms = []
+        if s_est_corta.iloc[i_s]:
+            ms.append(f"Estadía tienda < {min_estadia_st} min")
+        if s_est_larga.iloc[i_s]:
+            ms.append("Estadía tienda extrema (reloj abierto)")
+        if s_solape.iloc[i_s] or s_tv_null_neg.iloc[i_s]:
+            ms.append("Solape horario / Tránsito nulo")
+        if s_tv_extremo.iloc[i_s]:
+            ms.append("Tiempo en viaje extremo")
+        if s_vel_irreal.iloc[i_s]:
+            ms.append("Velocidad irreal (>120 o <2 km/h)")
+        if s_km_parada_bad.iloc[i_s]:
+            ms.append("KMS parada nulo o 0 en tramo >5 min")
+        stop_motivos.append(" | ".join(ms) if ms else "OK")
+
+    comp_stops["Motivo_Parada"] = stop_motivos
+    comp_stops["Parada_Limpia"] = comp_stops["Motivo_Parada"] == "OK"
+
+    bad_st_est_corta = set(comp_stops[s_est_corta]["Id Viaje"])
+    bad_st_est_larga = set(comp_stops[s_est_larga]["Id Viaje"])
+    bad_st_solape = set(comp_stops[s_solape | s_tv_null_neg]["Id Viaje"])
+    bad_st_tv_ext = set(comp_stops[s_tv_extremo]["Id Viaje"])
+    bad_st_vel = set(comp_stops[s_vel_irreal]["Id Viaje"])
+    bad_st_km = set(comp_stops[s_km_parada_bad]["Id Viaje"])
+
+    if validar_odometro:
+        bad_tr_odom = set(
+            comp_trips[
+                comp_trips["KMS_Total"].isna()
+                | (comp_trips["KMS_Total"] <= 0)
+                | (comp_trips["KMS_Total"] > 1500)
+                | (comp_trips["KMS_Total"] + 1.0 < comp_trips["Sum_KMS_Paradas"].fillna(0))
+            ]["Id Viaje"]
+        )
+    else:
+        bad_tr_odom = set()
+
+    trip_motivos = []
+    for tid in comp_trips["Id Viaje"]:
         mt = []
-        if r_tr_incomp.iloc[idx_t]:
-            mt.append("Ruta incompleta (<100% visitas)")
-        if r_tr_km0.iloc[idx_t]:
-            mt.append("KMS Total = 0")
-        if r_tr_km_ext.iloc[idx_t]:
-            mt.append("KMS Total > 1.500 km")
-        if r_tr_ret_bad.iloc[idx_t]:
-            mt.append("Tiempo Retorno inválido/abierto")
-        motivos_tr.append(" | ".join(mt) if mt else "OK (Base Limpia)")
+        if tid in bad_cd_corta:
+            mt.append(f"CD Origen < {min_estadia_cd} min")
+        if tid in bad_cd_larga:
+            mt.append(f"CD Origen > {max_estadia_cd} min (Playa)")
+        if tid in bad_st_est_corta:
+            mt.append(f"Parada < {min_estadia_st} min")
+        if tid in bad_st_est_larga:
+            mt.append("Parada extrema (reloj abierto)")
+        if tid in bad_st_solape:
+            mt.append("Solape horario / Tránsito inválido")
+        if tid in bad_st_tv_ext:
+            mt.append("Tiempo tránsito extremo")
+        if tid in bad_st_vel:
+            mt.append("Velocidad irreal GPS")
+        if tid in bad_st_km or tid in bad_tr_odom:
+            mt.append("Incongruencia odómetro (KMS)")
+        trip_motivos.append(" | ".join(mt) if mt else "OK (Base Final KPI)")
 
-    tr_eval["Motivo_DQ"] = motivos_tr
-    tr_eval["Es_Limpia"] = tr_eval["Motivo_DQ"] == "OK (Base Limpia)"
+    comp_trips["Motivo_DQ"] = trip_motivos
+    comp_trips["Viaje_Final_Limpio"] = comp_trips["Motivo_DQ"] == "OK (Base Final KPI)"
 
-    # Guardar bases limpias en session_state para que Solapa 4 las consuma directamente
-    st.session_state["clean_stores_df"] = st_eval[st_eval["Es_Limpia"]].copy()
-    st.session_state["clean_cd_df"] = cd_eval[cd_eval["Es_Limpia"]].copy()
-    st.session_state["clean_trips_df"] = tr_eval[tr_eval["Es_Limpia"]].copy()
+    final_clean_trips = comp_trips[comp_trips["Viaje_Final_Limpio"]].copy()
+    final_clean_ids = set(final_clean_trips["Id Viaje"].unique())
+    final_clean_stops = comp_stops[comp_stops["Id Viaje"].isin(final_clean_ids)].copy()
 
-    # KPIs de Saneamiento
-    tot_st_vis = len(st_eval)
-    ok_st_vis = int(st_eval["Es_Limpia"].sum())
-    excl_st_vis = tot_st_vis - ok_st_vis
-    pct_st_limpia = (ok_st_vis / tot_st_vis * 100) if tot_st_vis > 0 else 0.0
+    st.session_state["clean_trips_df"] = final_clean_trips
+    st.session_state["clean_stores_df"] = final_clean_stops
 
-    tot_cd_vis = len(cd_eval)
-    ok_cd_vis = int(cd_eval["Es_Limpia"].sum())
-    excl_cd_vis = tot_cd_vis - ok_cd_vis
-    pct_cd_limpia = (ok_cd_vis / tot_cd_vis * 100) if tot_cd_vis > 0 else 0.0
+    cnt_comp_base = len(comp_trips)
+    cnt_final_clean = len(final_clean_trips)
+    cnt_excl_incong = cnt_comp_base - cnt_final_clean
+    pct_comp_sobre_tms = (cnt_comp_base / tot_tms_trips * 100) if tot_tms_trips > 0 else 0.0
+    pct_retencion_limpia = (cnt_final_clean / cnt_comp_base * 100) if cnt_comp_base > 0 else 0.0
 
-    tot_tr_vis = len(tr_eval)
-    ok_tr_vis = int(tr_eval["Es_Limpia"].sum())
-    excl_tr_vis = tot_tr_vis - ok_tr_vis
-    pct_tr_limpia = (ok_tr_vis / tot_tr_vis * 100) if tot_tr_vis > 0 else 0.0
-
-    dq1, dq2, dq3, dq4 = st.columns(4)
+    dq1, dq2, dq3, dq4 = st.columns([1.15, 1.25, 1.25, 1.15])
     with dq1:
         st.markdown(
             _kpi_card_html(
-                "Paradas Tienda Limpias",
-                _fmt_int(ok_st_vis),
-                f"{_fmt_pct(pct_st_limpia)} de {_fmt_int(tot_st_vis)} visitadas",
-                "#16a34a" if pct_st_limpia >= 80 else "#d97706",
-                f"Excluidas por anomalía: <b>{_fmt_int(excl_st_vis)}</b>",
+                "1. Viajes Completos Base",
+                _fmt_int(cnt_comp_base),
+                f"{_fmt_pct(pct_comp_sobre_tms)} de {_fmt_int(tot_tms_trips)} viajes TMS",
+                "#1d4ed8",
+                "CD Carga OK + 100% Tiendas OK",
             ),
             unsafe_allow_html=True,
         )
     with dq2:
         st.markdown(
             _kpi_card_html(
-                "Registros CD Origen Limpios",
-                _fmt_int(ok_cd_vis),
-                f"{_fmt_pct(pct_cd_limpia)} de {_fmt_int(tot_cd_vis)} con GPS",
-                "#16a34a" if pct_cd_limpia >= 75 else "#d97706",
-                f"Excluidos (> {max_estadia_cd} min): <b>{_fmt_int(excl_cd_vis)}</b>",
+                "2. Incongruencias Excluidas",
+                _fmt_int(cnt_excl_incong),
+                f"{_fmt_pct(100 - pct_retencion_limpia)} de los viajes completos",
+                "#dc2626" if cnt_excl_incong > 0 else "#16a34a",
+                "Estadías extremas, solapes, KMS o vel.",
             ),
             unsafe_allow_html=True,
         )
     with dq3:
         st.markdown(
             _kpi_card_html(
-                "Viajes Completos Limpios",
-                _fmt_int(ok_tr_vis),
-                f"{_fmt_pct(pct_tr_limpia)} de {_fmt_int(tot_tr_vis)} viajes TMS",
-                "#16a34a" if pct_tr_limpia >= 75 else "#d97706",
-                f"Excluidos por anomalía: <b>{_fmt_int(excl_tr_vis)}</b>",
+                "3. Base Final Limpia (KPIs)",
+                _fmt_int(cnt_final_clean),
+                f"{_fmt_pct(pct_retencion_limpia)} de retención limpia",
+                "#16a34a",
+                f"Abarca <b>{_fmt_int(len(final_clean_stops))}</b> paradas limpias",
             ),
             unsafe_allow_html=True,
         )
     with dq4:
+        ret_null = int(comp_trips["Tiempo_Retorno"].isna().sum())
+        ret_bad = int(
+            (
+                comp_trips["obs_err_fin"]
+                | (
+                    comp_trips["Tiempo_Retorno"].notna()
+                    & ((comp_trips["Tiempo_Retorno"] <= 0) | (comp_trips["Tiempo_Retorno"] > 360))
+                )
+            ).sum()
+        )
         st.markdown(
             _kpi_card_html(
-                "Estado Base para Solapa 4",
-                "LISTA",
-                "Muestra depurada sincronizada",
-                "#1d4ed8",
-                "Los KPIs de Solapa 4 usan esta base",
+                "Retorno (Solo Evaluación)",
+                _fmt_int(ret_null + ret_bad),
+                "Viajes con retorno abierto/incongruente",
+                "#d97706",
+                f"{ret_null} sin retorno | {ret_bad} >6h/err. (NO excluye)",
             ),
             unsafe_allow_html=True,
         )
@@ -2511,35 +2536,35 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: RESUMEN DE CALIDAD DE DATOS POR OPERACION (CD)
+    # BLOQUE 1: EMBUDO DE VIAJES COMPLETOS Y BASE LIMPIA POR OPERACION (CD)
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Calidad de Datos y Retención de Muestra por Operación (CD)")
+    st.markdown("### 1. Embudo de Viajes Completos y Depuración por Operación (CD)")
 
     rows_dq_op = []
-    for op in sorted(tr_eval["Operacion"].dropna().unique()):
-        s_st = st_eval[st_eval["Operacion"] == op]
-        s_cd = cd_eval[cd_eval["Operacion"] == op]
-        s_tr = tr_eval[tr_eval["Operacion"] == op]
+    for op in sorted(dq_trips_filt["Operacion"].dropna().unique()):
+        sub_all = dq_trips_filt[dq_trips_filt["Operacion"] == op]
+        sub_comp = comp_trips[comp_trips["Operacion"] == op]
+        sub_clean = final_clean_trips[final_clean_trips["Operacion"] == op]
+        sub_st_clean = final_clean_stops[final_clean_stops["Operacion"] == op]
 
-        st_tot_o = len(s_st)
-        st_ok_o = int(s_st["Es_Limpia"].sum())
-        cd_tot_o = len(s_cd)
-        cd_ok_o = int(s_cd["Es_Limpia"].sum())
-        tr_tot_o = len(s_tr)
-        tr_ok_o = int(s_tr["Es_Limpia"].sum())
+        v_tms_o = len(sub_all)
+        v_100_st = int(sub_all["Todas_Tiendas_OK"].sum())
+        v_cd_ok = int(sub_all["CD_Origen_OK"].sum())
+        v_comp_o = len(sub_comp)
+        v_clean_o = len(sub_clean)
+        v_excl_o = v_comp_o - v_clean_o
 
         rows_dq_op.append(
             {
                 "CD": str(int(op)),
-                "Paradas GPS": st_tot_o,
-                "Paradas Limpias": st_ok_o,
-                "% Paradas Limpias": round((st_ok_o / st_tot_o * 100) if st_tot_o > 0 else 0.0, 1),
-                "CD Origen GPS": cd_tot_o,
-                "CD Origen Limpios": cd_ok_o,
-                "% CD Limpio": round((cd_ok_o / cd_tot_o * 100) if cd_tot_o > 0 else 0.0, 1),
-                "Viajes TMS": tr_tot_o,
-                "Viajes Limpios": tr_ok_o,
-                "% Viajes Limpios": round((tr_ok_o / tr_tot_o * 100) if tr_tot_o > 0 else 0.0, 1),
+                "Viajes TMS": v_tms_o,
+                "100% Tiendas OK": v_100_st,
+                "CD Origen OK": v_cd_ok,
+                "Viajes Completos": v_comp_o,
+                "Excl. Incongr.": v_excl_o,
+                "Base Final Limpia": v_clean_o,
+                "Paradas Limpias": len(sub_st_clean),
+                "% Retención Limpia": round((v_clean_o / v_comp_o * 100) if v_comp_o > 0 else 0.0, 1),
             }
         )
 
@@ -2549,15 +2574,14 @@ with tab3:
             [
                 {
                     "CD": "TOTAL",
-                    "Paradas GPS": df_dq_op["Paradas GPS"].sum(),
-                    "Paradas Limpias": df_dq_op["Paradas Limpias"].sum(),
-                    "% Paradas Limpias": round(pct_st_limpia, 1),
-                    "CD Origen GPS": df_dq_op["CD Origen GPS"].sum(),
-                    "CD Origen Limpios": df_dq_op["CD Origen Limpios"].sum(),
-                    "% CD Limpio": round(pct_cd_limpia, 1),
                     "Viajes TMS": df_dq_op["Viajes TMS"].sum(),
-                    "Viajes Limpios": df_dq_op["Viajes Limpios"].sum(),
-                    "% Viajes Limpios": round(pct_tr_limpia, 1),
+                    "100% Tiendas OK": df_dq_op["100% Tiendas OK"].sum(),
+                    "CD Origen OK": df_dq_op["CD Origen OK"].sum(),
+                    "Viajes Completos": df_dq_op["Viajes Completos"].sum(),
+                    "Excl. Incongr.": df_dq_op["Excl. Incongr."].sum(),
+                    "Base Final Limpia": df_dq_op["Base Final Limpia"].sum(),
+                    "Paradas Limpias": df_dq_op["Paradas Limpias"].sum(),
+                    "% Retención Limpia": round(pct_retencion_limpia, 1),
                 }
             ]
         )
@@ -2568,14 +2592,8 @@ with tab3:
             use_container_width=True,
             hide_index=True,
             column_config={
-                "% Paradas Limpias": st.column_config.ProgressColumn(
-                    "% Paradas Limpias", format="%.1f%%", min_value=0, max_value=100, width="small"
-                ),
-                "% CD Limpio": st.column_config.ProgressColumn(
-                    "% CD Limpio", format="%.1f%%", min_value=0, max_value=100, width="small"
-                ),
-                "% Viajes Limpios": st.column_config.ProgressColumn(
-                    "% Viajes Limpios", format="%.1f%%", min_value=0, max_value=100, width="small"
+                "% Retención Limpia": st.column_config.ProgressColumn(
+                    "% Retención Limpia", format="%.1f%%", min_value=0, max_value=100, width="medium"
                 ),
             },
         )
@@ -2583,69 +2601,121 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 2: PARETO DE ANOMALIAS DETECTADAS
+    # BLOQUE 2: PARETO DE INCONGRUENCIAS LOGISTICAS (Y EVALUACION DE RETORNO)
     # -------------------------------------------------------------------------
-    st.markdown("### 2. Pareto de Anomalías Excluidas por Regla")
+    st.markdown("### 2. Diagnóstico de Incongruencias Detectadas (Sobre Viajes Completos)")
 
-    pareto_col1, pareto_col2 = st.columns(2)
-    with pareto_col1:
-        st_anoms = st_eval[~st_eval["Es_Limpia"]]["Motivo_DQ"].value_counts().reset_index()
-        st_anoms.columns = ["Motivo", "Cantidad"]
-        if not st_anoms.empty:
-            fig_p1 = go.Figure(
+    pcol1, pcol2 = st.columns([1.25, 1])
+    with pcol1:
+        reglas_summary = pd.DataFrame(
+            [
+                {"Regla de Incongruencia": f"CD Origen > {max_estadia_cd} min (Playa/Abierto)", "Viajes": len(bad_cd_larga)},
+                {"Regla de Incongruencia": "Solape horario / Tránsito nulo entre paradas", "Viajes": len(bad_st_solape)},
+                {"Regla de Incongruencia": f"Parada en tienda < {min_estadia_st} min (sin descarga)", "Viajes": len(bad_st_est_corta)},
+                {"Regla de Incongruencia": "Parada en tienda extrema (reloj abierto)", "Viajes": len(bad_st_est_larga)},
+                {"Regla de Incongruencia": "Incongruencia odómetro (KMS Total o Tramo 0)", "Viajes": len(bad_st_km | bad_tr_odom)},
+                {"Regla de Incongruencia": f"Velocidad irreal (> {max_vel_gps} o < 2 km/h)", "Viajes": len(bad_st_vel)},
+                {"Regla de Incongruencia": f"CD Origen < {min_estadia_cd} min (barrera)", "Viajes": len(bad_cd_corta)},
+                {"Regla de Incongruencia": "Tiempo en viaje extremo entre paradas", "Viajes": len(bad_st_tv_ext)},
+            ]
+        )
+        reglas_summary = reglas_summary[reglas_summary["Viajes"] > 0].sort_values("Viajes", ascending=True)
+        if not reglas_summary.empty:
+            fig_dq = go.Figure(
                 go.Bar(
-                    x=st_anoms["Cantidad"],
-                    y=st_anoms["Motivo"],
+                    x=reglas_summary["Viajes"],
+                    y=reglas_summary["Regla de Incongruencia"],
                     orientation="h",
                     marker_color="#dc2626",
-                    text=st_anoms["Cantidad"],
+                    text=reglas_summary["Viajes"],
                     textposition="outside",
                 )
             )
-            fig_p1.update_layout(
-                title="Motivos de Exclusión en Paradas de Tienda",
-                height=310,
-                margin=dict(l=10, r=40, t=40, b=20),
-                yaxis=dict(autorange="reversed"),
-                xaxis_title="Cantidad de Paradas",
+            fig_dq.update_layout(
+                title="Viajes Completos Excluidos por Tipo de Incongruencia",
+                height=340,
+                margin=dict(l=10, r=45, t=40, b=20),
+                xaxis_title="Cantidad de Viajes (un viaje puede tener >1 regla)",
             )
-            st.plotly_chart(fig_p1, use_container_width=True)
+            st.plotly_chart(fig_dq, use_container_width=True)
         else:
-            st.success("Sin anomalías en paradas de tienda con los filtros actuales.")
+            st.success("Sin incongruencias detectadas con los parámetros actuales.")
 
-    with pareto_col2:
-        tr_anoms = tr_eval[~tr_eval["Es_Limpia"]]["Motivo_DQ"].value_counts().reset_index()
-        tr_anoms.columns = ["Motivo", "Cantidad"]
-        if not tr_anoms.empty:
-            fig_p2 = go.Figure(
-                go.Bar(
-                    x=tr_anoms["Cantidad"],
-                    y=tr_anoms["Motivo"],
-                    orientation="h",
-                    marker_color="#d97706",
-                    text=tr_anoms["Cantidad"],
-                    textposition="outside",
-                )
-            )
-            fig_p2.update_layout(
-                title="Motivos de Exclusión a Nivel Viaje / Retorno",
-                height=310,
-                margin=dict(l=10, r=40, t=40, b=20),
-                yaxis=dict(autorange="reversed"),
-                xaxis_title="Cantidad de Viajes",
-            )
-            st.plotly_chart(fig_p2, use_container_width=True)
-        else:
-            st.success("Sin anomalías a nivel viaje con los filtros actuales.")
+    with pcol2:
+        st.markdown("**📊 Evaluación de Retorno a CD (Dato informativo — NO excluye)**")
+        st.caption(
+            "Auditoría de `Tiempo Retorno` y `KMS Retorno` sobre los "
+            f"**{_fmt_int(cnt_comp_base)}** viajes completos para diagnosticar cierres de ruta:"
+        )
+        ret_ok_cnt = int(
+            (
+                (~comp_trips["obs_err_fin"])
+                & comp_trips["Tiempo_Retorno"].notna()
+                & (comp_trips["Tiempo_Retorno"] > 0)
+                & (comp_trips["Tiempo_Retorno"] <= np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
+                & (comp_trips["KMS_Retorno"].fillna(0) > 0)
+            ).sum()
+        )
+        ret_sin_dato_cnt = int(comp_trips["Tiempo_Retorno"].isna().sum())
+        ret_err_cierre_cnt = int(comp_trips["obs_err_fin"].sum())
+        ret_extremo_cnt = int(
+            (
+                (~comp_trips["obs_err_fin"])
+                & comp_trips["Tiempo_Retorno"].notna()
+                & (comp_trips["Tiempo_Retorno"] > np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
+            ).sum()
+        )
+        ret_km_zero_cnt = int(
+            (comp_trips["Tiempo_Retorno"].notna() & (comp_trips["KMS_Retorno"].fillna(0) <= 0)).sum()
+        )
+
+        df_ret_box = pd.DataFrame(
+            [
+                {"Estado del Retorno (sobre Viajes Completos)": "✅ Retorno consistente (Tiempo y KMS OK)", "Viajes": ret_ok_cnt, "%": round(ret_ok_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
+                {"Estado del Retorno (sobre Viajes Completos)": "⚠️ Error en finalización (cierre tardío TMS)", "Viajes": ret_err_cierre_cnt, "%": round(ret_err_cierre_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
+                {"Estado del Retorno (sobre Viajes Completos)": "⚪ Sin dato de retorno (Tiempo Retorno vacío)", "Viajes": ret_sin_dato_cnt, "%": round(ret_sin_dato_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
+                {"Estado del Retorno (sobre Viajes Completos)": "⏱️ Tiempo retorno extremo (>6h Cerc. / >12h Lej.)", "Viajes": ret_extremo_cnt, "%": round(ret_extremo_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
+                {"Estado del Retorno (sobre Viajes Completos)": "🛣️ KMS Retorno <= 0 o <= 0 min", "Viajes": ret_km_zero_cnt, "%": round(ret_km_zero_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
+            ]
+        )
+        st.dataframe(df_ret_box, use_container_width=True, hide_index=True)
 
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 3: AUDITORIA DE REGISTROS EXCLUIDOS Y DESCARGA DE BASE LIMPIA
+    # BLOQUE 3: AUDITORIA DE EXCLUSIONES, EVALUACION RETORNO Y DESCARGA EXCEL
     # -------------------------------------------------------------------------
-    st.markdown("### 3. Auditoría de Anomalías y Descarga de Base Limpia")
+    st.markdown("### 3. Auditoría Detallada y Descarga de Base Final Limpia")
 
-    excl_st_df = st_eval[~st_eval["Es_Limpia"]].copy()
+    excl_tr_df = comp_trips[~comp_trips["Viaje_Final_Limpio"]].copy()
+    excl_tr_df["Fecha Reparto"] = excl_tr_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    excl_tr_disp = excl_tr_df[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Ref_Clean",
+            "Id Viaje",
+            "Dominio",
+            "Categoria",
+            "Estadia_CD_Origen",
+            "Tiendas_Plan_Viaje",
+            "KMS_Total",
+            "Sum_KMS_Paradas",
+            "Motivo_DQ",
+        ]
+    ].rename(
+        columns={
+            "Operacion": "CD",
+            "Ref_Clean": "Ref Externa Viaje",
+            "Estadia_CD_Origen": "Estadía CD (min)",
+            "Tiendas_Plan_Viaje": "Tiendas",
+            "KMS_Total": "KMS Total",
+            "Sum_KMS_Paradas": "Suma KMS Paradas",
+            "Motivo_DQ": "Motivo Exclusión",
+        }
+    )
+
+    excl_st_df = comp_stops[~comp_stops["Parada_Limpia"]].copy()
     excl_st_df["Fecha Reparto"] = excl_st_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
     excl_st_disp = excl_st_df[
         [
@@ -2658,8 +2728,9 @@ with tab3:
             "Categoria",
             "Tiempo de Estadia",
             "Tiempo en Viaje",
+            "KMS Parada_num",
             "Velocidad Real Calculada_num",
-            "Motivo_DQ",
+            "Motivo_Parada",
         ]
     ].rename(
         columns={
@@ -2668,38 +2739,39 @@ with tab3:
             "Tienda_Cod": "Tienda",
             "Tiempo de Estadia": "Estadía (min)",
             "Tiempo en Viaje": "Viaje (min)",
+            "KMS Parada_num": "KMS Tramo",
             "Velocidad Real Calculada_num": "Vel. (km/h)",
-            "Motivo_DQ": "Motivo Exclusión",
+            "Motivo_Parada": "Incongruencia Detectada",
         }
     )
 
-    excl_cd_df = cd_eval[~cd_eval["Es_Limpia"]].copy()
-    excl_cd_df["Fecha Reparto"] = excl_cd_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    excl_cd_disp = excl_cd_df[
+    ret_incong_mask = (
+        comp_trips["obs_err_fin"]
+        | comp_trips["Tiempo_Retorno"].isna()
+        | (comp_trips["Tiempo_Retorno"] <= 0)
+        | (comp_trips["Tiempo_Retorno"] > np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
+        | (comp_trips["KMS_Retorno"].fillna(0) <= 0)
+    )
+    ret_eval_df = comp_trips[ret_incong_mask].copy()
+    ret_eval_df["Fecha Reparto"] = ret_eval_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    ret_eval_df["Observación Retorno"] = np.select(
         [
-            "Operacion",
-            "Fecha Reparto",
-            "Hora Reparto",
-            "Ref_Clean",
-            "Id Viaje",
-            "Dominio",
-            "Inicio Horario Visita Real",
-            "Fecha Hora Salida",
-            "Tiempo de Estadia",
-            "Motivo_DQ",
-        ]
-    ].rename(
-        columns={
-            "Operacion": "CD",
-            "Ref_Clean": "Ref Externa Viaje",
-            "Tiempo de Estadia": "Estadía CD (min)",
-            "Motivo_DQ": "Motivo Exclusión",
-        }
+            ret_eval_df["obs_err_fin"],
+            ret_eval_df["Tiempo_Retorno"].isna(),
+            ret_eval_df["Tiempo_Retorno"] <= 0,
+            ret_eval_df["Tiempo_Retorno"] > np.where(ret_eval_df["Categoria"] == "Lejana", 720, 360),
+            ret_eval_df["KMS_Retorno"].fillna(0) <= 0,
+        ],
+        [
+            "Error en finalización (cierre tardío)",
+            "Sin dato de retorno (vacío)",
+            "Tiempo retorno <= 0 min",
+            "Tiempo retorno extremo (>6h/12h)",
+            "KMS retorno = 0",
+        ],
+        default="Revisar",
     )
-
-    excl_tr_df = tr_eval[~tr_eval["Es_Limpia"]].copy()
-    excl_tr_df["Fecha Reparto"] = excl_tr_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    excl_tr_disp = excl_tr_df[
+    ret_eval_disp = ret_eval_df[
         [
             "Operacion",
             "Fecha Reparto",
@@ -2707,55 +2779,58 @@ with tab3:
             "Id Viaje",
             "Dominio",
             "Categoria",
-            "Tiendas_Plan_Viaje",
-            "Tiendas_OK_Viaje",
-            "KMS_Total",
+            "Viaje_Final_Limpio",
             "Tiempo_Retorno",
-            "Motivo_DQ",
+            "KMS_Retorno",
+            "Observación Retorno",
         ]
     ].rename(
         columns={
             "Operacion": "CD",
             "Ref_Clean": "Ref Externa Viaje",
-            "Tiendas_Plan_Viaje": "Tiendas Plan.",
-            "Tiendas_OK_Viaje": "Tiendas OK",
-            "KMS_Total": "KMS Total",
-            "Tiempo_Retorno": "Retorno (min)",
-            "Motivo_DQ": "Motivo Exclusión",
+            "Viaje_Final_Limpio": "Incluido en Base KPI",
+            "Tiempo_Retorno": "Tiempo Retorno (min)",
+            "KMS_Retorno": "KMS Retorno",
         }
     )
 
-    clean_st_export = st_eval[st_eval["Es_Limpia"]].copy()
-    clean_st_export["Fecha Reparto"] = clean_st_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    clean_tr_export = tr_eval[tr_eval["Es_Limpia"]].copy()
+    clean_tr_export = final_clean_trips.copy()
     clean_tr_export["Fecha Reparto"] = clean_tr_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    clean_st_export = final_clean_stops.copy()
+    clean_st_export["Fecha Reparto"] = clean_st_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
 
     dq_excel_bytes = build_dq_excel(
-        clean_st_export, clean_tr_export, excl_st_disp, excl_cd_disp, excl_tr_disp
+        clean_tr_export, clean_st_export, excl_tr_disp, excl_st_disp, ret_eval_disp
     )
     st.download_button(
-        label="📥 Descargar Base Limpia + Anomalías en Excel (.xlsx)",
+        label="📥 Descargar Base Final Limpia + Auditoría en Excel (.xlsx)",
         data=dq_excel_bytes,
-        file_name="Base_Limpia_y_Data_Quality.xlsx",
+        file_name="Base_Final_Limpia_y_Auditoria.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
     dqt1, dqt2, dqt3 = st.tabs(
         [
-            f"🏪 Paradas Tienda Excluidas ({len(excl_st_disp)})",
-            f"🏭 CD Origen Excluidos ({len(excl_cd_disp)})",
-            f"🚛 Viajes / Retornos Excluidos ({len(excl_tr_disp)})",
+            f"🚫 Viajes Completos Excluidos ({len(excl_tr_disp)})",
+            f"🏪 Paradas con Incongruencia ({len(excl_st_disp)})",
+            f"🔄 Evaluación Retorno a CD — No Excluye ({len(ret_eval_disp)})",
         ]
     )
 
     with dqt1:
-        st.dataframe(excl_st_disp, use_container_width=True, hide_index=True)
+        st.caption("Viajes completos descartados de la base de KPIs por presentar al menos una incongruencia logística.")
+        st.dataframe(excl_tr_disp, use_container_width=True, hide_index=True)
 
     with dqt2:
-        st.dataframe(excl_cd_disp, use_container_width=True, hide_index=True)
+        st.caption("Detalle puntual de la parada o tramo donde se originó la incongruencia.")
+        st.dataframe(excl_st_disp, use_container_width=True, hide_index=True)
 
     with dqt3:
-        st.dataframe(excl_tr_disp, use_container_width=True, hide_index=True)
+        st.caption(
+            "Dato informativo para evaluar el cierre de rutas y tiempos/kms de retorno. "
+            "Estos viajes NO se excluyen de la Base Final de KPIs por este motivo."
+        )
+        st.dataframe(ret_eval_disp, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # PLACEHOLDER PARA SOLAPA 4 (ESTADISTICA DE TIEMPOS SOBRE BASE LIMPIA)
@@ -2763,8 +2838,7 @@ with tab3:
 with tab4:
     st.info(
         f"🚧 **Próximo paso (Solapa 4 — Estadística de Tiempos y KPIs):** "
-        f"Ya cuenta con **{len(st.session_state['clean_stores_df']):,}** paradas limpias, "
-        f"**{len(st.session_state['clean_cd_df']):,}** registros limpios de CD origen y "
-        f"**{len(st.session_state['clean_trips_df']):,}** viajes completos limpios listos para calcular "
-        f"medianas, percentiles (P75/P90), tiempos de descarga, tránsito y comparativa Cercana vs. Lejana (>100 km)."
+        f"Base sincronizada con **{len(st.session_state['clean_trips_df']):,}** viajes completos limpios "
+        f"(**{len(st.session_state['clean_stores_df']):,}** paradas en tienda) con estadía en CD origen, "
+        f"estadías en todas las tiendas, tiempos de tránsito, distancias y velocidades 100% depuradas."
     )
