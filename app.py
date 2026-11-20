@@ -170,6 +170,31 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     df_u["Operacion"] = pd.to_numeric(df_u["Operacion"], errors="coerce").astype("Int64")
     df_u["Fecha_Reparto"] = pd.to_datetime(df_u["Fecha Reparto"], format="%d/%m/%Y", errors="coerce")
 
+    # Parseo de Distancia en Activacion (si viene en el reporte)
+    if "Distancia en Activacion" in df_u.columns:
+        if df_u["Distancia en Activacion"].dtype == object:
+            df_u["Dist_Activacion_km"] = pd.to_numeric(
+                df_u["Distancia en Activacion"].astype(str).str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+        else:
+            df_u["Dist_Activacion_km"] = pd.to_numeric(df_u["Distancia en Activacion"], errors="coerce")
+    else:
+        df_u["Dist_Activacion_km"] = np.nan
+
+    # Parseo de etiquetas multiples en Observacion (soporta formato simple y compuesto con '|')
+    obs_str = df_u["Observacion"].fillna("").astype(str)
+    df_u["obs_no_visitada"] = obs_str.str.contains("No visitada", case=False, regex=False)
+    df_u["obs_sin_coord"] = (df_u["Tipo de Zona"] == "Sin zona") | obs_str.str.contains(
+        "Sin coordenadas", case=False, regex=False
+    )
+    df_u["obs_perdida_gps"] = obs_str.str.contains("Perdida de GPS", case=False, regex=False)
+    df_u["obs_act_tarde"] = obs_str.str.contains("Activacion tarde", case=False, regex=False) | (
+        df_u["Dist_Activacion_km"].fillna(0) > 5.0
+    )
+    df_u["obs_err_fin"] = obs_str.str.contains("Error en finalizacion", case=False, regex=False)
+    df_u["visita_efectiva"] = (~df_u["obs_no_visitada"]) & (~df_u["obs_sin_coord"])
+
     # Validacion estricta de Ref Externa Viaje: debe ser "Operacion - Numero"
     ref_str = df_u["Ref Externa Viaje"].fillna("").astype(str).str.strip()
     op_str = df_u["Operacion"].astype(str).str.strip()
@@ -220,7 +245,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         .agg(
             Tiendas_TMS=("Tienda_Cod", "nunique"),
             Set_Tiendas_TMS=("Tienda_Cod", lambda s: tuple(sorted(set(s)))),
-            Tiendas_Visitadas_GPS=("Observacion", lambda s: int(s.isna().sum())),
+            Tiendas_Visitadas_GPS=("visita_efectiva", lambda s: int(s.sum())),
         )
     )
 
@@ -313,10 +338,10 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         .agg(
             Tiendas_Planificadas=("Tipo de Zona", lambda s: int(s.isin(["Tienda", "Sin zona"]).sum())),
             Tiendas_Con_Visita_GPS=(
-                "Observacion",
+                "visita_efectiva",
                 lambda s: int(
                     (
-                        s.isna()
+                        s
                         & u_valid.loc[s.index, "Tipo de Zona"].isin(["Tienda", "Sin zona"])
                     ).sum()
                 ),
@@ -364,16 +389,16 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         "Sin semana",
     )
 
-    # Cantidad de tiendas efectivamente visitadas dentro del mismo Id Viaje
-    stores_gps["Visitadas_En_IdViaje"] = stores_gps.groupby("Id Viaje")["Observacion"].transform(
-        lambda s: int(s.isna().sum())
-    )
+    # Mantenemos nuestra logica exacta:
+    # - 0 tiendas visitadas en todo el viaje => Falla GPS / Unidad (Viaje Ciego)
+    # - >=1 tienda visitada en el viaje pero esta parada no => Falla Geozona (Parcial)
+    stores_gps["Visitadas_En_IdViaje"] = stores_gps.groupby("Id Viaje")["visita_efectiva"].transform("sum").astype(int)
 
     conds_gps = [
-        stores_gps["Observacion"].isna(),
-        stores_gps["Tipo de Zona"] == "Sin zona",
-        (stores_gps["Observacion"] == "No visitada") & (stores_gps["Visitadas_En_IdViaje"] == 0),
-        (stores_gps["Observacion"] == "No visitada") & (stores_gps["Visitadas_En_IdViaje"] > 0),
+        stores_gps["visita_efectiva"],
+        stores_gps["obs_sin_coord"],
+        stores_gps["obs_no_visitada"] & (stores_gps["Visitadas_En_IdViaje"] == 0),
+        stores_gps["obs_no_visitada"] & (stores_gps["Visitadas_En_IdViaje"] > 0),
     ]
     choices_gps = [
         "Visitada (OK)",
@@ -401,6 +426,10 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         "Categoria",
         "Tiempo de Estadia",
         "Cantidad Visitas",
+        "Dist_Activacion_km",
+        "obs_perdida_gps",
+        "obs_act_tarde",
+        "obs_err_fin",
         "Observacion",
         "Visitadas_En_IdViaje",
         "Diagnostico_GPS",
@@ -442,7 +471,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     # Completitud de tiendas por Id Viaje
     is_st = u_clean_num["Tipo de Zona"].isin(["Tienda", "Sin zona"])
     st_tot_trip = u_clean_num[is_st].groupby("Id Viaje")["Tienda_Cod"].transform("count")
-    st_ok_trip = u_clean_num[is_st].groupby("Id Viaje")["Observacion"].transform(lambda s: int(s.isna().sum()))
+    st_ok_trip = u_clean_num[is_st].groupby("Id Viaje")["visita_efectiva"].transform("sum")
     trip_comp_map = (
         u_clean_num[is_st]
         .assign(
@@ -467,7 +496,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
 
     # Subtabla 1: Paradas en Tienda con visita GPS (para auditoria de tiempos en tienda y transito)
     dq_stores = u_clean_num[
-        (u_clean_num["Tipo de Zona"] == "Tienda") & (u_clean_num["Observacion"].isna())
+        (u_clean_num["Tipo de Zona"] == "Tienda") & (u_clean_num["visita_efectiva"])
     ][
         [
             "Operacion",
@@ -491,6 +520,9 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             "KMS Parada_num",
             "Velocidad Real Calculada_num",
             "Cantidad Visitas",
+            "Dist_Activacion_km",
+            "obs_act_tarde",
+            "obs_err_fin",
             "Ruta_Tiendas_100_OK",
         ]
     ].copy()
@@ -499,7 +531,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     dq_cd_orig = u_clean_num[
         (u_clean_num["Tipo de Zona"] == "CD - Carga")
         & (u_clean_num["cd_seq"] == 1)
-        & (u_clean_num["Observacion"].isna())
+        & (u_clean_num["visita_efectiva"])
     ][
         [
             "Operacion",
@@ -517,11 +549,14 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             "Inicio Horario Visita Real",
             "Fecha Hora Salida",
             "Tiempo de Estadia",
+            "Dist_Activacion_km",
+            "obs_act_tarde",
+            "obs_err_fin",
             "Ruta_Tiendas_100_OK",
         ]
     ].copy()
 
-    # Subtabla 3: Nivel Viaje UNIGIS (Odometro, Retorno y Completitud)
+    # Subtabla 3: Nivel Viaje UNIGIS (Odometro, Retorno, Activacion y Completitud)
     dq_trips = (
         u_clean_num.groupby("Id Viaje", as_index=False)
         .agg(
@@ -542,6 +577,9 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             KMS_Total=("KMS Total Viaje_num", "first"),
             KMS_Retorno=("KMS Retorno_num", "first"),
             Tiempo_Retorno=("Tiempo Retorno", "first"),
+            Dist_Activacion_km=("Dist_Activacion_km", "first"),
+            obs_act_tarde=("obs_act_tarde", "max"),
+            obs_err_fin=("obs_err_fin", "max"),
         )
     )
 
@@ -1473,17 +1511,24 @@ with tab2:
         gps_filt[gps_filt["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)"]["Id Viaje"].nunique()
     )
     viajes_100_ok_cnt = int(
-        gps_filt.groupby("Id Viaje")["Observacion"]
-        .apply(lambda s: int(s.isna().sum()) == len(s))
+        gps_filt.groupby("Id Viaje")["Diagnostico_GPS"]
+        .apply(lambda s: int((s == "Visitada (OK)").sum()) == len(s))
         .sum()
     )
+
+    viajes_act_tarde_cnt = int(gps_filt[gps_filt["obs_act_tarde"]]["Id Viaje"].nunique())
+    viajes_err_fin_cnt = int(gps_filt[gps_filt["obs_err_fin"]]["Id Viaje"].nunique())
+    pct_viajes_act_tarde = (viajes_act_tarde_cnt / viajes_gps_tot * 100) if viajes_gps_tot > 0 else 0.0
+
+    geo_only_df = gps_filt[gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)"]
+    paradas_geo_act_ok = int((~geo_only_df["obs_act_tarde"]).sum())
+    paradas_geo_act_tarde = int(geo_only_df["obs_act_tarde"].sum())
 
     pct_efec_gps = (paradas_ok / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_ciego = (paradas_ciego / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_geo = (paradas_geo / tot_paradas * 100) if tot_paradas > 0 else 0.0
-    pct_sin_coord = (paradas_sin_coord / tot_paradas * 100) if tot_paradas > 0 else 0.0
 
-    g1, g2, g3, g4, g5 = st.columns([1.05, 1.45, 1.25, 1.20, 0.95])
+    g1, g2, g3, g4, g5 = st.columns([1.0, 1.45, 1.25, 1.30, 1.15])
     with g1:
         st.markdown(
             _kpi_card_html(
@@ -1502,7 +1547,7 @@ with tab2:
                 _fmt_pct(pct_efec_gps),
                 f"{_fmt_int(paradas_ok)} visitas OK | {_fmt_int(paradas_sin_dato)} sin dato:",
                 "#16a34a" if pct_efec_gps >= 90 else "#d97706",
-                f"• <b>{_fmt_int(paradas_ciego)}</b> viaje ciego | <b>{_fmt_int(paradas_geo)}</b> geocerca | <b>{_fmt_int(paradas_sin_coord)}</b> s/coord.",
+                f"• <b>{_fmt_int(paradas_ciego)}</b> viaje ciego | <b>{_fmt_int(paradas_geo)}</b> geozona | <b>{_fmt_int(paradas_sin_coord)}</b> s/coord.",
             ),
             unsafe_allow_html=True,
         )
@@ -1517,29 +1562,25 @@ with tab2:
             ),
             unsafe_allow_html=True,
         )
-    geo_only_df = gps_filt[gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)"]
-    tiendas_geo_unicas = int(geo_only_df["Tienda_Cod"].nunique())
-    tiendas_geo_rec = int((geo_only_df.groupby("Tienda_Cod").size() >= 2).sum())
-
     with g4:
         st.markdown(
             _kpi_card_html(
-                "Falla Geocerca (Paradas)",
+                "Falla Geozona (Paradas)",
                 _fmt_int(paradas_geo),
                 f"{_fmt_pct(pct_geo)} del total de paradas",
                 "#d97706" if paradas_geo > 0 else "#16a34a",
-                f"En <b>{_fmt_int(tiendas_geo_unicas)}</b> tiendas (<b>{_fmt_int(tiendas_geo_rec)}</b> recurrentes)",
+                f"<b>{_fmt_int(paradas_geo_act_ok)}</b> activ. OK | <b>{_fmt_int(paradas_geo_act_tarde)}</b> activ. tarde",
             ),
             unsafe_allow_html=True,
         )
     with g5:
         st.markdown(
             _kpi_card_html(
-                "Sin Coordenadas",
-                _fmt_int(paradas_sin_coord),
-                f"{_fmt_pct(pct_sin_coord)} de paradas",
-                "#64748b",
-                f"{gps_filt[gps_filt['Diagnostico_GPS'] == 'Sin coordenadas']['Tienda_Cod'].nunique()} tiendas sin lat/long",
+                "Interfaz y Cierre (Viajes)",
+                _fmt_int(viajes_act_tarde_cnt),
+                f"Activ. tarde ({_fmt_pct(pct_viajes_act_tarde)})",
+                "#475569",
+                f"<b>{_fmt_int(viajes_err_fin_cnt)}</b> cierre tardío | <b>{gps_filt[gps_filt['Diagnostico_GPS'] == 'Sin coordenadas']['Tienda_Cod'].nunique()}</b> s/coord.",
             ),
             unsafe_allow_html=True,
         )
@@ -1549,13 +1590,16 @@ with tab2:
     # -------------------------------------------------------------------------
     # BLOQUE 1: EFECTIVIDAD GPS POR OPERACION (CD)
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Efectividad GPS y Diagnóstico de Fallas por Operación (CD)")
+    st.markdown("### 1. Efectividad GPS, Geozonas e Interfaz por Operación (CD)")
 
     rows_gps_op = []
     for op in sorted(gps_filt["Operacion"].dropna().unique()):
         sub = gps_filt[gps_filt["Operacion"] == op]
         v_tot = int(sub["Id Viaje"].nunique())
-        v_ciegos = int(sub[sub["Visitadas_En_IdViaje"] == 0]["Id Viaje"].nunique())
+        v_ciegos = int(sub[sub["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)"]["Id Viaje"].nunique())
+        v_act = int(sub[sub["obs_act_tarde"]]["Id Viaje"].nunique())
+        v_err = int(sub[sub["obs_err_fin"]]["Id Viaje"].nunique())
+
         p_tot = len(sub)
         p_ok = int((sub["Diagnostico_GPS"] == "Visitada (OK)").sum())
         p_ciego = int((sub["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)").sum())
@@ -1568,10 +1612,12 @@ with tab2:
                 "CD": str(int(op)),
                 "Viajes TMS": v_tot,
                 "Viajes Ciegos": v_ciegos,
+                "% Activ. Tarde": round((v_act / v_tot * 100) if v_tot > 0 else 0.0, 1),
+                "% Error Cierre": round((v_err / v_tot * 100) if v_tot > 0 else 0.0, 1),
                 "Paradas Plan.": p_tot,
                 "Visitadas OK": p_ok,
-                "Falla GPS (Ciego)": p_ciego,
-                "Falla Geocerca": p_geo,
+                "Falla GPS": p_ciego,
+                "Falla Geozona": p_geo,
                 "Sin Coord.": p_sc,
                 "% Efectividad GPS": round(efec, 2),
             }
@@ -1579,16 +1625,19 @@ with tab2:
 
     df_gps_op = pd.DataFrame(rows_gps_op)
     if not df_gps_op.empty:
+        tot_v_all = df_gps_op["Viajes TMS"].sum()
         tot_gps_row = pd.DataFrame(
             [
                 {
                     "CD": "TOTAL",
-                    "Viajes TMS": df_gps_op["Viajes TMS"].sum(),
+                    "Viajes TMS": tot_v_all,
                     "Viajes Ciegos": df_gps_op["Viajes Ciegos"].sum(),
+                    "% Activ. Tarde": round((viajes_act_tarde_cnt / tot_v_all * 100) if tot_v_all > 0 else 0.0, 1),
+                    "% Error Cierre": round((viajes_err_fin_cnt / tot_v_all * 100) if tot_v_all > 0 else 0.0, 1),
                     "Paradas Plan.": df_gps_op["Paradas Plan."].sum(),
                     "Visitadas OK": df_gps_op["Visitadas OK"].sum(),
-                    "Falla GPS (Ciego)": df_gps_op["Falla GPS (Ciego)"].sum(),
-                    "Falla Geocerca": df_gps_op["Falla Geocerca"].sum(),
+                    "Falla GPS": df_gps_op["Falla GPS"].sum(),
+                    "Falla Geozona": df_gps_op["Falla Geozona"].sum(),
                     "Sin Coord.": df_gps_op["Sin Coord."].sum(),
                     "% Efectividad GPS": round(pct_efec_gps, 2),
                 }
@@ -1604,10 +1653,12 @@ with tab2:
                 "CD": st.column_config.TextColumn("CD", width="small"),
                 "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
                 "Viajes Ciegos": st.column_config.NumberColumn("Viajes Ciegos", format="%d", width="small"),
+                "% Activ. Tarde": st.column_config.NumberColumn("% Activ. Tarde", format="%.1f%%", width="small"),
+                "% Error Cierre": st.column_config.NumberColumn("% Error Cierre", format="%.1f%%", width="small"),
                 "Paradas Plan.": st.column_config.NumberColumn("Paradas Plan.", format="%d", width="small"),
                 "Visitadas OK": st.column_config.NumberColumn("Visitadas OK", format="%d", width="small"),
-                "Falla GPS (Ciego)": st.column_config.NumberColumn("Falla GPS (Ciego)", format="%d", width="small"),
-                "Falla Geocerca": st.column_config.NumberColumn("Falla Geocerca", format="%d", width="small"),
+                "Falla GPS": st.column_config.NumberColumn("Falla GPS", format="%d", width="small"),
+                "Falla Geozona": st.column_config.NumberColumn("Falla Geozona", format="%d", width="small"),
                 "Sin Coord.": st.column_config.NumberColumn("Sin Coord.", format="%d", width="small"),
                 "% Efectividad GPS": st.column_config.ProgressColumn(
                     "% Efectividad GPS",
@@ -1918,21 +1969,32 @@ with tab2:
     # -------------------------------------------------------------------------
     st.markdown("### 3. Diagnóstico Accionable: Geocercas vs. Unidades Sin Señal")
 
-    # 3A. Ranking de Tiendas por Falla de Geocerca
+    # 3A. Ranking de Tiendas por Falla de Geozona (con apertura de Activacion Tarde)
+    gps_tiendas_only = gps_filt[gps_filt["Tipo de Zona"] == "Tienda"].copy()
+    gps_tiendas_only["_geo_ok_act"] = (
+        (gps_tiendas_only["Diagnostico_GPS"] == "Falla Geocerca (Parcial)")
+        & (~gps_tiendas_only["obs_act_tarde"])
+    )
+    gps_tiendas_only["_geo_tarde_act"] = (
+        (gps_tiendas_only["Diagnostico_GPS"] == "Falla Geocerca (Parcial)")
+        & (gps_tiendas_only["obs_act_tarde"])
+    )
+
     st_rank_all = (
-        gps_filt[gps_filt["Tipo de Zona"] == "Tienda"]
-        .groupby(["Operacion", "Tienda_Cod"], as_index=False)
+        gps_tiendas_only.groupby(["Operacion", "Tienda_Cod"], as_index=False)
         .agg(
             Paradas_Plan=("Diagnostico_GPS", "count"),
             Visitadas_OK=("Diagnostico_GPS", lambda s: int((s == "Visitada (OK)").sum())),
+            Falla_Geozona_Pura=("_geo_ok_act", "sum"),
+            Falla_Con_Act_Tarde=("_geo_tarde_act", "sum"),
             Falla_Geocerca=("Diagnostico_GPS", lambda s: int((s == "Falla Geocerca (Parcial)").sum())),
             Falla_Viaje_Ciego=("Diagnostico_GPS", lambda s: int((s == "Viaje Ciego (GPS/Unidad)").sum())),
             Reentradas_Geocerca=("Cantidad Visitas", lambda s: int((s > 1).sum())),
         )
     )
-    st_rank_all["% Falla Geocerca"] = np.where(
+    st_rank_all["% Falla Geozona (Activ. OK)"] = np.where(
         st_rank_all["Paradas_Plan"] > 0,
-        (st_rank_all["Falla_Geocerca"] / st_rank_all["Paradas_Plan"] * 100).round(1),
+        (st_rank_all["Falla_Geozona_Pura"] / st_rank_all["Paradas_Plan"] * 100).round(1),
         0.0,
     )
     st_rank_all["% Efectividad OK"] = np.where(
@@ -1941,14 +2003,17 @@ with tab2:
         0.0,
     )
     st_rank_all = st_rank_all.sort_values(
-        ["Falla_Geocerca", "% Falla Geocerca", "Paradas_Plan"], ascending=[False, False, False]
+        ["Falla_Geozona_Pura", "% Falla Geozona (Activ. OK)", "Paradas_Plan"],
+        ascending=[False, False, False],
     ).rename(
         columns={
             "Operacion": "CD",
             "Tienda_Cod": "Tienda",
             "Paradas_Plan": "Paradas Plan.",
             "Visitadas_OK": "Visitadas OK",
-            "Falla_Geocerca": "Falla Geocerca",
+            "Falla_Geozona_Pura": "Falla Geozona (Activ. OK)",
+            "Falla_Con_Act_Tarde": "Falla c/ Activ. Tarde",
+            "Falla_Geocerca": "Falla Parcial Total",
             "Falla_Viaje_Ciego": "Falla Viaje Ciego",
             "Reentradas_Geocerca": "Re-entradas (>1)",
         }
@@ -2085,26 +2150,26 @@ with tab2:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    cant_geo_rec_pairs = int((st_rank_all["Falla Geocerca"] >= 2).sum())
+    cant_geo_rec_pairs = int((st_rank_all["Falla Geozona (Activ. OK)"] >= 2).sum())
     cant_dom_ciegos = int((dom_rank_all["Viajes Ciegos"] > 0).sum())
 
     gtab1, gtab2, gtab3 = st.tabs(
         [
             f"🗺️ Tiendas a Revisar Geozona ({cant_geo_rec_pairs} recurrentes)",
             f"📡 Unidades Sin Señal GPS ({cant_dom_ciegos})",
-            f"📌 Tiendas Sin Coordenadas ({len(sin_coord_tbl)})",
+            f"📌 Sin Coordenadas ({len(sin_coord_tbl)}) e Interfaz TMS",
         ]
     )
 
     with gtab1:
         st.caption(
             "Tiendas donde el camión sí registró visitas GPS en otras paradas del mismo viaje, "
-            "pero marcó 'No visitada' aquí (falla parcial atribuible a geozona/polígono)."
+            "pero marcó 'No visitada' aquí. Por defecto excluye viajes con Activación Tarde (>5 km) para no culpar al polígono."
         )
-        gc1, gc2 = st.columns(2)
+        gc1, gc2, gc3 = st.columns([1.2, 1.2, 1.3])
         with gc1:
             min_fallas_geo = st.number_input(
-                "Mínimo de fallas de geozona (2 = excluye casos aislados de 1 vez):",
+                "Mínimo de fallas de geozona (2 = recurrentes):",
                 min_value=1,
                 max_value=50,
                 value=2,
@@ -2120,17 +2185,29 @@ with tab2:
                 step=1,
                 key="min_paradas_geo",
             )
+        with gc3:
+            st.write("")
+            excluir_act_tarde_geo = st.checkbox(
+                "Excluir viajes con Activación Tarde (>5 km)",
+                value=True,
+                key="excluir_act_tarde_geo",
+            )
+
+        col_falla_ref = (
+            "Falla Geozona (Activ. OK)" if excluir_act_tarde_geo else "Falla Parcial Total"
+        )
         st_geo_view = st_rank_all[
-            (st_rank_all["Falla Geocerca"] >= min_fallas_geo)
+            (st_rank_all[col_falla_ref] >= min_fallas_geo)
             & (st_rank_all["Paradas Plan."] >= min_paradas_geo)
-        ]
+        ].sort_values([col_falla_ref, "% Falla Geozona (Activ. OK)"], ascending=[False, False])
+
         st.dataframe(
             st_geo_view,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "% Falla Geocerca": st.column_config.ProgressColumn(
-                    "% Falla Geocerca",
+                "% Falla Geozona (Activ. OK)": st.column_config.ProgressColumn(
+                    "% Falla Geozona",
                     format="%.1f%%",
                     min_value=0,
                     max_value=100,
@@ -2185,10 +2262,39 @@ with tab2:
         )
 
     with gtab3:
-        st.caption(
-            "Tiendas clasificadas como 'Sin zona / Sin coordenadas' en UNIGIS: requieren carga de latitud/longitud en el maestro."
-        )
+        st.markdown("**A. Tiendas Sin Coordenadas en Maestro UNIGIS**")
         st.dataframe(sin_coord_tbl, use_container_width=True, hide_index=True)
+
+        st.markdown("**B. Resumen de Activación Tardía (>5 km del CD) y Error en Finalización por CD**")
+        trips_int_df = (
+            gps_filt.groupby(["Operacion", "Id Viaje"], as_index=False)
+            .agg(
+                Dist_Act=("Dist_Activacion_km", "first"),
+                Act_Tarde=("obs_act_tarde", "max"),
+                Err_Fin=("obs_err_fin", "max"),
+            )
+        )
+        int_cd_summary = (
+            trips_int_df.groupby("Operacion", as_index=False)
+            .agg(
+                Viajes_TMS=("Id Viaje", "count"),
+                Viajes_Activ_Tarde=("Act_Tarde", "sum"),
+                Dist_Mediana_Tarde_km=("Dist_Act", lambda s: round(float(s[s > 5].median()), 2) if (s > 5).any() else 0.0),
+                Dist_Max_km=("Dist_Act", lambda s: round(float(s.max()), 1) if s.notna().any() else 0.0),
+                Viajes_Error_Cierre=("Err_Fin", "sum"),
+            )
+            .rename(
+                columns={
+                    "Operacion": "CD",
+                    "Viajes_TMS": "Viajes TMS",
+                    "Viajes_Activ_Tarde": "Viajes Activ. Tarde (>5 km)",
+                    "Dist_Mediana_Tarde_km": "Mediana Dist. Activ. Tarde (km)",
+                    "Dist_Max_km": "Máx. Dist. Activ. (km)",
+                    "Viajes_Error_Cierre": "Viajes Error Cierre",
+                }
+            )
+        )
+        st.dataframe(int_cd_summary, use_container_width=True, hide_index=True)
 
 # =============================================================================
 # SOLAPA 3: DATA QUALITY, ANOMALIAS Y CONSTRUCCION DE BASE LIMPIA
@@ -2314,8 +2420,9 @@ with tab3:
     r_tr_incomp = (~tr_eval["Ruta_Tiendas_100_OK"]) if solo_rutas_100 else pd.Series(False, index=tr_eval.index)
     r_tr_km0 = (tr_eval["KMS_Total"].fillna(0) == 0) if excluir_km_cero else pd.Series(False, index=tr_eval.index)
     r_tr_km_ext = tr_eval["KMS_Total"].fillna(0) > 1500
-    r_tr_ret_bad = (tr_eval["Tiempo_Retorno"].notna()) & (
-        (tr_eval["Tiempo_Retorno"] <= 0) | (tr_eval["Tiempo_Retorno"] > max_ret_vec)
+    r_tr_ret_bad = tr_eval["obs_err_fin"] | (
+        (tr_eval["Tiempo_Retorno"].notna())
+        & ((tr_eval["Tiempo_Retorno"] <= 0) | (tr_eval["Tiempo_Retorno"] > max_ret_vec))
     )
 
     motivos_tr = []
