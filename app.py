@@ -59,9 +59,11 @@ def find_repo_excel_files():
             or "supply" in os.path.basename(f).lower()
         ]
     )
+    nomina_f = sorted([f for f in candidates if "nomina" in os.path.basename(f).lower()])
+    nom_path = nomina_f[-1] if nomina_f else None
     if amrepa_f and unigis_f:
-        return amrepa_f[-1], unigis_f[-1]
-    return None, None
+        return amrepa_f[-1], unigis_f[-1], nom_path
+    return None, None, nom_path
 
 
 def _extract_folder_id(url: str) -> str:
@@ -116,6 +118,16 @@ def fetch_from_drive_folder(folder_url: str):
                 f"Detectados: {found_names if found_names else 'ninguno'}."
             )
 
+        nomina_files = sorted(
+            [f for f in all_xlsx if "nomina" in os.path.basename(f).lower()]
+        )
+        n_bytes = None
+        name_n = None
+        if nomina_files:
+            with open(nomina_files[-1], "rb") as fn:
+                n_bytes = fn.read()
+            name_n = os.path.basename(nomina_files[-1])
+
         with open(amrepa_files[-1], "rb") as fa:
             a_bytes = fa.read()
         with open(unigis_files[-1], "rb") as fu:
@@ -124,8 +136,10 @@ def fetch_from_drive_folder(folder_url: str):
         return (
             a_bytes,
             u_bytes,
+            n_bytes,
             os.path.basename(amrepa_files[-1]),
             os.path.basename(unigis_files[-1]),
+            name_n,
         )
 
 
@@ -148,8 +162,65 @@ def _to_float_safe(series: pd.Series) -> pd.Series:
     return pd.to_numeric(cleaned, errors="coerce").astype(float)
 
 
-@st.cache_data(show_spinner="Procesando y conciliando bases AMREPA y UNIGIS...")
-def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
+def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
+    if nomina_bytes is None:
+        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+    try:
+        df_n = pd.read_excel(io.BytesIO(nomina_bytes), sheet_name=0)
+    except Exception:
+        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+
+    if "Patente" not in df_n.columns:
+        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+
+    df_n = df_n.copy()
+    df_n["Patente_Clean"] = (
+        df_n["Patente"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .str.upper()
+        .str.replace(" ", "", regex=False)
+    )
+    df_n = df_n[~df_n["Patente_Clean"].isin(["", "0", "SINPATENTE", "NAN"])].copy()
+
+    sit_rank = {
+        "ACTIVO": 1,
+        "ACTIVO EVENTUAL": 2,
+        "REEMPLAZADO X BACKUP": 3,
+        "TRACTOR": 4,
+        "BACKUP INACTIVO": 5,
+        "INACTIVO": 6,
+        "BAJA": 7,
+    }
+    if "SITUACION" in df_n.columns:
+        df_n["_rank"] = df_n["SITUACION"].astype(str).str.strip().str.upper().map(sit_rank).fillna(99)
+    else:
+        df_n["_rank"] = 50
+
+    df_n = df_n.sort_values("_rank").drop_duplicates("Patente_Clean", keep="first").set_index("Patente_Clean")
+
+    out = pd.DataFrame(index=df_n.index)
+    out["Tipo_Vehiculo_Nom"] = (
+        df_n["Tipo Camion"].fillna("").astype(str).str.strip().str.upper()
+        if "Tipo Camion" in df_n.columns
+        else ""
+    )
+    out["Satelital_Nom"] = (
+        df_n["Satelital"].fillna("Sin dato").astype(str).str.strip()
+        if "Satelital" in df_n.columns
+        else "Sin dato"
+    )
+    out["Empresa_Nom"] = (
+        df_n["Empresa"].fillna("Sin dato").astype(str).str.strip()
+        if "Empresa" in df_n.columns
+        else "Sin dato"
+    )
+    return out
+
+
+@st.cache_data(show_spinner="Procesando y conciliando bases AMREPA, UNIGIS y Nómina...")
+def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None):
     # 1. Lectura de archivos Excel
     df_a_raw = pd.read_excel(io.BytesIO(amrepa_bytes), sheet_name=0)
     xls_u = pd.ExcelFile(io.BytesIO(unigis_bytes))
@@ -159,6 +230,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         else xls_u.sheet_names[0]
     )
     df_u_raw = pd.read_excel(io.BytesIO(unigis_bytes), sheet_name=sheet_u)
+    nomina_lut = _build_nomina_lookup(nomina_bytes)
 
     # 2. Limpieza AMREPA (WMS)
     df_a = df_a_raw.copy()
@@ -381,8 +453,16 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     stores_gps = stores_gps.merge(a_trans_map, on=["Operacion", "Ref_Clean"], how="left")
     stores_gps["Transportista"] = stores_gps["Transportista"].fillna("Sin dato WMS")
     stores_gps["Dominio"] = stores_gps["Dominio"].fillna("Sin dominio").astype(str).str.strip()
+    stores_gps["Dominio_Clean"] = stores_gps["Dominio"].str.upper().str.replace(" ", "", regex=False)
     stores_gps["Interno"] = stores_gps["Interno"].fillna("S/D").astype(str).str.strip()
     stores_gps["Tipo de Camion"] = stores_gps["Tipo de Camion"].fillna("Sin dato").astype(str).str.strip()
+    if not nomina_lut.empty:
+        mapped_tipo = stores_gps["Dominio_Clean"].map(nomina_lut["Tipo_Vehiculo_Nom"]).fillna("")
+        stores_gps["Tipo_Vehiculo"] = np.where(mapped_tipo != "", mapped_tipo, stores_gps["Tipo de Camion"])
+        stores_gps["Satelital"] = stores_gps["Dominio_Clean"].map(nomina_lut["Satelital_Nom"]).fillna("Sin dato")
+    else:
+        stores_gps["Tipo_Vehiculo"] = stores_gps["Tipo de Camion"]
+        stores_gps["Satelital"] = "Sin dato"
 
     stores_gps["Mes_Label"] = stores_gps["Fecha_Reparto"].dt.strftime("%Y-%m").fillna("Sin fecha")
     stores_gps["Semana_Sort"] = stores_gps["Fecha_Reparto"].dt.to_period("W").apply(
@@ -426,6 +506,8 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
         "Dominio",
         "Interno",
         "Tipo de Camion",
+        "Tipo_Vehiculo",
+        "Satelital",
         "Tienda_Cod",
         "Tipo de Zona",
         "Categoria",
@@ -462,8 +544,24 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     u_clean_num = u_clean_num.merge(a_trans_map, on=["Operacion", "Ref_Clean"], how="left")
     u_clean_num["Transportista"] = u_clean_num["Transportista"].fillna("Sin dato WMS")
     u_clean_num["Dominio"] = u_clean_num["Dominio"].fillna("Sin dominio").astype(str).str.strip()
+    u_clean_num["Dominio_Clean"] = u_clean_num["Dominio"].str.upper().str.replace(" ", "", regex=False)
     u_clean_num["Interno"] = u_clean_num["Interno"].fillna("S/D").astype(str).str.strip()
     u_clean_num["Tipo de Camion"] = u_clean_num["Tipo de Camion"].fillna("Sin dato").astype(str).str.strip()
+    if not nomina_lut.empty:
+        mapped_tv = u_clean_num["Dominio_Clean"].map(nomina_lut["Tipo_Vehiculo_Nom"]).fillna("")
+        u_clean_num["Tipo_Vehiculo"] = np.where(mapped_tv != "", mapped_tv, u_clean_num["Tipo de Camion"])
+        u_clean_num["Satelital"] = u_clean_num["Dominio_Clean"].map(nomina_lut["Satelital_Nom"]).fillna("Sin dato")
+        u_clean_num["Empresa_Flota"] = u_clean_num["Dominio_Clean"].map(nomina_lut["Empresa_Nom"]).fillna("Sin dato")
+    else:
+        u_clean_num["Tipo_Vehiculo"] = u_clean_num["Tipo de Camion"]
+        u_clean_num["Satelital"] = "Sin dato"
+        u_clean_num["Empresa_Flota"] = "Sin dato"
+
+    for col_vol in ["Total Bultos", "Formato Equivalentes", "Apertura Puerta Trasera", "Cierre Puerta Trasera", "Minutos Apertura y Cierre"]:
+        if col_vol in u_clean_num.columns:
+            u_clean_num[col_vol + "_num"] = _to_float_safe(u_clean_num[col_vol])
+        else:
+            u_clean_num[col_vol + "_num"] = np.nan
     u_clean_num["Mes_Label"] = u_clean_num["Fecha_Reparto"].dt.strftime("%Y-%m").fillna("Sin fecha")
     u_clean_num["Semana_Sort"] = u_clean_num["Fecha_Reparto"].dt.to_period("W").apply(
         lambda p: p.start_time if pd.notna(p) else pd.NaT
@@ -542,6 +640,23 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
     dq_trips["Tiendas_OK_Viaje"] = dq_trips["Tiendas_OK_Viaje"].fillna(0).astype(int)
     dq_trips["Viaje_Completo_Base"] = dq_trips["CD_Origen_OK"] & dq_trips["Todas_Tiendas_OK"]
 
+    # Clasificar Tipo de Viaje segun cantidad de tiendas planificadas en Id Viaje
+    dq_trips["Tipo_Viaje"] = np.select(
+        [
+            dq_trips["Tiendas_Plan_Viaje"] == 1,
+            dq_trips["Tiendas_Plan_Viaje"] == 2,
+            dq_trips["Tiendas_Plan_Viaje"] >= 3,
+        ],
+        [
+            "Directo (1 tienda)",
+            "Compartido (2 tiendas)",
+            "Rutas (3+ tiendas)",
+        ],
+        default="Sin tiendas",
+    )
+
+    trip_type_lut = dq_trips.set_index("Id Viaje")[["Tiendas_Plan_Viaje", "Tipo_Viaje"]]
+
     # Subtabla de Paradas en Tienda
     dq_stores = u_clean_num[u_clean_num["Tipo de Zona"] == "Tienda"][
         [
@@ -555,7 +670,10 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             "Ref_Clean",
             "Transportista",
             "Dominio",
+            "Interno",
             "Tipo de Camion",
+            "Tipo_Vehiculo",
+            "Satelital",
             "Tienda_Cod",
             "Orden Visita Tienda",
             "Categoria",
@@ -569,9 +687,16 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes):
             "KMS Parada_num",
             "Velocidad Real Calculada_num",
             "Cantidad Visitas",
+            "Total Bultos_num",
+            "Formato Equivalentes_num",
+            "Apertura Puerta Trasera_num",
+            "Cierre Puerta Trasera_num",
+            "Minutos Apertura y Cierre_num",
             "visita_efectiva",
         ]
     ].copy()
+    dq_stores["Tiendas_Plan_Viaje"] = dq_stores["Id Viaje"].map(trip_type_lut["Tiendas_Plan_Viaje"]).fillna(1).astype(int)
+    dq_stores["Tipo_Viaje"] = dq_stores["Id Viaje"].map(trip_type_lut["Tipo_Viaje"]).fillna("Directo (1 tienda)")
 
     dq_cd_orig = dq_trips[dq_trips["CD_Origen_OK"]].copy()
 
@@ -607,14 +732,13 @@ def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails) -> bytes
     return output.getvalue()
 
 
-def build_dq_excel(df_clean_tr, df_clean_st, df_excl_tr, df_excl_st, df_ret_eval) -> bytes:
+def build_estadias_excel(df_seg, df_mat, df_rank, df_clean_st) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_clean_tr.to_excel(writer, sheet_name="1_Base_Limpia_Viajes", index=False)
-        df_clean_st.to_excel(writer, sheet_name="2_Base_Limpia_Paradas", index=False)
-        df_excl_tr.to_excel(writer, sheet_name="3_Viajes_Excluidos_Incongr", index=False)
-        df_excl_st.to_excel(writer, sheet_name="4_Paradas_Con_Anomalia", index=False)
-        df_ret_eval.to_excel(writer, sheet_name="5_Eval_Retorno_Informativo", index=False)
+        df_seg.to_excel(writer, sheet_name="1_Resumen_Segmentos", index=False)
+        df_mat.to_excel(writer, sheet_name="2_Matriz_CD_x_Vehiculo", index=False)
+        df_rank.to_excel(writer, sheet_name="3_Ranking_Tiendas", index=False)
+        df_clean_st.to_excel(writer, sheet_name="4_Base_Limpia_Estadias", index=False)
     return output.getvalue()
 
 
@@ -627,11 +751,12 @@ try:
 except Exception:
     default_drive_url = ""
 
-repo_a, repo_u = find_repo_excel_files()
+repo_a, repo_u, repo_n = find_repo_excel_files()
 has_repo_files = repo_a is not None and repo_u is not None
 
 amrepa_bytes = None
 unigis_bytes = None
+nomina_bytes = None
 fuente_label = ""
 
 # Prioridad 1: Base persistente en GitHub | Prioridad 2: Google Drive Secret | Prioridad 3: Manual
@@ -641,10 +766,14 @@ if has_repo_files:
     with open(repo_u, "rb") as fu:
         unigis_bytes = fu.read()
     fuente_label = f"`{os.path.basename(repo_a)}` + `{os.path.basename(repo_u)}`"
+    if repo_n is not None:
+        with open(repo_n, "rb") as fn:
+            nomina_bytes = fn.read()
+        fuente_label += f" + `{os.path.basename(repo_n)}`"
 elif default_drive_url:
     try:
-        amrepa_bytes, unigis_bytes, name_a, name_u = fetch_from_drive_folder(default_drive_url)
-        fuente_label = f"Drive (`{name_a}` + `{name_u}`)"
+        amrepa_bytes, unigis_bytes, nomina_bytes, name_a, name_u, name_n = fetch_from_drive_folder(default_drive_url)
+        fuente_label = f"Drive (`{name_a}` + `{name_u}`" + (f" + `{name_n}`)" if name_n else ")")
     except Exception:
         pass
 
@@ -653,19 +782,24 @@ if "manual_a" in st.session_state and st.session_state["manual_a"] is not None:
     amrepa_bytes = st.session_state["manual_a"]
 if "manual_u" in st.session_state and st.session_state["manual_u"] is not None:
     unigis_bytes = st.session_state["manual_u"]
+if "manual_n" in st.session_state and st.session_state["manual_n"] is not None:
+    nomina_bytes = st.session_state["manual_n"]
 
 if amrepa_bytes is None or unigis_bytes is None:
     st.title("🚚 Estadística de Camión")
     st.warning("No se detectaron archivos base. Cargalos desde el menú lateral.")
     up_a = st.sidebar.file_uploader("Archivo WMS (AMREPA.xlsx)", type=["xlsx"])
     up_u = st.sidebar.file_uploader("Reporte TMS (UNIGIS Detalle.xlsx)", type=["xlsx"])
+    up_n = st.sidebar.file_uploader("Nómina Flota (Nomina.xlsx - opcional)", type=["xlsx"])
     if up_a and up_u:
         st.session_state["manual_a"] = up_a.getvalue()
         st.session_state["manual_u"] = up_u.getvalue()
+        if up_n:
+            st.session_state["manual_n"] = up_n.getvalue()
         st.rerun()
     st.stop()
 
-data = load_and_process_data(amrepa_bytes, unigis_bytes)
+data = load_and_process_data(amrepa_bytes, unigis_bytes, nomina_bytes)
 master = data["master_trips"].copy()
 dup_detail = data["dup_detail"].copy()
 invalid_detail = data["invalid_detail"].copy()
@@ -814,13 +948,17 @@ with st.sidebar.expander("⚙️ Base de Datos / Carga Manual", expanded=False):
     st.caption(f"Fuente activa: {fuente_label}")
     up_a_alt = st.file_uploader("Reemplazar AMREPA (.xlsx)", type=["xlsx"], key="up_a_alt")
     up_u_alt = st.file_uploader("Reemplazar UNIGIS (.xlsx)", type=["xlsx"], key="up_u_alt")
+    up_n_alt = st.file_uploader("Cargar / Reemplazar Nómina Flota (.xlsx)", type=["xlsx"], key="up_n_alt")
     if up_a_alt is not None:
         st.session_state["manual_a"] = up_a_alt.getvalue()
     if up_u_alt is not None:
         st.session_state["manual_u"] = up_u_alt.getvalue()
+    if up_n_alt is not None:
+        st.session_state["manual_n"] = up_n_alt.getvalue()
     if st.button("Restaurar base original"):
         st.session_state["manual_a"] = None
         st.session_state["manual_u"] = None
+        st.session_state["manual_n"] = None
         st.rerun()
 
 # -----------------------------------------------------------------------------
@@ -832,12 +970,13 @@ st.caption(
     f"CDs: **{', '.join(map(str, selected_ops))}** | Todos los filtros laterales actualizan todas las vistas."
 )
 
-tab1, tab2, tab3, tab4 = st.tabs(
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
         "📊 1. Conciliación Macro (WMS vs. TMS)",
         "📍 2. Visitas GPS y Geocercas",
-        "🧹 3. Data Quality y Base Limpia",
-        "⏱️ 4. Estadística de Tiempos (KPIs)",
+        "🏪 3. Estadías y Productividad en Tienda",
+        "🛣️ 4. Velocidades (Parametrización UNIGIS)",
+        "🚛 5. Internos, CD Origen y Jornada Diaria",
     ]
 )
 
@@ -2016,10 +2155,10 @@ with tab2:
         }
     )
 
-    # 3B. Ranking de Unidades (Dominio) y Transportistas por Viajes Ciegos
+    # 3B. Ranking de Unidades (Dominio) por Viajes Ciegos (con Tipo Vehiculo y Satelital de Nomina)
     dom_trip_lvl = (
         gps_filt.groupby(
-            ["Operacion", "Dominio", "Interno", "Tipo de Camion", "Transportista", "Id Viaje"],
+            ["Operacion", "Dominio", "Interno", "Tipo_Vehiculo", "Satelital", "Transportista", "Id Viaje"],
             as_index=False,
         )
         .agg(
@@ -2030,7 +2169,7 @@ with tab2:
     )
     dom_rank_all = (
         dom_trip_lvl.groupby(
-            ["Operacion", "Dominio", "Interno", "Tipo de Camion", "Transportista"],
+            ["Operacion", "Dominio", "Interno", "Tipo_Vehiculo", "Satelital", "Transportista"],
             as_index=False,
         )
         .agg(
@@ -2055,7 +2194,7 @@ with tab2:
     ).rename(
         columns={
             "Operacion": "CD",
-            "Tipo de Camion": "Tipo Camión",
+            "Tipo_Vehiculo": "Tipo Vehículo",
             "Viajes_TMS": "Viajes TMS",
             "Viajes_Ciegos": "Viajes Ciegos",
             "Paradas_Plan": "Paradas Plan.",
@@ -2312,559 +2451,491 @@ with tab2:
         st.dataframe(int_cd_summary, use_container_width=True, hide_index=True)
 
 # =============================================================================
-# SOLAPA 3: DATA QUALITY, INCONGRUENCIAS Y BASE FINAL DE VIAJES COMPLETOS
+# SOLAPA 3: ESTADIAS Y PRODUCTIVIDAD EN TIENDA (LIMPIEZA PROPIA + BOXPLOTS)
 # =============================================================================
 with tab3:
-    st.subheader("Construcción de Base Limpia de Viajes Completos (Input para KPIs)")
+    st.subheader("Estadías y Productividad de Descarga en Tienda")
     st.caption(
-        "Paso 1: Se parte de los Viajes Completos (tienen estadía en CD Origen + 100% de sus tiendas con estadía; "
-        "la 2ª fila de CD retorno y los datos de retorno NO se usan para excluir). "
-        "Paso 2: Se depuran incongruencias estadísticas en estadías, tránsitos, secuencia horaria, distancias y velocidades."
+        "Muestra independiente sobre todas las paradas en tienda con visita GPS efectiva "
+        "(no descarta paradas si faltó estadía en el CD o en otra parada del viaje)."
     )
 
-    with st.expander("🎛️ Parámetros de Depuración de Incongruencias Logísticas", expanded=True):
-        p1, p2, p3, p4 = st.columns(4)
-        with p1:
-            min_estadia_cd = st.number_input(
-                "Estadía mín. CD Origen (min):",
-                min_value=0,
-                max_value=60,
-                value=10,
-                step=5,
-                help="Descarta activaciones sobre la barrera de salida (<10 min).",
-            )
-            max_estadia_cd = st.number_input(
-                "Estadía máx. CD Origen (min):",
-                min_value=120,
-                max_value=1440,
-                value=360,
-                step=60,
-                help="Descarta camiones cargados el día anterior en playa (>360 min = 6h).",
-            )
-        with p2:
-            min_estadia_st = st.number_input(
-                "Estadía mín. en Tienda (min):",
+    with st.expander("🎛️ Parámetros de Depuración de Estadías en Tienda", expanded=False):
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        with sc1:
+            min_est_tienda = st.number_input(
+                "Estadía mínima válida (min):",
                 min_value=0,
                 max_value=30,
                 value=5,
                 step=1,
-                help="Descarta pasos rápidos por la puerta sin descarga real.",
+                help="Descarta pasos rápidos por la puerta de la tienda sin descarga real (<5 min).",
+                key="s3_min_est",
             )
-            max_estadia_st_cerc = st.number_input(
-                "Estadía máx. Tienda Cercana (min):",
+        with sc2:
+            max_est_cerc = st.number_input(
+                "Estadía máx. Cercana (min):",
                 min_value=60,
                 max_value=720,
                 value=240,
                 step=30,
-                help="Umbral máximo de descarga en tiendas Cercana (default: 240 min = 4h).",
+                help="Excluye relojes abiertos o pernoctes en tiendas Cercana (default: 240 min = 4h).",
+                key="s3_max_cerc",
             )
-        with p3:
-            max_estadia_st_lej = st.number_input(
-                "Estadía máx. Tienda Lejana (min):",
+        with sc3:
+            max_est_lej = st.number_input(
+                "Estadía máx. Lejana (min):",
                 min_value=60,
                 max_value=960,
                 value=360,
                 step=30,
-                help="Umbral máximo de descarga en tiendas Lejana >100 km (default: 360 min = 6h).",
+                help="Excluye relojes abiertos en tiendas Lejana >100 km (default: 360 min = 6h).",
+                key="s3_max_lej",
             )
-            max_vel_gps = st.number_input(
-                "Velocidad máxima válida (km/h):",
-                min_value=80,
-                max_value=200,
-                value=120,
-                step=10,
-                help="Detecta saltos irreales de coordenadas GPS entre paradas.",
-            )
-        with p4:
-            validar_solape_horario = st.checkbox(
-                "Excluir solapamientos horarios",
+        with sc4:
+            st.write("")
+            excl_solape_s3 = st.checkbox(
+                "Excluir solapamiento horario",
                 value=True,
-                help="Excluye viajes donde la entrada a una tienda ocurre antes de salir de la parada anterior (geocercas superpuestas).",
-            )
-            validar_odometro = st.checkbox(
-                "Excluir odómetro incongruente",
-                value=True,
-                help="Excluye viajes con KMS Total > 1.500 km, KMS Total menor a la suma de paradas, o tramos >5 min con 0 km.",
+                help="Descarta paradas cuya hora de entrada ocurre antes de haber salido de la parada anterior.",
+                key="s3_excl_solape",
             )
 
-    # --- PASO 1: Universo de Viajes Completos (CD Origen OK + 100% Tiendas OK) ---
-    tot_tms_trips = len(dq_trips_filt)
-    comp_trips = dq_trips_filt[dq_trips_filt["Viaje_Completo_Base"]].copy()
-    comp_ids_set = set(comp_trips["Id Viaje"].unique())
-    comp_stops = dq_stores_filt[dq_stores_filt["Id Viaje"].isin(comp_ids_set)].copy()
+    # Construccion de la Base Limpia de Estadias en Tienda
+    st_all_vis = dq_stores_filt[dq_stores_filt["visita_efectiva"]].copy()
+    is_lej_s3 = st_all_vis["Categoria"] == "Lejana"
+    max_est_vec_s3 = np.where(is_lej_s3, max_est_lej, max_est_cerc)
 
-    # --- PASO 2: Evaluacion de incongruencias logísticas sobre los Viajes Completos ---
-    bad_cd_corta = set(comp_trips[comp_trips["Estadia_CD_Origen"] < min_estadia_cd]["Id Viaje"])
-    bad_cd_larga = set(comp_trips[comp_trips["Estadia_CD_Origen"] > max_estadia_cd]["Id Viaje"])
-
-    is_lej_s = comp_stops["Categoria"] == "Lejana"
-    max_est_s = np.where(is_lej_s, max_estadia_st_lej, max_estadia_st_cerc)
-    max_tv_s = np.where(is_lej_s, 900, 360)
-
-    s_est_corta = comp_stops["Tiempo de Estadia"] < min_estadia_st
-    s_est_larga = comp_stops["Tiempo de Estadia"] > max_est_s
-    s_tv_null_neg = comp_stops["Tiempo en Viaje"].isna() | (comp_stops["Tiempo en Viaje"] < 0)
-    s_solape = (
+    r_corta_s3 = st_all_vis["Tiempo de Estadia"].isna() | (st_all_vis["Tiempo de Estadia"] < min_est_tienda)
+    r_larga_s3 = st_all_vis["Tiempo de Estadia"] > max_est_vec_s3
+    r_solape_s3 = (
         (
-            comp_stops["dt_ini_real"].notna()
-            & comp_stops["prev_dt_fin_real"].notna()
-            & (comp_stops["dt_ini_real"] < comp_stops["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+            st_all_vis["dt_ini_real"].notna()
+            & st_all_vis["prev_dt_fin_real"].notna()
+            & (st_all_vis["dt_ini_real"] < st_all_vis["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
         )
-        if validar_solape_horario
-        else pd.Series(False, index=comp_stops.index)
-    )
-    s_tv_extremo = comp_stops["Tiempo en Viaje"].fillna(0) > max_tv_s
-    s_vel_irreal = (comp_stops["Velocidad Real Calculada_num"].fillna(0) > max_vel_gps) | (
-        (comp_stops["KMS Parada_num"].fillna(0) > 2.0)
-        & (comp_stops["Velocidad Real Calculada_num"].fillna(0) < 2.0)
-    )
-    s_km_parada_bad = (
-        (
-            comp_stops["KMS Parada_num"].isna()
-            | ((comp_stops["KMS Parada_num"] <= 0) & (comp_stops["Tiempo en Viaje"].fillna(0) > 5))
-        )
-        if validar_odometro
-        else pd.Series(False, index=comp_stops.index)
+        if excl_solape_s3
+        else pd.Series(False, index=st_all_vis.index)
     )
 
-    stop_motivos = []
-    for i_s in range(len(comp_stops)):
-        ms = []
-        if s_est_corta.iloc[i_s]:
-            ms.append(f"Estadía tienda < {min_estadia_st} min")
-        if s_est_larga.iloc[i_s]:
-            ms.append("Estadía tienda extrema (reloj abierto)")
-        if s_solape.iloc[i_s] or s_tv_null_neg.iloc[i_s]:
-            ms.append("Solape horario / Tránsito nulo")
-        if s_tv_extremo.iloc[i_s]:
-            ms.append("Tiempo en viaje extremo")
-        if s_vel_irreal.iloc[i_s]:
-            ms.append("Velocidad irreal (>120 o <2 km/h)")
-        if s_km_parada_bad.iloc[i_s]:
-            ms.append("KMS parada nulo o 0 en tramo >5 min")
-        stop_motivos.append(" | ".join(ms) if ms else "OK")
+    st_clean_s3 = st_all_vis[(~r_corta_s3) & (~r_larga_s3) & (~r_solape_s3)].copy()
 
-    comp_stops["Motivo_Parada"] = stop_motivos
-    comp_stops["Parada_Limpia"] = comp_stops["Motivo_Parada"] == "OK"
+    # Etiquetas de orden de parada en ruta
+    st_clean_s3["Orden_Parada_Grupo"] = np.select(
+        [
+            st_clean_s3["Orden Visita Tienda"] == 1,
+            st_clean_s3["Orden Visita Tienda"] == 2,
+            st_clean_s3["Orden Visita Tienda"] == 3,
+            st_clean_s3["Orden Visita Tienda"] >= 4,
+        ],
+        ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"],
+        default="Sin orden",
+    )
 
-    bad_st_est_corta = set(comp_stops[s_est_corta]["Id Viaje"])
-    bad_st_est_larga = set(comp_stops[s_est_larga]["Id Viaje"])
-    bad_st_solape = set(comp_stops[s_solape | s_tv_null_neg]["Id Viaje"])
-    bad_st_tv_ext = set(comp_stops[s_tv_extremo]["Id Viaje"])
-    bad_st_vel = set(comp_stops[s_vel_irreal]["Id Viaje"])
-    bad_st_km = set(comp_stops[s_km_parada_bad]["Id Viaje"])
+    # KPIs de Limpieza + Estadía + Productividad + Fases de Puerta
+    tot_vis_s3 = len(st_all_vis)
+    ok_vis_s3 = len(st_clean_s3)
+    excl_vis_s3 = tot_vis_s3 - ok_vis_s3
+    pct_ret_s3 = (ok_vis_s3 / tot_vis_s3 * 100) if tot_vis_s3 > 0 else 0.0
 
-    if validar_odometro:
-        bad_tr_odom = set(
-            comp_trips[
-                comp_trips["KMS_Total"].isna()
-                | (comp_trips["KMS_Total"] <= 0)
-                | (comp_trips["KMS_Total"] > 1500)
-                | (comp_trips["KMS_Total"] + 1.0 < comp_trips["Sum_KMS_Paradas"].fillna(0))
-            ]["Id Viaje"]
-        )
-    else:
-        bad_tr_odom = set()
+    est_series = st_clean_s3["Tiempo de Estadia"].dropna()
+    med_est_s3 = float(est_series.median()) if len(est_series) > 0 else 0.0
+    p25_est_s3 = float(np.percentile(est_series, 25)) if len(est_series) > 0 else 0.0
+    p75_est_s3 = float(np.percentile(est_series, 75)) if len(est_series) > 0 else 0.0
+    p90_est_s3 = float(np.percentile(est_series, 90)) if len(est_series) > 0 else 0.0
 
-    trip_motivos = []
-    for tid in comp_trips["Id Viaje"]:
-        mt = []
-        if tid in bad_cd_corta:
-            mt.append(f"CD Origen < {min_estadia_cd} min")
-        if tid in bad_cd_larga:
-            mt.append(f"CD Origen > {max_estadia_cd} min (Playa)")
-        if tid in bad_st_est_corta:
-            mt.append(f"Parada < {min_estadia_st} min")
-        if tid in bad_st_est_larga:
-            mt.append("Parada extrema (reloj abierto)")
-        if tid in bad_st_solape:
-            mt.append("Solape horario / Tránsito inválido")
-        if tid in bad_st_tv_ext:
-            mt.append("Tiempo tránsito extremo")
-        if tid in bad_st_vel:
-            mt.append("Velocidad irreal GPS")
-        if tid in bad_st_km or tid in bad_tr_odom:
-            mt.append("Incongruencia odómetro (KMS)")
-        trip_motivos.append(" | ".join(mt) if mt else "OK (Base Final KPI)")
+    # Productividad por Bultos (paradas con >= 20 bultos para evitar distorsiones de 1-2 bultos)
+    prod_s3 = st_clean_s3[st_clean_s3["Total Bultos_num"].fillna(0) >= 20].copy()
+    prod_s3["Min_100_Bultos"] = prod_s3["Tiempo de Estadia"] / (prod_s3["Total Bultos_num"] / 100.0)
+    med_min_100b = float(prod_s3["Min_100_Bultos"].median()) if len(prod_s3) > 0 else 0.0
+    med_bultos_s3 = float(st_clean_s3["Total Bultos_num"].median()) if ok_vis_s3 > 0 else 0.0
+    bultos_hora_s3 = (6000.0 / med_min_100b) if med_min_100b > 0 else 0.0
 
-    comp_trips["Motivo_DQ"] = trip_motivos
-    comp_trips["Viaje_Final_Limpio"] = comp_trips["Motivo_DQ"] == "OK (Base Final KPI)"
+    # Sensor de puerta trasera (pre-conectado para cuando UNIGIS active el dato)
+    puerta_activa_cnt = int((st_clean_s3["Minutos Apertura y Cierre_num"].fillna(0) > 0).sum())
 
-    final_clean_trips = comp_trips[comp_trips["Viaje_Final_Limpio"]].copy()
-    final_clean_ids = set(final_clean_trips["Id Viaje"].unique())
-    final_clean_stops = comp_stops[comp_stops["Id Viaje"].isin(final_clean_ids)].copy()
-
-    st.session_state["clean_trips_df"] = final_clean_trips
-    st.session_state["clean_stores_df"] = final_clean_stops
-
-    cnt_comp_base = len(comp_trips)
-    cnt_final_clean = len(final_clean_trips)
-    cnt_excl_incong = cnt_comp_base - cnt_final_clean
-    pct_comp_sobre_tms = (cnt_comp_base / tot_tms_trips * 100) if tot_tms_trips > 0 else 0.0
-    pct_retencion_limpia = (cnt_final_clean / cnt_comp_base * 100) if cnt_comp_base > 0 else 0.0
-
-    dq1, dq2, dq3, dq4 = st.columns([1.15, 1.25, 1.25, 1.15])
-    with dq1:
+    k3_1, k3_2, k3_3, k3_4 = st.columns([1.15, 1.25, 1.25, 1.25])
+    with k3_1:
         st.markdown(
             _kpi_card_html(
-                "1. Viajes Completos Base",
-                _fmt_int(cnt_comp_base),
-                f"{_fmt_pct(pct_comp_sobre_tms)} de {_fmt_int(tot_tms_trips)} viajes TMS",
+                "Base Limpia Estadías",
+                _fmt_int(ok_vis_s3),
+                f"{_fmt_pct(pct_ret_s3)} de {_fmt_int(tot_vis_s3)} visitas OK",
+                "#16a34a" if pct_ret_s3 >= 90 else "#d97706",
+                f"Excluidas: <b>{int(r_corta_s3.sum())}</b> <{min_est_tienda}m | <b>{int(r_larga_s3.sum())}</b> >máx | <b>{int(r_solape_s3.sum())}</b> solape",
+            ),
+            unsafe_allow_html=True,
+        )
+    with k3_2:
+        st.markdown(
+            _kpi_card_html(
+                "Mediana Estadía en Tienda",
+                f"{med_est_s3:.0f} min",
+                f"P25: {p25_est_s3:.0f} min  |  P75: {p75_est_s3:.0f} min",
                 "#1d4ed8",
-                "CD Carga OK + 100% Tiendas OK",
+                f"Percentil 90 (crítico): <b>{p90_est_s3:.0f} min</b>",
             ),
             unsafe_allow_html=True,
         )
-    with dq2:
+    with k3_3:
         st.markdown(
             _kpi_card_html(
-                "2. Incongruencias Excluidas",
-                _fmt_int(cnt_excl_incong),
-                f"{_fmt_pct(100 - pct_retencion_limpia)} de los viajes completos",
-                "#dc2626" if cnt_excl_incong > 0 else "#16a34a",
-                "Estadías extremas, solapes, KMS o vel.",
+                "Productividad de Descarga",
+                f"{med_min_100b:.1f} min",
+                "Cada 100 bultos entregados",
+                "#0f172a",
+                f"Ritmo: <b>{bultos_hora_s3:.0f} bultos/h</b> | Mediana: <b>{med_bultos_s3:.0f} bultos</b>",
             ),
             unsafe_allow_html=True,
         )
-    with dq3:
-        st.markdown(
-            _kpi_card_html(
-                "3. Base Final Limpia (KPIs)",
-                _fmt_int(cnt_final_clean),
-                f"{_fmt_pct(pct_retencion_limpia)} de retención limpia",
-                "#16a34a",
-                f"Abarca <b>{_fmt_int(len(final_clean_stops))}</b> paradas limpias",
-            ),
-            unsafe_allow_html=True,
-        )
-    with dq4:
-        ret_null = int(comp_trips["Tiempo_Retorno"].isna().sum())
-        ret_bad = int(
-            (
-                comp_trips["obs_err_fin"]
-                | (
-                    comp_trips["Tiempo_Retorno"].notna()
-                    & ((comp_trips["Tiempo_Retorno"] <= 0) | (comp_trips["Tiempo_Retorno"] > 360))
-                )
-            ).sum()
-        )
-        st.markdown(
-            _kpi_card_html(
-                "Retorno (Solo Evaluación)",
-                _fmt_int(ret_null + ret_bad),
-                "Viajes con retorno abierto/incongruente",
-                "#d97706",
-                f"{ret_null} sin retorno | {ret_bad} >6h/err. (NO excluye)",
-            ),
-            unsafe_allow_html=True,
-        )
+    with k3_4:
+        if puerta_activa_cnt > 0:
+            med_desc_efectiva = float(
+                st_clean_s3[st_clean_s3["Minutos Apertura y Cierre_num"] > 0]["Minutos Apertura y Cierre_num"].median()
+            )
+            st.markdown(
+                _kpi_card_html(
+                    "Descarga Efectiva (Puerta)",
+                    f"{med_desc_efectiva:.0f} min",
+                    f"Con sensor activo en {_fmt_int(puerta_activa_cnt)} paradas",
+                    "#16a34a",
+                    "Fase 2: Apertura a Cierre puerta trasera",
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                _kpi_card_html(
+                    "Fases Puerta Trasera",
+                    "Sensor en 0",
+                    "Pendiente activación en UNIGIS",
+                    "#64748b",
+                    "Pre-conectado: Espera + Descarga + Egreso",
+                ),
+                unsafe_allow_html=True,
+            )
 
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: EMBUDO DE VIAJES COMPLETOS Y BASE LIMPIA POR OPERACION (CD)
+    # BLOQUE 1: DIAGRAMAS DE CAJAS (BOXPLOTS) Y PERCENTILES POR SEGMENTO
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Embudo de Viajes Completos y Depuración por Operación (CD)")
+    st.markdown("### 1. Distribución de Estadías (Diagrama de Cajas y Percentiles)")
 
-    rows_dq_op = []
-    for op in sorted(dq_trips_filt["Operacion"].dropna().unique()):
-        sub_all = dq_trips_filt[dq_trips_filt["Operacion"] == op]
-        sub_comp = comp_trips[comp_trips["Operacion"] == op]
-        sub_clean = final_clean_trips[final_clean_trips["Operacion"] == op]
-        sub_st_clean = final_clean_stops[final_clean_stops["Operacion"] == op]
+    dim_map_s3 = {
+        "Tipo de Viaje (Directo / Compartido / Rutas)": "Tipo_Viaje",
+        "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+        "Operación (CD)": "Operacion",
+        "Categoría (Cercana vs. Lejana)": "Categoria",
+        "Orden de Parada en Ruta": "Orden_Parada_Grupo",
+    }
+    sub_map_s3 = {
+        "Sin sub-corte": None,
+        "Categoría (Cercana vs. Lejana)": "Categoria",
+        "Tipo de Viaje": "Tipo_Viaje",
+        "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+    }
 
-        v_tms_o = len(sub_all)
-        v_100_st = int(sub_all["Todas_Tiendas_OK"].sum())
-        v_cd_ok = int(sub_all["CD_Origen_OK"].sum())
-        v_comp_o = len(sub_comp)
-        v_clean_o = len(sub_clean)
-        v_excl_o = v_comp_o - v_clean_o
+    bx_c1, bx_c2 = st.columns([1.3, 1.2])
+    with bx_c1:
+        dim_label_s3 = st.selectbox(
+            "Agrupar eje principal por:",
+            options=list(dim_map_s3.keys()),
+            index=0,
+            key="s3_dim_sel",
+        )
+    with bx_c2:
+        sub_label_s3 = st.selectbox(
+            "Sub-dividir cajas por color (opcional):",
+            options=list(sub_map_s3.keys()),
+            index=0,
+            key="s3_sub_sel",
+        )
 
-        rows_dq_op.append(
+    dim_col = dim_map_s3[dim_label_s3]
+    sub_col = sub_map_s3[sub_label_s3]
+    if sub_col == dim_col:
+        sub_col = None
+
+    if st_clean_s3.empty:
+        st.info("No hay paradas limpias en el rango y filtros seleccionados.")
+    else:
+        df_plot_s3 = st_clean_s3.copy()
+        if dim_col == "Operacion":
+            df_plot_s3[dim_col] = "CD " + df_plot_s3[dim_col].astype(str)
+        else:
+            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
+
+        # Ordenar categorias por mediana descendente (excepto Orden de Parada o Tipo de Viaje)
+        if dim_col == "Tipo_Viaje":
+            cat_order = [
+                c
+                for c in ["Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"]
+                if c in df_plot_s3[dim_col].unique()
+            ]
+        elif dim_col == "Orden_Parada_Grupo":
+            cat_order = [
+                c
+                for c in ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"]
+                if c in df_plot_s3[dim_col].unique()
+            ]
+        else:
+            cat_order = (
+                df_plot_s3.groupby(dim_col)["Tiempo de Estadia"]
+                .median()
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+
+        fig_box = go.Figure()
+        palette_box = ["#1d4ed8", "#d97706", "#16a34a", "#7c3aed", "#dc2626", "#0891b2", "#475569"]
+
+        if sub_col is None:
+            for idx_c, cat_val in enumerate(cat_order):
+                vals = df_plot_s3[df_plot_s3[dim_col] == cat_val]["Tiempo de Estadia"]
+                fig_box.add_trace(
+                    go.Box(
+                        y=vals,
+                        name=f"{cat_val} (n={len(vals):,})",
+                        boxmean=True,
+                        boxpoints=False,
+                        marker_color=palette_box[idx_c % len(palette_box)],
+                        hovertemplate=(
+                            f"<b>{cat_val}</b><br>"
+                            "Estadía: %{y:.0f} min<extra></extra>"
+                        ),
+                    )
+                )
+        else:
+            df_plot_s3[sub_col] = df_plot_s3[sub_col].fillna("Sin dato").astype(str)
+            sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
+            for idx_s, sv in enumerate(sub_vals):
+                sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
+                fig_box.add_trace(
+                    go.Box(
+                        x=sub_df[dim_col],
+                        y=sub_df["Tiempo de Estadia"],
+                        name=sv,
+                        boxmean=True,
+                        boxpoints=False,
+                        marker_color=palette_box[idx_s % len(palette_box)],
+                    )
+                )
+            fig_box.update_layout(boxmode="group", xaxis=dict(categoryorder="array", categoryarray=cat_order))
+
+        fig_box.update_layout(
+            height=410,
+            margin=dict(l=20, r=20, t=30, b=20),
+            yaxis_title="Tiempo de Estadía en Tienda (minutos)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            showlegend=True,
+        )
+        st.plotly_chart(fig_box, use_container_width=True)
+
+        # Tabla resumen estadistico del segmento elegido
+        grp_cols = [dim_col] if sub_col is None else [dim_col, sub_col]
+        seg_rows = []
+        for keys, grp in df_plot_s3.groupby(grp_cols):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            s_est = grp["Tiempo de Estadia"]
+            g_prod = grp[grp["Total Bultos_num"].fillna(0) >= 20]
+            m100 = (
+                float((g_prod["Tiempo de Estadia"] / (g_prod["Total Bultos_num"] / 100.0)).median())
+                if len(g_prod) > 0
+                else np.nan
+            )
+            row_dict = {grp_cols[i]: keys[i] for i in range(len(grp_cols))}
+            row_dict.update(
+                {
+                    "Paradas Limpias": int(len(s_est)),
+                    "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
+                    "P25 (min)": round(float(np.percentile(s_est, 25)), 0),
+                    "Mediana (min)": round(float(s_est.median()), 0),
+                    "P75 (min)": round(float(np.percentile(s_est, 75)), 0),
+                    "P90 (min)": round(float(np.percentile(s_est, 90)), 0),
+                    "Promedio (min)": round(float(s_est.mean()), 1),
+                    "Min / 100 Bultos": round(m100, 1) if pd.notna(m100) else None,
+                }
+            )
+            seg_rows.append(row_dict)
+
+        df_seg_summary = pd.DataFrame(seg_rows)
+        if sub_col is None and dim_col in cat_order:
+            df_seg_summary["_ord"] = df_seg_summary[dim_col].map({v: i for i, v in enumerate(cat_order)})
+            df_seg_summary = df_seg_summary.sort_values("_ord").drop(columns=["_ord"])
+
+        st.dataframe(df_seg_summary, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 2: MATRIZ CD x TIPO DE VEHICULO (NOMINA) + FASES PUERTA TRASERA
+    # -------------------------------------------------------------------------
+    st.markdown("### 2. Matriz por Operación (CD) y Tipo de Vehículo (Nómina)")
+
+    if not st_clean_s3.empty:
+        piv_med_veh = (
+            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
+            .pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values="Tiempo de Estadia",
+                aggfunc="median",
+            )
+            .round(0)
+        )
+        piv_cnt_veh = (
+            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
+            .pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values="Tiempo de Estadia",
+                aggfunc="count",
+            )
+            .fillna(0)
+            .astype(int)
+        )
+
+        # Combinar "42 min (n=1.230)" en una tabla limpia de lectura gerencial
+        mat_display = pd.DataFrame(index=piv_med_veh.index)
+        for col_v in piv_med_veh.columns:
+            mat_display[col_v] = [
+                f"{int(piv_med_veh.loc[idx_r, col_v])} min (n={piv_cnt_veh.loc[idx_r, col_v]:,})".replace(",", ".")
+                if pd.notna(piv_med_veh.loc[idx_r, col_v]) and piv_cnt_veh.loc[idx_r, col_v] > 0
+                else "—"
+                for idx_r in piv_med_veh.index
+            ]
+        mat_display = mat_display.reset_index().rename(columns={"CD_Str": "Operación"})
+        st.dataframe(mat_display, use_container_width=True, hide_index=True)
+
+        with st.expander("🚪 Fases de Estadía en Tienda (Sensor Puerta Trasera)", expanded=False):
+            st.markdown(
+                """
+                Cuando UNIGIS active la telemetría de puerta trasera (`Apertura Puerta Trasera` y `Cierre Puerta Trasera`),
+                este bloque abrirá automáticamente cada estadía en sus **3 fases operativas**:
+                1. **Fase 1 — Espera / Recepción en Tienda:** `Apertura Puerta Trasera − Inicio Horario Visita Real` *(demora hasta que abren cortina/reciben)*.
+                2. **Fase 2 — Descarga Efectiva:** `Minutos Apertura y Cierre` *(tiempo real de descarga física de mercadería)*.
+                3. **Fase 3 — Cierre Documental y Egreso:** `Fecha Hora Salida − Cierre Puerta Trasera` *(demora de remito/firma y salida de geocerca)*.
+                """
+            )
+            if puerta_activa_cnt == 0:
+                st.info("Estado actual del archivo UNIGIS: las 3 columnas de puerta trasera vienen en `0` en el 100% de las paradas.")
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 3: RANKING DE TIENDAS POR TIEMPO DE ESTADIA + DESCARGA EXCEL
+    # -------------------------------------------------------------------------
+    st.markdown("### 3. Ranking de Tiendas por Estadía y Productividad")
+
+    rk_c1, rk_c2, rk_c3 = st.columns([1.2, 1.2, 1.2])
+    with rk_c1:
+        min_vis_rk = st.number_input(
+            "Mínimo de visitas limpias en la tienda:",
+            min_value=1,
+            max_value=100,
+            value=5,
+            step=1,
+            key="s3_min_vis_rk",
+        )
+    with rk_c2:
+        filtro_tv_rk = st.selectbox(
+            "Filtrar por Tipo de Viaje:",
+            options=["Todos", "Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"],
+            index=0,
+            key="s3_tv_rk",
+        )
+    with rk_c3:
+        filtro_cat_rk = st.selectbox(
+            "Filtrar por Categoría:",
+            options=["Todas", "Cercana", "Lejana"],
+            index=0,
+            key="s3_cat_rk",
+        )
+
+    rk_base = st_clean_s3.copy()
+    if filtro_tv_rk != "Todos":
+        rk_base = rk_base[rk_base["Tipo_Viaje"] == filtro_tv_rk]
+    if filtro_cat_rk != "Todas":
+        rk_base = rk_base[rk_base["Categoria"] == filtro_cat_rk]
+
+    rk_rows = []
+    for (op_r, t_cod), grp in rk_base.groupby(["Operacion", "Tienda_Cod"]):
+        if len(grp) < min_vis_rk:
+            continue
+        s_e = grp["Tiempo de Estadia"]
+        g_p = grp[grp["Total Bultos_num"].fillna(0) >= 20]
+        m100_t = (
+            float((g_p["Tiempo de Estadia"] / (g_p["Total Bultos_num"] / 100.0)).median())
+            if len(g_p) > 0
+            else np.nan
+        )
+        rk_rows.append(
             {
-                "CD": str(int(op)),
-                "Viajes TMS": v_tms_o,
-                "100% Tiendas OK": v_100_st,
-                "CD Origen OK": v_cd_ok,
-                "Viajes Completos": v_comp_o,
-                "Excl. Incongr.": v_excl_o,
-                "Base Final Limpia": v_clean_o,
-                "Paradas Limpias": len(sub_st_clean),
-                "% Retención Limpia": round((v_clean_o / v_comp_o * 100) if v_comp_o > 0 else 0.0, 1),
+                "CD": str(int(op_r)),
+                "Tienda": str(t_cod),
+                "Categoría": grp["Categoria"].mode().iloc[0] if not grp["Categoria"].mode().empty else "Sin dato",
+                "Visitas Limpias": int(len(s_e)),
+                "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
+                "P25 (min)": round(float(np.percentile(s_e, 25)), 0),
+                "Mediana (min)": round(float(s_e.median()), 0),
+                "P75 (min)": round(float(np.percentile(s_e, 75)), 0),
+                "P90 (min)": round(float(np.percentile(s_e, 90)), 0),
+                "Min / 100 Bultos": round(m100_t, 1) if pd.notna(m100_t) else None,
             }
         )
 
-    df_dq_op = pd.DataFrame(rows_dq_op)
-    if not df_dq_op.empty:
-        tot_dq_row = pd.DataFrame(
-            [
-                {
-                    "CD": "TOTAL",
-                    "Viajes TMS": df_dq_op["Viajes TMS"].sum(),
-                    "100% Tiendas OK": df_dq_op["100% Tiendas OK"].sum(),
-                    "CD Origen OK": df_dq_op["CD Origen OK"].sum(),
-                    "Viajes Completos": df_dq_op["Viajes Completos"].sum(),
-                    "Excl. Incongr.": df_dq_op["Excl. Incongr."].sum(),
-                    "Base Final Limpia": df_dq_op["Base Final Limpia"].sum(),
-                    "Paradas Limpias": df_dq_op["Paradas Limpias"].sum(),
-                    "% Retención Limpia": round(pct_retencion_limpia, 1),
-                }
+    df_rk_tiendas = (
+        pd.DataFrame(rk_rows).sort_values(["Mediana (min)", "P90 (min)"], ascending=[False, False])
+        if rk_rows
+        else pd.DataFrame(
+            columns=[
+                "CD",
+                "Tienda",
+                "Categoría",
+                "Visitas Limpias",
+                "Mediana Bultos",
+                "P25 (min)",
+                "Mediana (min)",
+                "P75 (min)",
+                "P90 (min)",
+                "Min / 100 Bultos",
             ]
         )
-        df_dq_op_disp = pd.concat([df_dq_op, tot_dq_row], ignore_index=True)
-
-        st.dataframe(
-            df_dq_op_disp,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "% Retención Limpia": st.column_config.ProgressColumn(
-                    "% Retención Limpia", format="%.1f%%", min_value=0, max_value=100, width="medium"
-                ),
-            },
-        )
-
-    st.divider()
-
-    # -------------------------------------------------------------------------
-    # BLOQUE 2: PARETO DE INCONGRUENCIAS LOGISTICAS (Y EVALUACION DE RETORNO)
-    # -------------------------------------------------------------------------
-    st.markdown("### 2. Diagnóstico de Incongruencias Detectadas (Sobre Viajes Completos)")
-
-    pcol1, pcol2 = st.columns([1.25, 1])
-    with pcol1:
-        reglas_summary = pd.DataFrame(
-            [
-                {"Regla de Incongruencia": f"CD Origen > {max_estadia_cd} min (Playa/Abierto)", "Viajes": len(bad_cd_larga)},
-                {"Regla de Incongruencia": "Solape horario / Tránsito nulo entre paradas", "Viajes": len(bad_st_solape)},
-                {"Regla de Incongruencia": f"Parada en tienda < {min_estadia_st} min (sin descarga)", "Viajes": len(bad_st_est_corta)},
-                {"Regla de Incongruencia": "Parada en tienda extrema (reloj abierto)", "Viajes": len(bad_st_est_larga)},
-                {"Regla de Incongruencia": "Incongruencia odómetro (KMS Total o Tramo 0)", "Viajes": len(bad_st_km | bad_tr_odom)},
-                {"Regla de Incongruencia": f"Velocidad irreal (> {max_vel_gps} o < 2 km/h)", "Viajes": len(bad_st_vel)},
-                {"Regla de Incongruencia": f"CD Origen < {min_estadia_cd} min (barrera)", "Viajes": len(bad_cd_corta)},
-                {"Regla de Incongruencia": "Tiempo en viaje extremo entre paradas", "Viajes": len(bad_st_tv_ext)},
-            ]
-        )
-        reglas_summary = reglas_summary[reglas_summary["Viajes"] > 0].sort_values("Viajes", ascending=True)
-        if not reglas_summary.empty:
-            fig_dq = go.Figure(
-                go.Bar(
-                    x=reglas_summary["Viajes"],
-                    y=reglas_summary["Regla de Incongruencia"],
-                    orientation="h",
-                    marker_color="#dc2626",
-                    text=reglas_summary["Viajes"],
-                    textposition="outside",
-                )
-            )
-            fig_dq.update_layout(
-                title="Viajes Completos Excluidos por Tipo de Incongruencia",
-                height=340,
-                margin=dict(l=10, r=45, t=40, b=20),
-                xaxis_title="Cantidad de Viajes (un viaje puede tener >1 regla)",
-            )
-            st.plotly_chart(fig_dq, use_container_width=True)
-        else:
-            st.success("Sin incongruencias detectadas con los parámetros actuales.")
-
-    with pcol2:
-        st.markdown("**📊 Evaluación de Retorno a CD (Dato informativo — NO excluye)**")
-        st.caption(
-            "Auditoría de `Tiempo Retorno` y `KMS Retorno` sobre los "
-            f"**{_fmt_int(cnt_comp_base)}** viajes completos para diagnosticar cierres de ruta:"
-        )
-        ret_ok_cnt = int(
-            (
-                (~comp_trips["obs_err_fin"])
-                & comp_trips["Tiempo_Retorno"].notna()
-                & (comp_trips["Tiempo_Retorno"] > 0)
-                & (comp_trips["Tiempo_Retorno"] <= np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
-                & (comp_trips["KMS_Retorno"].fillna(0) > 0)
-            ).sum()
-        )
-        ret_sin_dato_cnt = int(comp_trips["Tiempo_Retorno"].isna().sum())
-        ret_err_cierre_cnt = int(comp_trips["obs_err_fin"].sum())
-        ret_extremo_cnt = int(
-            (
-                (~comp_trips["obs_err_fin"])
-                & comp_trips["Tiempo_Retorno"].notna()
-                & (comp_trips["Tiempo_Retorno"] > np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
-            ).sum()
-        )
-        ret_km_zero_cnt = int(
-            (comp_trips["Tiempo_Retorno"].notna() & (comp_trips["KMS_Retorno"].fillna(0) <= 0)).sum()
-        )
-
-        df_ret_box = pd.DataFrame(
-            [
-                {"Estado del Retorno (sobre Viajes Completos)": "✅ Retorno consistente (Tiempo y KMS OK)", "Viajes": ret_ok_cnt, "%": round(ret_ok_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
-                {"Estado del Retorno (sobre Viajes Completos)": "⚠️ Error en finalización (cierre tardío TMS)", "Viajes": ret_err_cierre_cnt, "%": round(ret_err_cierre_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
-                {"Estado del Retorno (sobre Viajes Completos)": "⚪ Sin dato de retorno (Tiempo Retorno vacío)", "Viajes": ret_sin_dato_cnt, "%": round(ret_sin_dato_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
-                {"Estado del Retorno (sobre Viajes Completos)": "⏱️ Tiempo retorno extremo (>6h Cerc. / >12h Lej.)", "Viajes": ret_extremo_cnt, "%": round(ret_extremo_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
-                {"Estado del Retorno (sobre Viajes Completos)": "🛣️ KMS Retorno <= 0 o <= 0 min", "Viajes": ret_km_zero_cnt, "%": round(ret_km_zero_cnt / cnt_comp_base * 100, 1) if cnt_comp_base else 0.0},
-            ]
-        )
-        st.dataframe(df_ret_box, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # -------------------------------------------------------------------------
-    # BLOQUE 3: AUDITORIA DE EXCLUSIONES, EVALUACION RETORNO Y DESCARGA EXCEL
-    # -------------------------------------------------------------------------
-    st.markdown("### 3. Auditoría Detallada y Descarga de Base Final Limpia")
-
-    excl_tr_df = comp_trips[~comp_trips["Viaje_Final_Limpio"]].copy()
-    excl_tr_df["Fecha Reparto"] = excl_tr_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    excl_tr_disp = excl_tr_df[
-        [
-            "Operacion",
-            "Fecha Reparto",
-            "Ref_Clean",
-            "Id Viaje",
-            "Dominio",
-            "Categoria",
-            "Estadia_CD_Origen",
-            "Tiendas_Plan_Viaje",
-            "KMS_Total",
-            "Sum_KMS_Paradas",
-            "Motivo_DQ",
-        ]
-    ].rename(
-        columns={
-            "Operacion": "CD",
-            "Ref_Clean": "Ref Externa Viaje",
-            "Estadia_CD_Origen": "Estadía CD (min)",
-            "Tiendas_Plan_Viaje": "Tiendas",
-            "KMS_Total": "KMS Total",
-            "Sum_KMS_Paradas": "Suma KMS Paradas",
-            "Motivo_DQ": "Motivo Exclusión",
-        }
     )
 
-    excl_st_df = comp_stops[~comp_stops["Parada_Limpia"]].copy()
-    excl_st_df["Fecha Reparto"] = excl_st_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    excl_st_disp = excl_st_df[
-        [
-            "Operacion",
-            "Fecha Reparto",
-            "Ref_Clean",
-            "Id Viaje",
-            "Dominio",
-            "Tienda_Cod",
-            "Categoria",
-            "Tiempo de Estadia",
-            "Tiempo en Viaje",
-            "KMS Parada_num",
-            "Velocidad Real Calculada_num",
-            "Motivo_Parada",
-        ]
-    ].rename(
-        columns={
-            "Operacion": "CD",
-            "Ref_Clean": "Ref Externa Viaje",
-            "Tienda_Cod": "Tienda",
-            "Tiempo de Estadia": "Estadía (min)",
-            "Tiempo en Viaje": "Viaje (min)",
-            "KMS Parada_num": "KMS Tramo",
-            "Velocidad Real Calculada_num": "Vel. (km/h)",
-            "Motivo_Parada": "Incongruencia Detectada",
-        }
-    )
-
-    ret_incong_mask = (
-        comp_trips["obs_err_fin"]
-        | comp_trips["Tiempo_Retorno"].isna()
-        | (comp_trips["Tiempo_Retorno"] <= 0)
-        | (comp_trips["Tiempo_Retorno"] > np.where(comp_trips["Categoria"] == "Lejana", 720, 360))
-        | (comp_trips["KMS_Retorno"].fillna(0) <= 0)
-    )
-    ret_eval_df = comp_trips[ret_incong_mask].copy()
-    ret_eval_df["Fecha Reparto"] = ret_eval_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    ret_eval_df["Observación Retorno"] = np.select(
-        [
-            ret_eval_df["obs_err_fin"],
-            ret_eval_df["Tiempo_Retorno"].isna(),
-            ret_eval_df["Tiempo_Retorno"] <= 0,
-            ret_eval_df["Tiempo_Retorno"] > np.where(ret_eval_df["Categoria"] == "Lejana", 720, 360),
-            ret_eval_df["KMS_Retorno"].fillna(0) <= 0,
-        ],
-        [
-            "Error en finalización (cierre tardío)",
-            "Sin dato de retorno (vacío)",
-            "Tiempo retorno <= 0 min",
-            "Tiempo retorno extremo (>6h/12h)",
-            "KMS retorno = 0",
-        ],
-        default="Revisar",
-    )
-    ret_eval_disp = ret_eval_df[
-        [
-            "Operacion",
-            "Fecha Reparto",
-            "Ref_Clean",
-            "Id Viaje",
-            "Dominio",
-            "Categoria",
-            "Viaje_Final_Limpio",
-            "Tiempo_Retorno",
-            "KMS_Retorno",
-            "Observación Retorno",
-        ]
-    ].rename(
-        columns={
-            "Operacion": "CD",
-            "Ref_Clean": "Ref Externa Viaje",
-            "Viaje_Final_Limpio": "Incluido en Base KPI",
-            "Tiempo_Retorno": "Tiempo Retorno (min)",
-            "KMS_Retorno": "KMS Retorno",
-        }
-    )
-
-    clean_tr_export = final_clean_trips.copy()
-    clean_tr_export["Fecha Reparto"] = clean_tr_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    clean_st_export = final_clean_stops.copy()
-    clean_st_export["Fecha Reparto"] = clean_st_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-
-    dq_excel_bytes = build_dq_excel(
-        clean_tr_export, clean_st_export, excl_tr_disp, excl_st_disp, ret_eval_disp
+    clean_s3_export = st_clean_s3.copy()
+    clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    estadias_excel_bytes = build_estadias_excel(
+        df_seg_summary if not st_clean_s3.empty else pd.DataFrame(),
+        mat_display if not st_clean_s3.empty else pd.DataFrame(),
+        df_rk_tiendas,
+        clean_s3_export,
     )
     st.download_button(
-        label="📥 Descargar Base Final Limpia + Auditoría en Excel (.xlsx)",
-        data=dq_excel_bytes,
-        file_name="Base_Final_Limpia_y_Auditoria.xlsx",
+        label="📥 Descargar Análisis de Estadías en Tienda (.xlsx)",
+        data=estadias_excel_bytes,
+        file_name="Analisis_Estadias_y_Productividad_Tienda.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    dqt1, dqt2, dqt3 = st.tabs(
-        [
-            f"🚫 Viajes Completos Excluidos ({len(excl_tr_disp)})",
-            f"🏪 Paradas con Incongruencia ({len(excl_st_disp)})",
-            f"🔄 Evaluación Retorno a CD — No Excluye ({len(ret_eval_disp)})",
-        ]
-    )
-
-    with dqt1:
-        st.caption("Viajes completos descartados de la base de KPIs por presentar al menos una incongruencia logística.")
-        st.dataframe(excl_tr_disp, use_container_width=True, hide_index=True)
-
-    with dqt2:
-        st.caption("Detalle puntual de la parada o tramo donde se originó la incongruencia.")
-        st.dataframe(excl_st_disp, use_container_width=True, hide_index=True)
-
-    with dqt3:
-        st.caption(
-            "Dato informativo para evaluar el cierre de rutas y tiempos/kms de retorno. "
-            "Estos viajes NO se excluyen de la Base Final de KPIs por este motivo."
-        )
-        st.dataframe(ret_eval_disp, use_container_width=True, hide_index=True)
+    st.dataframe(df_rk_tiendas, use_container_width=True, hide_index=True)
 
 # =============================================================================
-# PLACEHOLDER PARA SOLAPA 4 (ESTADISTICA DE TIEMPOS SOBRE BASE LIMPIA)
+# PLACEHOLDERS PARA SOLAPAS 4 Y 5
 # =============================================================================
 with tab4:
     st.info(
-        f"🚧 **Próximo paso (Solapa 4 — Estadística de Tiempos y KPIs):** "
-        f"Base sincronizada con **{len(st.session_state['clean_trips_df']):,}** viajes completos limpios "
-        f"(**{len(st.session_state['clean_stores_df']):,}** paradas en tienda) con estadía en CD origen, "
-        f"estadías en todas las tiendas, tiempos de tránsito, distancias y velocidades 100% depuradas."
+        "🚧 **Próximo paso (Solapa 4 — Velocidades y Parametrización UNIGIS):** "
+        "Cálculo de las 4 velocidades de UNIGIS (`Velocidad promedio entre paradas`, `Velocidad depósito salida`, "
+        "`Velocidad depósito llegada` y `Velocidad máxima`) abiertas por **Operación (CD)** y **Tipo de Vehículo (Nómina)**, "
+        "con su bloque de limpieza de tramos y diagramas de cajas."
+    )
+
+with tab5:
+    st.info(
+        "🚧 **Solapa 5 — Internos, CD Origen y Jornada Diaria:** "
+        "Permanencia en CD Origen, desvío vs. `Hora Reparto`, análisis de vueltas por día (`1` vs `2` vs `3+ vueltas`) "
+        "y jornada del chofer por interno/patente."
     )
