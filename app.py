@@ -1508,8 +1508,14 @@ with tab2:
         .sum()
     )
 
-    viajes_act_tarde_cnt = int(gps_filt[gps_filt["obs_act_tarde"]]["Id Viaje"].nunique())
-    viajes_err_fin_cnt = int(gps_filt[gps_filt["obs_err_fin"]]["Id Viaje"].nunique())
+    act_tarde_df = gps_filt[gps_filt["obs_act_tarde"]]
+    viajes_act_tarde_cnt = int(act_tarde_df["Id Viaje"].nunique())
+    viajes_act_tarde_ok_cnt = int(
+        act_tarde_df.groupby("Id Viaje")["Diagnostico_GPS"]
+        .apply(lambda s: int((s == "Visitada (OK)").sum()) == len(s))
+        .sum()
+    )
+    viajes_act_tarde_fail_cnt = viajes_act_tarde_cnt - viajes_act_tarde_ok_cnt
     pct_viajes_act_tarde = (viajes_act_tarde_cnt / viajes_gps_tot * 100) if viajes_gps_tot > 0 else 0.0
 
     geo_only_df = gps_filt[gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)"]
@@ -1520,7 +1526,7 @@ with tab2:
     pct_ciego = (paradas_ciego / tot_paradas * 100) if tot_paradas > 0 else 0.0
     pct_geo = (paradas_geo / tot_paradas * 100) if tot_paradas > 0 else 0.0
 
-    g1, g2, g3, g4, g5 = st.columns([1.0, 1.45, 1.25, 1.30, 1.15])
+    g1, g2, g3, g4, g5 = st.columns([1.0, 1.45, 1.25, 1.30, 1.20])
     with g1:
         st.markdown(
             _kpi_card_html(
@@ -1568,11 +1574,11 @@ with tab2:
     with g5:
         st.markdown(
             _kpi_card_html(
-                "Interfaz y Cierre (Viajes)",
+                "Activación Tarde (Viajes)",
                 _fmt_int(viajes_act_tarde_cnt),
-                f"Activación tarde ({_fmt_pct(pct_viajes_act_tarde)})",
+                f"{_fmt_pct(pct_viajes_act_tarde)} de viajes (>5 km CD)",
                 "#475569",
-                f"<b>{_fmt_int(viajes_err_fin_cnt)}</b> viajes con error de cierre",
+                f"<b>{_fmt_int(viajes_act_tarde_ok_cnt)}</b> con visitas OK | <b>{_fmt_int(viajes_act_tarde_fail_cnt)}</b> c/ pérdida",
             ),
             unsafe_allow_html=True,
         )
