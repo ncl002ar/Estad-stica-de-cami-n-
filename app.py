@@ -2949,9 +2949,13 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 3: RANKING DE TIENDAS POR TIEMPO DE ESTADIA + DESCARGA EXCEL
+    # BLOQUE 3: MATRIZ DE DISPERSION Y RANKING ESTRUCTURAL DE TIENDAS
     # -------------------------------------------------------------------------
-    st.markdown("### 3. Ranking de Tiendas por Estadía y Productividad")
+    st.markdown("### 3. Diagnóstico de Demoras (Desvío vs. Benchmark y Percentiles Críticos)")
+    st.caption(
+        "Este análisis compara la mediana de estadía de cada tienda contra la mediana general de su propio segmento "
+        "(`Tipo de Viaje` y `Categoría`). Las tiendas con un **desvío positivo alto** presentan demoras estructurales."
+    )
 
     rk_c1, rk_c2, rk_c3 = st.columns([1.2, 1.2, 1.2])
     with rk_c1:
@@ -2984,6 +2988,14 @@ with tab3:
     if filtro_cat_rk != "Todas":
         rk_base = rk_base[rk_base["Categoria"] == filtro_cat_rk]
 
+    # Calcular Benchmark por segmento
+    bench_df = (
+        st_clean_s3.groupby(["Tipo_Viaje", "Categoria"])["Tiempo de Estadia"]
+        .median()
+        .reset_index(name="Mediana_Bench")
+    )
+    rk_base = rk_base.merge(bench_df, on=["Tipo_Viaje", "Categoria"], how="left")
+
     rk_rows = []
     for (op_r, t_cod), grp in rk_base.groupby(["Operacion", "Tienda_Cod"]):
         if len(grp) < min_vis_rk:
@@ -2995,39 +3007,79 @@ with tab3:
             if len(g_p) > 0
             else np.nan
         )
+        med_est_t = float(s_e.median())
+        med_bench_t = float(grp["Mediana_Bench"].mean())
+        
         rk_rows.append(
             {
                 "CD": str(int(op_r)),
                 "Tienda": str(t_cod),
-                "Categoría": grp["Categoria"].mode().iloc[0] if not grp["Categoria"].mode().empty else "Sin dato",
+                "Tipo Viaje Ppal.": grp["Tipo_Viaje"].mode().iloc[0] if not grp["Tipo_Viaje"].empty else "",
+                "Categoría": grp["Categoria"].mode().iloc[0] if not grp["Categoria"].empty else "",
                 "Visitas Limpias": int(len(s_e)),
                 "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
-                "P25 (min)": round(float(np.percentile(s_e, 25)), 0),
-                "Mediana (min)": round(float(s_e.median()), 0),
-                "P75 (min)": round(float(np.percentile(s_e, 75)), 0),
-                "P90 (min)": round(float(np.percentile(s_e, 90)), 0),
-                "Min / 100 Bultos": round(m100_t, 1) if pd.notna(m100_t) else None,
+                "Mediana Est. (min)": round(med_est_t, 0),
+                "P90 Est. (min)": round(float(np.percentile(s_e, 90)), 0),
+                "Bench Segmento": round(med_bench_t, 1),
+                "Desvío vs Bench": round(med_est_t - med_bench_t, 1),
+                "Min / 100 Bultos": round(m100_t, 1) if pd.notna(m100_t) else np.nan,
             }
         )
 
-    df_rk_tiendas = (
-        pd.DataFrame(rk_rows).sort_values(["Mediana (min)", "P90 (min)"], ascending=[False, False])
-        if rk_rows
-        else pd.DataFrame(
+    df_rk_tiendas = pd.DataFrame(rk_rows)
+    if not df_rk_tiendas.empty:
+        df_rk_tiendas = df_rk_tiendas.sort_values("Desvío vs Bench", ascending=False)
+        
+        # Gráfico de Dispersión (Bultos vs Estadía) coloreado por Desvío
+        fig_scatter = go.Figure(
+            data=go.Scatter(
+                x=df_rk_tiendas["Mediana Bultos"],
+                y=df_rk_tiendas["Mediana Est. (min)"],
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color=df_rk_tiendas["Desvío vs Bench"],
+                    colorscale="RdYlBu_r",
+                    showscale=True,
+                    colorbar=dict(title="Desvío (min)", len=0.8),
+                    line=dict(width=0.5, color="white"),
+                ),
+                text=df_rk_tiendas["Tienda"],
+                customdata=np.dstack((df_rk_tiendas["CD"], df_rk_tiendas["Tipo Viaje Ppal."]))[0],
+                hovertemplate=(
+                    "<b>Tienda %{text}</b> (CD %{customdata[0]})<br>"
+                    "Volumen: %{x:,.0f} bultos<br>"
+                    "Estadía Mediana: %{y:,.0f} min<br>"
+                    "Desvío vs Bench: %{marker.color:+.1f} min<br>"
+                    "Segmento: %{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+        fig_scatter.update_layout(
+            height=400,
+            margin=dict(l=20, r=20, t=30, b=20),
+            xaxis_title="Volumen Típico de Descarga (Mediana de Bultos)",
+            yaxis_title="Tiempo de Estadía Habitual (Mediana en min)",
+            title="Matriz Bultos vs. Tiempo de Estadía (cada punto es una Tienda)",
+            hovermode="closest",
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
+    else:
+        df_rk_tiendas = pd.DataFrame(
             columns=[
                 "CD",
                 "Tienda",
+                "Tipo Viaje Ppal.",
                 "Categoría",
                 "Visitas Limpias",
                 "Mediana Bultos",
-                "P25 (min)",
-                "Mediana (min)",
-                "P75 (min)",
-                "P90 (min)",
+                "Mediana Est. (min)",
+                "P90 Est. (min)",
+                "Bench Segmento",
+                "Desvío vs Bench",
                 "Min / 100 Bultos",
             ]
         )
-    )
 
     clean_s3_export = st_clean_s3.copy()
     clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
@@ -3044,7 +3096,18 @@ with tab3:
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    st.dataframe(df_rk_tiendas, use_container_width=True, hide_index=True)
+    st.dataframe(
+        df_rk_tiendas,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Desvío vs Bench": st.column_config.NumberColumn(
+                "Desvío vs Bench",
+                help="Diferencia en minutos contra la mediana de su propio segmento",
+                format="%+.1f min"
+            ),
+        }
+    )
 
 # =============================================================================
 # PLACEHOLDERS PARA SOLAPAS 4 Y 5
