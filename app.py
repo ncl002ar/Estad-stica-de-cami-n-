@@ -1570,9 +1570,9 @@ with tab2:
             _kpi_card_html(
                 "Interfaz y Cierre (Viajes)",
                 _fmt_int(viajes_act_tarde_cnt),
-                f"Activ. tarde ({_fmt_pct(pct_viajes_act_tarde)})",
+                f"Activación tarde ({_fmt_pct(pct_viajes_act_tarde)})",
                 "#475569",
-                f"<b>{_fmt_int(viajes_err_fin_cnt)}</b> cierre tardío | <b>{gps_filt[gps_filt['Diagnostico_GPS'] == 'Sin coordenadas']['Tienda_Cod'].nunique()}</b> s/coord.",
+                f"<b>{_fmt_int(viajes_err_fin_cnt)}</b> viajes con error de cierre",
             ),
             unsafe_allow_html=True,
         )
@@ -1604,8 +1604,8 @@ with tab2:
                 "CD": str(int(op)),
                 "Viajes TMS": v_tot,
                 "Viajes Ciegos": v_ciegos,
-                "% Activ. Tarde": round((v_act / v_tot * 100) if v_tot > 0 else 0.0, 1),
-                "% Error Cierre": round((v_err / v_tot * 100) if v_tot > 0 else 0.0, 1),
+                "Activ. Tarde": v_act,
+                "Error Cierre": v_err,
                 "Paradas Plan.": p_tot,
                 "Visitadas OK": p_ok,
                 "Falla GPS": p_ciego,
@@ -1617,15 +1617,14 @@ with tab2:
 
     df_gps_op = pd.DataFrame(rows_gps_op)
     if not df_gps_op.empty:
-        tot_v_all = df_gps_op["Viajes TMS"].sum()
         tot_gps_row = pd.DataFrame(
             [
                 {
                     "CD": "TOTAL",
-                    "Viajes TMS": tot_v_all,
+                    "Viajes TMS": df_gps_op["Viajes TMS"].sum(),
                     "Viajes Ciegos": df_gps_op["Viajes Ciegos"].sum(),
-                    "% Activ. Tarde": round((viajes_act_tarde_cnt / tot_v_all * 100) if tot_v_all > 0 else 0.0, 1),
-                    "% Error Cierre": round((viajes_err_fin_cnt / tot_v_all * 100) if tot_v_all > 0 else 0.0, 1),
+                    "Activ. Tarde": df_gps_op["Activ. Tarde"].sum(),
+                    "Error Cierre": df_gps_op["Error Cierre"].sum(),
                     "Paradas Plan.": df_gps_op["Paradas Plan."].sum(),
                     "Visitadas OK": df_gps_op["Visitadas OK"].sum(),
                     "Falla GPS": df_gps_op["Falla GPS"].sum(),
@@ -1645,8 +1644,8 @@ with tab2:
                 "CD": st.column_config.TextColumn("CD", width="small"),
                 "Viajes TMS": st.column_config.NumberColumn("Viajes TMS", format="%d", width="small"),
                 "Viajes Ciegos": st.column_config.NumberColumn("Viajes Ciegos", format="%d", width="small"),
-                "% Activ. Tarde": st.column_config.NumberColumn("% Activ. Tarde", format="%.1f%%", width="small"),
-                "% Error Cierre": st.column_config.NumberColumn("% Error Cierre", format="%.1f%%", width="small"),
+                "Activ. Tarde": st.column_config.NumberColumn("Activ. Tarde", format="%d", width="small"),
+                "Error Cierre": st.column_config.NumberColumn("Error Cierre", format="%d", width="small"),
                 "Paradas Plan.": st.column_config.NumberColumn("Paradas Plan.", format="%d", width="small"),
                 "Visitadas OK": st.column_config.NumberColumn("Visitadas OK", format="%d", width="small"),
                 "Falla GPS": st.column_config.NumberColumn("Falla GPS", format="%d", width="small"),
@@ -2155,10 +2154,10 @@ with tab2:
 
     with gtab1:
         st.caption(
-            "Tiendas donde el camión sí registró visitas GPS en otras paradas del mismo viaje, "
-            "pero marcó 'No visitada' aquí. Por defecto excluye viajes con Activación Tarde (>5 km) para no culpar al polígono."
+            "Apertura completa de cada tienda: Paradas Plan. = Visitadas OK + Falla Geozona (polígono) + "
+            "Por Activ. Tarde (>5 km CD) + Falla Viaje Ciego (unidad sin GPS en todo el viaje)."
         )
-        gc1, gc2, gc3 = st.columns([1.2, 1.2, 1.3])
+        gc1, gc2 = st.columns(2)
         with gc1:
             min_fallas_geo = st.number_input(
                 "Mínimo de fallas de geozona (2 = recurrentes):",
@@ -2177,40 +2176,58 @@ with tab2:
                 step=1,
                 key="min_paradas_geo",
             )
-        with gc3:
-            st.write("")
-            excluir_act_tarde_geo = st.checkbox(
-                "Excluir viajes con Activación Tarde (>5 km)",
-                value=True,
-                key="excluir_act_tarde_geo",
-            )
 
-        col_falla_ref = (
-            "Falla Geozona (Activ. OK)" if excluir_act_tarde_geo else "Falla Parcial Total"
-        )
-        st_geo_view = st_rank_all[
-            (st_rank_all[col_falla_ref] >= min_fallas_geo)
+        st_geo_sub = st_rank_all[
+            (st_rank_all["Falla Geozona (Activ. OK)"] >= min_fallas_geo)
             & (st_rank_all["Paradas Plan."] >= min_paradas_geo)
-        ].sort_values([col_falla_ref, "% Falla Geozona (Activ. OK)"], ascending=[False, False])
+        ].copy()
+        st_geo_sub["% Falla Geozona"] = np.where(
+            st_geo_sub["Paradas Plan."] > 0,
+            (st_geo_sub["Falla Geozona (Activ. OK)"] / st_geo_sub["Paradas Plan."] * 100).round(1),
+            0.0,
+        )
+        st_geo_view = (
+            st_geo_sub[
+                [
+                    "CD",
+                    "Tienda",
+                    "Paradas Plan.",
+                    "Visitadas OK",
+                    "Falla Geozona (Activ. OK)",
+                    "Falla c/ Activ. Tarde",
+                    "Falla Viaje Ciego",
+                    "Re-entradas (>1)",
+                    "% Falla Geozona",
+                ]
+            ]
+            .sort_values(["Falla Geozona (Activ. OK)", "% Falla Geozona"], ascending=[False, False])
+            .rename(
+                columns={
+                    "Falla Geozona (Activ. OK)": "Falla Geozona",
+                    "Falla c/ Activ. Tarde": "Por Activ. Tarde",
+                }
+            )
+        )
 
         st.dataframe(
             st_geo_view,
             use_container_width=True,
             hide_index=True,
             column_config={
-                "% Falla Geozona (Activ. OK)": st.column_config.ProgressColumn(
+                "CD": st.column_config.TextColumn("CD", width="small"),
+                "Tienda": st.column_config.TextColumn("Tienda", width="small"),
+                "Paradas Plan.": st.column_config.NumberColumn("Paradas Plan.", format="%d", width="small"),
+                "Visitadas OK": st.column_config.NumberColumn("Visitadas OK", format="%d", width="small"),
+                "Falla Geozona": st.column_config.NumberColumn("Falla Geozona", format="%d", width="small"),
+                "Por Activ. Tarde": st.column_config.NumberColumn("Por Activ. Tarde", format="%d", width="small"),
+                "Falla Viaje Ciego": st.column_config.NumberColumn("Falla Viaje Ciego", format="%d", width="small"),
+                "Re-entradas (>1)": st.column_config.NumberColumn("Re-entradas (>1)", format="%d", width="small"),
+                "% Falla Geozona": st.column_config.ProgressColumn(
                     "% Falla Geozona",
                     format="%.1f%%",
                     min_value=0,
                     max_value=100,
-                    width="small",
-                ),
-                "% Efectividad OK": st.column_config.ProgressColumn(
-                    "% Efectividad OK",
-                    format="%.1f%%",
-                    min_value=0,
-                    max_value=100,
-                    width="small",
+                    width="medium",
                 ),
             },
         )
