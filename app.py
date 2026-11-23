@@ -2460,36 +2460,63 @@ with tab3:
         "(no descarta paradas si faltó estadía en el CD o en otra parada del viaje)."
     )
 
-    with st.expander("🎛️ Parámetros de Depuración de Estadías en Tienda", expanded=False):
+    with st.expander("🎛️ Parámetros de Integridad Estadística de Estadías (Ajustables)", expanded=True):
         sc1, sc2, sc3, sc4 = st.columns(4)
         with sc1:
-            min_est_tienda = st.number_input(
-                "Estadía mínima válida (min):",
-                min_value=0,
+            min_est_directo = st.number_input(
+                "Piso mín. Directo (1 tienda):",
+                min_value=5,
+                max_value=60,
+                value=15,
+                step=5,
+                help="Un viaje exclusivo (mediana 670 bultos) no puede durar <15 min (default: 15 min).",
+                key="s3_min_dir",
+            )
+            min_est_comp = st.number_input(
+                "Piso mín. Compartido (2 tiendas):",
+                min_value=5,
+                max_value=45,
+                value=10,
+                step=1,
+                help="Piso mínimo para viajes de 2 tiendas (default: 10 min).",
+                key="s3_min_comp",
+            )
+        with sc2:
+            min_est_rutas = st.number_input(
+                "Piso mín. Rutas (3+ tiendas):",
+                min_value=1,
                 max_value=30,
                 value=5,
                 step=1,
-                help="Descarta pasos rápidos por la puerta de la tienda sin descarga real (<5 min).",
-                key="s3_min_est",
+                help="Piso mínimo para repartos capilares de 3+ tiendas (default: 5 min).",
+                key="s3_min_rutas",
             )
-        with sc2:
+            min_min100b_phys = st.number_input(
+                "Ritmo físico mín. (min/100 bultos):",
+                min_value=0.0,
+                max_value=10.0,
+                value=3.0,
+                step=0.5,
+                help="En cargas >=50 bultos, <3,0 min/100b (>2.000 bultos/h) indica descarga fuera del polígono o paso de largo.",
+                key="s3_min_phys",
+            )
+        with sc3:
             max_est_cerc = st.number_input(
-                "Estadía máx. Cercana (min):",
-                min_value=60,
+                "Techo máx. Directo Cercana (min):",
+                min_value=120,
                 max_value=720,
                 value=240,
                 step=30,
-                help="Excluye relojes abiertos o pernoctes en tiendas Cercana (default: 240 min = 4h).",
+                help="Compartido aplica 75% de este techo (180m) y Rutas aplica 62,5% (150m).",
                 key="s3_max_cerc",
             )
-        with sc3:
             max_est_lej = st.number_input(
-                "Estadía máx. Lejana (min):",
-                min_value=60,
+                "Techo máx. Directo Lejana (min):",
+                min_value=180,
                 max_value=960,
                 value=360,
                 step=30,
-                help="Excluye relojes abiertos en tiendas Lejana >100 km (default: 360 min = 6h).",
+                help="Compartido Lejana aplica 300m y Rutas Lejana aplica 240m.",
                 key="s3_max_lej",
             )
         with sc4:
@@ -2497,16 +2524,62 @@ with tab3:
             excl_solape_s3 = st.checkbox(
                 "Excluir solapamiento horario",
                 value=True,
-                help="Descarta paradas cuya hora de entrada ocurre antes de haber salido de la parada anterior.",
+                help="Descarta paradas cuya hora de entrada ocurre antes de salir de la parada anterior.",
                 key="s3_excl_solape",
             )
+            bigotes_tukey_s3 = st.checkbox(
+                "Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)",
+                value=True,
+                help="Evita que 1 caso extremo estire la línea del bigote hasta el techo; desmarcalo para ver Mín–Máx completo.",
+                key="s3_tukey",
+            )
 
-    # Construccion de la Base Limpia de Estadias en Tienda
+    # Construccion de la Base Limpia de Estadias en Tienda con 4 reglas de integridad
     st_all_vis = dq_stores_filt[dq_stores_filt["visita_efectiva"]].copy()
-    is_lej_s3 = st_all_vis["Categoria"] == "Lejana"
-    max_est_vec_s3 = np.where(is_lej_s3, max_est_lej, max_est_cerc)
 
-    r_corta_s3 = st_all_vis["Tiempo de Estadia"].isna() | (st_all_vis["Tiempo de Estadia"] < min_est_tienda)
+    # 1. Piso minimo diferenciado por Tipo de Viaje
+    min_est_vec_s3 = np.select(
+        [
+            st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)",
+            st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)",
+        ],
+        [float(min_est_directo), float(min_est_comp)],
+        default=float(min_est_rutas),
+    )
+
+    # 2. Techo maximo diferenciado por Tipo de Viaje y Categoria (evita relojes abiertos en rutas chicas)
+    is_lej_s3 = st_all_vis["Categoria"] == "Lejana"
+    max_est_vec_s3 = np.select(
+        [
+            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & is_lej_s3,
+            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & is_lej_s3,
+            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & is_lej_s3,
+        ],
+        [
+            float(max_est_cerc),
+            float(max_est_lej),
+            round(float(max_est_cerc) * 0.75, 0),
+            round(float(max_est_lej) * 0.8333, 0),
+            round(float(max_est_cerc) * 0.625, 0),
+            round(float(max_est_lej) * 0.6667, 0),
+        ],
+        default=float(max_est_cerc),
+    )
+
+    # 3. Consistencia fisica Bultos vs Tiempo (descarga imposible / fuera de geozona)
+    bultos_s3 = st_all_vis["Total Bultos_num"].fillna(0)
+    min_100b_raw = np.where(
+        bultos_s3 > 0,
+        st_all_vis["Tiempo de Estadia"] / (bultos_s3 / 100.0),
+        np.nan,
+    )
+    r_phys_s3 = (bultos_s3 >= 50) & (min_100b_raw < float(min_min100b_phys))
+
+    # 4. Piso, Techo y Solape Horario
+    r_corta_s3 = st_all_vis["Tiempo de Estadia"].isna() | (st_all_vis["Tiempo de Estadia"] < min_est_vec_s3)
     r_larga_s3 = st_all_vis["Tiempo de Estadia"] > max_est_vec_s3
     r_solape_s3 = (
         (
@@ -2518,7 +2591,7 @@ with tab3:
         else pd.Series(False, index=st_all_vis.index)
     )
 
-    st_clean_s3 = st_all_vis[(~r_corta_s3) & (~r_larga_s3) & (~r_solape_s3)].copy()
+    st_clean_s3 = st_all_vis[(~r_corta_s3) & (~r_larga_s3) & (~r_phys_s3) & (~r_solape_s3)].copy()
 
     # Etiquetas de orden de parada en ruta
     st_clean_s3["Orden_Parada_Grupo"] = np.select(
@@ -2554,15 +2627,15 @@ with tab3:
     # Sensor de puerta trasera (pre-conectado para cuando UNIGIS active el dato)
     puerta_activa_cnt = int((st_clean_s3["Minutos Apertura y Cierre_num"].fillna(0) > 0).sum())
 
-    k3_1, k3_2, k3_3, k3_4 = st.columns([1.15, 1.25, 1.25, 1.25])
+    k3_1, k3_2, k3_3, k3_4 = st.columns([1.25, 1.20, 1.20, 1.15])
     with k3_1:
         st.markdown(
             _kpi_card_html(
                 "Base Limpia Estadías",
                 _fmt_int(ok_vis_s3),
-                f"{_fmt_pct(pct_ret_s3)} de {_fmt_int(tot_vis_s3)} visitas OK",
+                f"{_fmt_pct(pct_ret_s3)} de {_fmt_int(tot_vis_s3)} visitas OK ({_fmt_int(excl_vis_s3)} excl.)",
                 "#16a34a" if pct_ret_s3 >= 90 else "#d97706",
-                f"Excluidas: <b>{int(r_corta_s3.sum())}</b> <{min_est_tienda}m | <b>{int(r_larga_s3.sum())}</b> >máx | <b>{int(r_solape_s3.sum())}</b> solape",
+                f"Piso: <b>{int(r_corta_s3.sum())}</b> | Físico bultos: <b>{int(r_phys_s3.sum())}</b> | Techo: <b>{int(r_larga_s3.sum())}</b> | Solape: <b>{int(r_solape_s3.sum())}</b>",
             ),
             unsafe_allow_html=True,
         )
@@ -2690,37 +2763,88 @@ with tab3:
         fig_box = go.Figure()
         palette_box = ["#1d4ed8", "#d97706", "#16a34a", "#7c3aed", "#dc2626", "#0891b2", "#475569"]
 
+        def _tukey_bounds(s: pd.Series):
+            q1, q3 = np.percentile(s, [25, 75])
+            iqr = q3 - q1
+            lo = max(float(s.min()), float(q1 - 1.5 * iqr))
+            hi = min(float(s.max()), float(q3 + 1.5 * iqr))
+            return lo, hi
+
         if sub_col is None:
             for idx_c, cat_val in enumerate(cat_order):
-                vals = df_plot_s3[df_plot_s3[dim_col] == cat_val]["Tiempo de Estadia"]
-                fig_box.add_trace(
-                    go.Box(
-                        y=vals,
-                        name=f"{cat_val} (n={len(vals):,})",
-                        boxmean=True,
-                        boxpoints=False,
-                        marker_color=palette_box[idx_c % len(palette_box)],
-                        hovertemplate=(
-                            f"<b>{cat_val}</b><br>"
-                            "Estadía: %{y:.0f} min<extra></extra>"
-                        ),
+                vals = df_plot_s3[df_plot_s3[dim_col] == cat_val]["Tiempo de Estadia"].dropna()
+                if len(vals) == 0:
+                    continue
+                if bigotes_tukey_s3:
+                    lo_w, hi_w = _tukey_bounds(vals)
+                    q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
+                    fig_box.add_trace(
+                        go.Box(
+                            x=[f"{cat_val} (n={len(vals):,})"],
+                            lowerfence=[lo_w],
+                            q1=[q1_v],
+                            median=[med_v],
+                            q3=[q3_v],
+                            upperfence=[hi_w],
+                            mean=[float(vals.mean())],
+                            name=f"{cat_val} (n={len(vals):,})",
+                            marker_color=palette_box[idx_c % len(palette_box)],
+                        )
                     )
-                )
+                else:
+                    fig_box.add_trace(
+                        go.Box(
+                            y=vals,
+                            name=f"{cat_val} (n={len(vals):,})",
+                            boxmean=True,
+                            boxpoints=False,
+                            marker_color=palette_box[idx_c % len(palette_box)],
+                        )
+                    )
         else:
             df_plot_s3[sub_col] = df_plot_s3[sub_col].fillna("Sin dato").astype(str)
             sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
             for idx_s, sv in enumerate(sub_vals):
                 sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
-                fig_box.add_trace(
-                    go.Box(
-                        x=sub_df[dim_col],
-                        y=sub_df["Tiempo de Estadia"],
-                        name=sv,
-                        boxmean=True,
-                        boxpoints=False,
-                        marker_color=palette_box[idx_s % len(palette_box)],
+                if bigotes_tukey_s3:
+                    x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
+                    for cv in cat_order:
+                        v_sub = sub_df[sub_df[dim_col] == cv]["Tiempo de Estadia"].dropna()
+                        if len(v_sub) == 0:
+                            continue
+                        lo_w, hi_w = _tukey_bounds(v_sub)
+                        q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
+                        x_cats.append(cv)
+                        lf_l.append(lo_w)
+                        q1_l.append(q1_v)
+                        med_l.append(med_v)
+                        q3_l.append(q3_v)
+                        uf_l.append(hi_w)
+                        mean_l.append(float(v_sub.mean()))
+                    fig_box.add_trace(
+                        go.Box(
+                            x=x_cats,
+                            lowerfence=lf_l,
+                            q1=q1_l,
+                            median=med_l,
+                            q3=q3_l,
+                            upperfence=uf_l,
+                            mean=mean_l,
+                            name=sv,
+                            marker_color=palette_box[idx_s % len(palette_box)],
+                        )
                     )
-                )
+                else:
+                    fig_box.add_trace(
+                        go.Box(
+                            x=sub_df[dim_col],
+                            y=sub_df["Tiempo de Estadia"],
+                            name=sv,
+                            boxmean=True,
+                            boxpoints=False,
+                            marker_color=palette_box[idx_s % len(palette_box)],
+                        )
+                    )
             fig_box.update_layout(boxmode="group", xaxis=dict(categoryorder="array", categoryarray=cat_order))
 
         fig_box.update_layout(
