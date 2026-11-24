@@ -2304,6 +2304,8 @@ with tab2:
     )
 
     # 3E. Auditoria de Paradas en CD Origen (1a fila CD - Carga)
+    # Si el camion tuvo GPS en tiendas (Tiendas_OK_Viaje > 0) pero no marco estadia en CD,
+    # significa que ya habia cruzado el limite de la zona del CD al llegar la activacion.
     cd_audit_df = dq_trips_filt.copy()
     cd_audit_df["Causa_CD"] = np.select(
         [
@@ -2316,11 +2318,11 @@ with tab2:
         ],
         [
             "Con Estadía CD (OK)",
-            "Viaje Ciego (0% GPS)",
-            "Activación Tarde (>5 km)",
-            "Salió antes del CD (0,5-5 km)",
+            "Viaje Ciego (0% GPS en todo el viaje)",
+            "Activación Tarde (>5 km — etiq. UNIGIS)",
+            "Activación Tarde (0,5 a 5 km del CD)",
         ],
-        default="Geozona CD / En predio (<=0,5 km)",
+        default="Activación Tarde (<=0,5 km — fuera de barrera)",
     )
 
     cd_sin_dato_df = cd_audit_df[~cd_audit_df["CD_Origen_OK"]].copy()
@@ -2510,19 +2512,21 @@ with tab2:
     with gtab3:
         st.caption(
             "Auditoría de captura GPS en la salida del depósito (1ª fila `CD - Carga`). "
-            "Explica por qué algunos viajes tienen visitas en tiendas pero no registran estadía de carga en el CD."
+            "Cuando la interfaz batch activa el viaje después de que el camión cruzó el límite de la geozona del CD (incluso a 100 m del centroide), "
+            "UNIGIS no puede registrar la estadía de carga."
         )
         tot_cd_v = len(cd_audit_df)
         ok_cd_v = int(cd_audit_df["CD_Origen_OK"].sum())
         sin_cd_v = tot_cd_v - ok_cd_v
         pct_cd_ok_v = (ok_cd_v / tot_cd_v * 100) if tot_cd_v > 0 else 0.0
 
-        c_cd_ciego = int((cd_audit_df["Causa_CD"] == "Viaje Ciego (0% GPS)").sum())
-        c_cd_act5 = int((cd_audit_df["Causa_CD"] == "Activación Tarde (>5 km)").sum())
-        c_cd_salio = int((cd_audit_df["Causa_CD"] == "Salió antes del CD (0,5-5 km)").sum())
-        c_cd_predio = int((cd_audit_df["Causa_CD"] == "Geozona CD / En predio (<=0,5 km)").sum())
+        c_cd_ciego = int((cd_audit_df["Causa_CD"] == "Viaje Ciego (0% GPS en todo el viaje)").sum())
+        c_cd_act5 = int((cd_audit_df["Causa_CD"] == "Activación Tarde (>5 km — etiq. UNIGIS)").sum())
+        c_cd_act05 = int((cd_audit_df["Causa_CD"] == "Activación Tarde (0,5 a 5 km del CD)").sum())
+        c_cd_act_cerca = int((cd_audit_df["Causa_CD"] == "Activación Tarde (<=0,5 km — fuera de barrera)").sum())
+        c_cd_act_tot = c_cd_act5 + c_cd_act05 + c_cd_act_cerca
 
-        ck1, ck2, ck3, ck4 = st.columns(4)
+        ck1, ck2, ck3 = st.columns([1.0, 1.65, 1.05])
         with ck1:
             st.markdown(
                 _kpi_card_html(
@@ -2530,40 +2534,29 @@ with tab2:
                     _fmt_int(ok_cd_v),
                     f"{_fmt_pct(pct_cd_ok_v)} de {_fmt_int(tot_cd_v)} viajes",
                     "#16a34a",
-                    "Activación dentro del predio",
+                    "Activado dentro de la geozona del CD",
                 ),
                 unsafe_allow_html=True,
             )
         with ck2:
             st.markdown(
                 _kpi_card_html(
-                    "Sin Dato por Activ. Tarde (>5 km)",
-                    _fmt_int(c_cd_act5),
-                    f"{_fmt_pct((c_cd_act5 / tot_cd_v * 100) if tot_cd_v else 0)} de viajes",
+                    "Sin Dato por Activación Tarde (Salió del CD)",
+                    _fmt_int(c_cd_act_tot),
+                    f"{_fmt_pct((c_cd_act_tot / tot_cd_v * 100) if tot_cd_v else 0)} (GPS OK en tiendas, pero activado fuera del CD):",
                     "#d97706",
-                    "Interfaz llegó con camión en ruta",
+                    f"• <b>{_fmt_int(c_cd_act_cerca)}</b> <=0,5 km | <b>{_fmt_int(c_cd_act05)}</b> 0,5-5 km | <b>{_fmt_int(c_cd_act5)}</b> >5 km",
                 ),
                 unsafe_allow_html=True,
             )
         with ck3:
             st.markdown(
                 _kpi_card_html(
-                    "Salió Antes del CD (0,5 a 5 km)",
-                    _fmt_int(c_cd_salio),
-                    f"{_fmt_pct((c_cd_salio / tot_cd_v * 100) if tot_cd_v else 0)} de viajes",
-                    "#2563eb",
-                    "Fuera de barrera al activar (<5 km)",
-                ),
-                unsafe_allow_html=True,
-            )
-        with ck4:
-            st.markdown(
-                _kpi_card_html(
-                    "Geozona CD / Viaje Ciego",
-                    _fmt_int(c_cd_predio + c_cd_ciego),
-                    f"{_fmt_int(c_cd_predio)} en predio (<=0,5 km) | {_fmt_int(c_cd_ciego)} ciegos",
+                    "Viaje Ciego (0% GPS)",
+                    _fmt_int(c_cd_ciego),
+                    f"{_fmt_pct((c_cd_ciego / tot_cd_v * 100) if tot_cd_v else 0)} sin señal GPS",
                     "#dc2626",
-                    "Revisar polígono CD o GPS unidad",
+                    "Sin registro en CD ni en tiendas",
                 ),
                 unsafe_allow_html=True,
             )
@@ -2574,16 +2567,19 @@ with tab2:
             vt = len(grp_c)
             vok = int(grp_c["CD_Origen_OK"].sum())
             vsin = vt - vok
+            v_act_cerca = int((grp_c["Causa_CD"] == "Activación Tarde (<=0,5 km — fuera de barrera)").sum())
+            v_act_05 = int((grp_c["Causa_CD"] == "Activación Tarde (0,5 a 5 km del CD)").sum())
+            v_act_5 = int((grp_c["Causa_CD"] == "Activación Tarde (>5 km — etiq. UNIGIS)").sum())
             rows_cd_orig_op.append(
                 {
                     "CD": str(int(op_c)),
                     "Viajes TMS": vt,
                     "Con Estadía CD": vok,
                     "Sin Dato CD": vsin,
-                    "Viaje Ciego": int((grp_c["Causa_CD"] == "Viaje Ciego (0% GPS)").sum()),
-                    "Activ. Tarde (>5 km)": int((grp_c["Causa_CD"] == "Activación Tarde (>5 km)").sum()),
-                    "Salió Antes (0,5-5 km)": int((grp_c["Causa_CD"] == "Salió antes del CD (0,5-5 km)").sum()),
-                    "En Predio (<=0,5 km)": int((grp_c["Causa_CD"] == "Geozona CD / En predio (<=0,5 km)").sum()),
+                    "Act. Tarde (<=0,5 km)": v_act_cerca,
+                    "Act. Tarde (0,5-5 km)": v_act_05,
+                    "Act. Tarde (>5 km)": v_act_5,
+                    "Viaje Ciego": int((grp_c["Causa_CD"] == "Viaje Ciego (0% GPS en todo el viaje)").sum()),
                     "% Captura CD": round((vok / vt * 100) if vt > 0 else 0.0, 1),
                 }
             )
@@ -2596,10 +2592,10 @@ with tab2:
                         "Viajes TMS": df_cd_orig_op["Viajes TMS"].sum(),
                         "Con Estadía CD": df_cd_orig_op["Con Estadía CD"].sum(),
                         "Sin Dato CD": df_cd_orig_op["Sin Dato CD"].sum(),
+                        "Act. Tarde (<=0,5 km)": df_cd_orig_op["Act. Tarde (<=0,5 km)"].sum(),
+                        "Act. Tarde (0,5-5 km)": df_cd_orig_op["Act. Tarde (0,5-5 km)"].sum(),
+                        "Act. Tarde (>5 km)": df_cd_orig_op["Act. Tarde (>5 km)"].sum(),
                         "Viaje Ciego": df_cd_orig_op["Viaje Ciego"].sum(),
-                        "Activ. Tarde (>5 km)": df_cd_orig_op["Activ. Tarde (>5 km)"].sum(),
-                        "Salió Antes (0,5-5 km)": df_cd_orig_op["Salió Antes (0,5-5 km)"].sum(),
-                        "En Predio (<=0,5 km)": df_cd_orig_op["En Predio (<=0,5 km)"].sum(),
                         "% Captura CD": round(pct_cd_ok_v, 1),
                     }
                 ]
@@ -2625,10 +2621,10 @@ with tab2:
                 "Filtrar por causa:",
                 options=[
                     "Todas",
-                    "Activación Tarde (>5 km)",
-                    "Salió antes del CD (0,5-5 km)",
-                    "Geozona CD / En predio (<=0,5 km)",
-                    "Viaje Ciego (0% GPS)",
+                    "Activación Tarde (<=0,5 km — fuera de barrera)",
+                    "Activación Tarde (0,5 a 5 km del CD)",
+                    "Activación Tarde (>5 km — etiq. UNIGIS)",
+                    "Viaje Ciego (0% GPS en todo el viaje)",
                 ],
                 index=0,
                 key="s2_causa_cd_sel",
