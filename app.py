@@ -3380,8 +3380,16 @@ with tab3:
 with tab4:
     st.subheader("Velocidades Camiones (Tramos y Tránsitos)")
     st.caption(
-        "Muestra independiente sobre tramos válidos, abierta por Operación (CD) y Tipo de Vehículo (Nómina). "
+        "Muestra independiente sobre tramos válidos, abierta por Operación (CD), Tipo de Vehículo (Nómina) y Categoría (Cercana vs. Lejana). "
         "Separa `Salida de Depósito (CD -> 1ª Tienda)`, `Entre Paradas (Tienda -> Tienda)` y `Retorno a Depósito (Última Tienda -> CD)`."
+    )
+
+    cat_v_sel = st.radio(
+        "Filtrar Categoría de Viaje (actualiza tarjetas y matrices):",
+        options=["Todas", "Cercana", "Lejana"],
+        index=0,
+        horizontal=True,
+        key="s4_cat_radio",
     )
 
     with st.expander("🎛️ Parámetros de Depuración de Tramos y Velocidades (Ajustables)", expanded=False):
@@ -3416,12 +3424,12 @@ with tab4:
                 key="s4_min_dist",
             )
             max_ret_cerc_v = st.number_input(
-                "Retorno máx. Cercana (min):",
+                "Tiempo retorno máx. Cercana (min):",
                 min_value=120,
                 max_value=720,
                 value=360,
                 step=60,
-                help="Filtra retornos abiertos para el cálculo de Velocidad Depósito Llegada (Lejana aplica el doble).",
+                help="Tope máximo de Tiempo Retorno en viajes Cercana (default 360 min = 6h). En Lejana se aplica automáticamente el doble (720 min = 12h) para filtrar viajes mal cerrados.",
                 key="s4_max_ret",
             )
         with vc3:
@@ -3480,12 +3488,14 @@ with tab4:
     else:
         r_salto_v = pd.Series(False, index=tr_st.index)
 
-    tr_clean = tr_st[(~r_dist_v) & (~r_time_v) & (~r_vel_v) & (~r_solape_v) & (~r_salto_v)].copy()
-    tr_clean["Vel_Calculada"] = (
-        tr_clean["KMS Parada_num"] / (tr_clean["Tiempo en Viaje"] / 60.0)
+    tr_clean_all = tr_st[(~r_dist_v) & (~r_time_v) & (~r_vel_v) & (~r_solape_v) & (~r_salto_v)].copy()
+    tr_clean_all["Vel_Calculada"] = (
+        tr_clean_all["KMS Parada_num"] / (tr_clean_all["Tiempo en Viaje"] / 60.0)
     ).round(1)
 
     # 2. Limpieza de Retornos (Última Tienda -> CD) para Velocidad Depósito Llegada
+    # UNIGIS entrega KMS Retorno y Tiempo Retorno; se excluyen viajes con 'Error en finalizacion'
+    # y retornos con reloj abierto (>360 min Cercana / >720 min Lejana).
     max_ret_vec_v = np.where(dq_trips_filt["Categoria"] == "Lejana", max_ret_cerc_v * 2, max_ret_cerc_v)
     tr_ret = dq_trips_filt[
         (~dq_trips_filt["obs_err_fin"])
@@ -3494,12 +3504,21 @@ with tab4:
         & (dq_trips_filt["Tiempo_Retorno"].fillna(0) <= max_ret_vec_v)
     ].copy()
     tr_ret["Vel_Retorno"] = (tr_ret["KMS_Retorno"] / (tr_ret["Tiempo_Retorno"] / 60.0)).round(1)
-    tr_ret_clean = tr_ret[
+    tr_ret_clean_all = tr_ret[
         (tr_ret["Vel_Retorno"] >= float(min_vel_v)) & (tr_ret["Vel_Retorno"] <= float(max_vel_v))
     ].copy()
 
+    # Aplicar filtro de Categoria elegido (Todas / Cercana / Lejana)
+    if cat_v_sel != "Todas":
+        tr_clean = tr_clean_all[tr_clean_all["Categoria"] == cat_v_sel].copy()
+        tr_ret_clean = tr_ret_clean_all[tr_ret_clean_all["Categoria"] == cat_v_sel].copy()
+        tot_tr_raw = int((tr_st["Categoria"] == cat_v_sel).sum())
+    else:
+        tr_clean = tr_clean_all.copy()
+        tr_ret_clean = tr_ret_clean_all.copy()
+        tot_tr_raw = len(tr_st)
+
     # KPIs de Velocidades
-    tot_tr_raw = len(tr_st)
     ok_tr_v = len(tr_clean)
     pct_ret_v = (ok_tr_v / tot_tr_raw * 100) if tot_tr_raw > 0 else 0.0
 
@@ -3543,7 +3562,7 @@ with tab4:
                 f"{med_lleg_cd:.1f} km/h",
                 f"Mediana en {_fmt_int(len(lleg_cd_s))} retornos limpios",
                 "#0f172a",
-                "Camión descargado (Última Tienda->CD)",
+                "Calculado: KMS Retorno / Tiempo Retorno",
             ),
             unsafe_allow_html=True,
         )
@@ -3564,7 +3583,31 @@ with tab4:
     # -------------------------------------------------------------------------
     # BLOQUE 1: MATRICES POR OPERACION (CD) Y TIPO DE VEHICULO (NOMINA)
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Velocidades por Operación (CD) y Tipo de Vehículo (Nómina)")
+    st.markdown(f"### 1. Velocidades por Operación (CD) y Tipo de Vehículo — Categoría: `{cat_v_sel}`")
+
+    # Tabla comparativa rapida Cercana vs Lejana
+    cat_comp_rows = []
+    for c_name in ["Cercana", "Lejana"]:
+        sub_c = tr_clean_all[tr_clean_all["Categoria"] == c_name]
+        sub_r = tr_ret_clean_all[tr_ret_clean_all["Categoria"] == c_name]
+        if sub_c.empty and sub_r.empty:
+            continue
+        s_sal = sub_c[sub_c["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]["Vel_Calculada"]
+        s_ent = sub_c[sub_c["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]["Vel_Calculada"]
+        s_lleg = sub_r["Vel_Retorno"]
+        cat_comp_rows.append(
+            {
+                "Categoría": c_name,
+                "Vel. Entre Paradas (km/h)": round(float(s_ent.median()), 1) if len(s_ent) > 0 else None,
+                "Vel. Depósito Salida (km/h)": round(float(s_sal.median()), 1) if len(s_sal) > 0 else None,
+                "Vel. Depósito Llegada (km/h)": round(float(s_lleg.median()), 1) if len(s_lleg) > 0 else None,
+                "Vel. Máxima P95 (km/h)": round(float(np.percentile(sub_c["Vel_Calculada"], 95)), 0) if len(sub_c) > 0 else None,
+                "Tramos Limpios": int(len(sub_c)),
+                "Retornos Limpios": int(len(sub_r)),
+            }
+        )
+    if cat_comp_rows:
+        st.dataframe(pd.DataFrame(cat_comp_rows), use_container_width=True, hide_index=True)
 
     def _build_vel_matrix(df_src: pd.DataFrame, val_col: str, agg_fn="median", p_val: int = 95) -> pd.DataFrame:
         if df_src.empty:
