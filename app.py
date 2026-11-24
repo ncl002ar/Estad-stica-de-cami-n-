@@ -975,8 +975,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
         "📊 1. Conciliación Macro (WMS vs. TMS)",
         "📍 2. Visitas GPS y Geocercas",
         "🏪 3. Estadías y Productividad en Tienda",
-        "🛣️ 4. Velocidades (Parametrización UNIGIS)",
-        "🚛 5. Internos, CD Origen y Jornada Diaria",
+        "🛣️ 4. Velocidades Camiones",
+        "🚛 5. Viajes y Jornadas",
     ]
 )
 
