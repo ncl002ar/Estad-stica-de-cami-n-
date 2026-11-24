@@ -725,13 +725,15 @@ def build_audit_excel(df_gap, df_solo_tms, df_store_diff, df_dup, df_inv) -> byt
     return output.getvalue()
 
 
-def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails) -> bytes:
+def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails, df_cd_sin_dato=None) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_geo.to_excel(writer, sheet_name="1_Tiendas_Geocerca", index=False)
         df_fleet.to_excel(writer, sheet_name="2_Unidades_Viajes_Ciegos", index=False)
         df_sin_coord.to_excel(writer, sheet_name="3_Tiendas_Sin_Coordenadas", index=False)
         df_raw_fails.to_excel(writer, sheet_name="4_Detalle_Paradas_Sin_GPS", index=False)
+        if df_cd_sin_dato is not None:
+            df_cd_sin_dato.to_excel(writer, sheet_name="5_CD_Origen_Sin_Dato", index=False)
     return output.getvalue()
 
 
@@ -2301,11 +2303,75 @@ with tab2:
         }
     )
 
+    # 3E. Auditoria de Paradas en CD Origen (1a fila CD - Carga)
+    cd_audit_df = dq_trips_filt.copy()
+    cd_audit_df["Causa_CD"] = np.select(
+        [
+            cd_audit_df["CD_Origen_OK"],
+            cd_audit_df["Tiendas_OK_Viaje"] == 0,
+            (cd_audit_df["Tiendas_OK_Viaje"] > 0) & cd_audit_df["obs_act_tarde"],
+            (cd_audit_df["Tiendas_OK_Viaje"] > 0)
+            & (~cd_audit_df["obs_act_tarde"])
+            & (cd_audit_df["Dist_Activacion_km"].fillna(0) > 0.5),
+        ],
+        [
+            "Con Estadía CD (OK)",
+            "Viaje Ciego (0% GPS)",
+            "Activación Tarde (>5 km)",
+            "Salió antes del CD (0,5-5 km)",
+        ],
+        default="Geozona CD / En predio (<=0,5 km)",
+    )
+
+    cd_sin_dato_df = cd_audit_df[~cd_audit_df["CD_Origen_OK"]].copy()
+    cd_sin_dato_export = cd_sin_dato_df[
+        [
+            "Operacion",
+            "Fecha_Reparto",
+            "Hora_Reparto",
+            "Ref_Clean",
+            "Id Viaje",
+            "Dominio",
+            "Tipo_Vehiculo",
+            "Dist_Activacion_km",
+            "Tiendas_OK_Viaje",
+            "Tiendas_Plan_Viaje",
+            "Causa_CD",
+        ]
+    ].copy().sort_values(["Operacion", "Fecha_Reparto", "Ref_Clean"])
+    cd_sin_dato_export["Fecha Reparto"] = cd_sin_dato_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    cd_sin_dato_export["Dist. Activación (km)"] = cd_sin_dato_export["Dist_Activacion_km"].round(2)
+    cd_sin_dato_export = cd_sin_dato_export[
+        [
+            "Operacion",
+            "Fecha Reparto",
+            "Hora_Reparto",
+            "Ref_Clean",
+            "Id Viaje",
+            "Dominio",
+            "Tipo_Vehiculo",
+            "Dist. Activación (km)",
+            "Tiendas_OK_Viaje",
+            "Tiendas_Plan_Viaje",
+            "Causa_CD",
+        ]
+    ].rename(
+        columns={
+            "Operacion": "CD",
+            "Hora_Reparto": "Hora Reparto",
+            "Ref_Clean": "Ref Externa Viaje",
+            "Tipo_Vehiculo": "Tipo Vehículo",
+            "Tiendas_OK_Viaje": "Tiendas OK",
+            "Tiendas_Plan_Viaje": "Tiendas Plan.",
+            "Causa_CD": "Causa Sin Dato CD",
+        }
+    )
+
     gps_excel_bytes = build_gps_audit_excel(
-        st_rank_all, dom_rank_all, sin_coord_tbl, raw_fails_export
+        st_rank_all, dom_rank_all, sin_coord_tbl, raw_fails_export, cd_sin_dato_export
     )
     st.download_button(
-        label="📥 Descargar Auditoría GPS y Geocercas en Excel (.xlsx)",
+        label="📥 Descargar Auditoría GPS, Geocercas y CD Origen en Excel (.xlsx)",
         data=gps_excel_bytes,
         file_name="Auditoria_GPS_y_Geocercas.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -2314,10 +2380,11 @@ with tab2:
     cant_geo_rec_pairs = int((st_rank_all["Falla Geozona (Activ. OK)"] >= 2).sum())
     cant_dom_ciegos = int((dom_rank_all["Viajes Ciegos"] > 0).sum())
 
-    gtab1, gtab2, gtab3 = st.tabs(
+    gtab1, gtab2, gtab3, gtab4 = st.tabs(
         [
             f"🗺️ Tiendas a Revisar Geozona ({cant_geo_rec_pairs} recurrentes)",
             f"📡 Unidades Sin Señal GPS ({cant_dom_ciegos})",
+            f"🏭 Paradas en CD Origen ({len(cd_sin_dato_df):,} sin dato)",
             f"📌 Sin Coordenadas ({len(sin_coord_tbl)}) e Interfaz TMS",
         ]
     )
@@ -2441,6 +2508,139 @@ with tab2:
         )
 
     with gtab3:
+        st.caption(
+            "Auditoría de captura GPS en la salida del depósito (1ª fila `CD - Carga`). "
+            "Explica por qué algunos viajes tienen visitas en tiendas pero no registran estadía de carga en el CD."
+        )
+        tot_cd_v = len(cd_audit_df)
+        ok_cd_v = int(cd_audit_df["CD_Origen_OK"].sum())
+        sin_cd_v = tot_cd_v - ok_cd_v
+        pct_cd_ok_v = (ok_cd_v / tot_cd_v * 100) if tot_cd_v > 0 else 0.0
+
+        c_cd_ciego = int((cd_audit_df["Causa_CD"] == "Viaje Ciego (0% GPS)").sum())
+        c_cd_act5 = int((cd_audit_df["Causa_CD"] == "Activación Tarde (>5 km)").sum())
+        c_cd_salio = int((cd_audit_df["Causa_CD"] == "Salió antes del CD (0,5-5 km)").sum())
+        c_cd_predio = int((cd_audit_df["Causa_CD"] == "Geozona CD / En predio (<=0,5 km)").sum())
+
+        ck1, ck2, ck3, ck4 = st.columns(4)
+        with ck1:
+            st.markdown(
+                _kpi_card_html(
+                    "Con Estadía en CD (OK)",
+                    _fmt_int(ok_cd_v),
+                    f"{_fmt_pct(pct_cd_ok_v)} de {_fmt_int(tot_cd_v)} viajes",
+                    "#16a34a",
+                    "Activación dentro del predio",
+                ),
+                unsafe_allow_html=True,
+            )
+        with ck2:
+            st.markdown(
+                _kpi_card_html(
+                    "Sin Dato por Activ. Tarde (>5 km)",
+                    _fmt_int(c_cd_act5),
+                    f"{_fmt_pct((c_cd_act5 / tot_cd_v * 100) if tot_cd_v else 0)} de viajes",
+                    "#d97706",
+                    "Interfaz llegó con camión en ruta",
+                ),
+                unsafe_allow_html=True,
+            )
+        with ck3:
+            st.markdown(
+                _kpi_card_html(
+                    "Salió Antes del CD (0,5 a 5 km)",
+                    _fmt_int(c_cd_salio),
+                    f"{_fmt_pct((c_cd_salio / tot_cd_v * 100) if tot_cd_v else 0)} de viajes",
+                    "#2563eb",
+                    "Fuera de barrera al activar (<5 km)",
+                ),
+                unsafe_allow_html=True,
+            )
+        with ck4:
+            st.markdown(
+                _kpi_card_html(
+                    "Geozona CD / Viaje Ciego",
+                    _fmt_int(c_cd_predio + c_cd_ciego),
+                    f"{_fmt_int(c_cd_predio)} en predio (<=0,5 km) | {_fmt_int(c_cd_ciego)} ciegos",
+                    "#dc2626",
+                    "Revisar polígono CD o GPS unidad",
+                ),
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("**Resumen por Operación (CD Origen)**")
+        rows_cd_orig_op = []
+        for op_c, grp_c in cd_audit_df.groupby("Operacion"):
+            vt = len(grp_c)
+            vok = int(grp_c["CD_Origen_OK"].sum())
+            vsin = vt - vok
+            rows_cd_orig_op.append(
+                {
+                    "CD": str(int(op_c)),
+                    "Viajes TMS": vt,
+                    "Con Estadía CD": vok,
+                    "Sin Dato CD": vsin,
+                    "Viaje Ciego": int((grp_c["Causa_CD"] == "Viaje Ciego (0% GPS)").sum()),
+                    "Activ. Tarde (>5 km)": int((grp_c["Causa_CD"] == "Activación Tarde (>5 km)").sum()),
+                    "Salió Antes (0,5-5 km)": int((grp_c["Causa_CD"] == "Salió antes del CD (0,5-5 km)").sum()),
+                    "En Predio (<=0,5 km)": int((grp_c["Causa_CD"] == "Geozona CD / En predio (<=0,5 km)").sum()),
+                    "% Captura CD": round((vok / vt * 100) if vt > 0 else 0.0, 1),
+                }
+            )
+        df_cd_orig_op = pd.DataFrame(rows_cd_orig_op)
+        if not df_cd_orig_op.empty:
+            tot_cd_op = pd.DataFrame(
+                [
+                    {
+                        "CD": "TOTAL",
+                        "Viajes TMS": df_cd_orig_op["Viajes TMS"].sum(),
+                        "Con Estadía CD": df_cd_orig_op["Con Estadía CD"].sum(),
+                        "Sin Dato CD": df_cd_orig_op["Sin Dato CD"].sum(),
+                        "Viaje Ciego": df_cd_orig_op["Viaje Ciego"].sum(),
+                        "Activ. Tarde (>5 km)": df_cd_orig_op["Activ. Tarde (>5 km)"].sum(),
+                        "Salió Antes (0,5-5 km)": df_cd_orig_op["Salió Antes (0,5-5 km)"].sum(),
+                        "En Predio (<=0,5 km)": df_cd_orig_op["En Predio (<=0,5 km)"].sum(),
+                        "% Captura CD": round(pct_cd_ok_v, 1),
+                    }
+                ]
+            )
+            df_cd_orig_op_disp = pd.concat([df_cd_orig_op, tot_cd_op], ignore_index=True)
+            st.dataframe(
+                df_cd_orig_op_disp,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "% Captura CD": st.column_config.ProgressColumn(
+                        "% Captura CD",
+                        format="%.1f%%",
+                        min_value=0,
+                        max_value=100,
+                        width="medium",
+                    ),
+                },
+            )
+
+        with st.expander("📋 Ver detalle de viajes sin estadía en CD Origen", expanded=False):
+            causa_sel_cd = st.selectbox(
+                "Filtrar por causa:",
+                options=[
+                    "Todas",
+                    "Activación Tarde (>5 km)",
+                    "Salió antes del CD (0,5-5 km)",
+                    "Geozona CD / En predio (<=0,5 km)",
+                    "Viaje Ciego (0% GPS)",
+                ],
+                index=0,
+                key="s2_causa_cd_sel",
+            )
+            view_cd_det = (
+                cd_sin_dato_export
+                if causa_sel_cd == "Todas"
+                else cd_sin_dato_export[cd_sin_dato_export["Causa Sin Dato CD"] == causa_sel_cd]
+            )
+            st.dataframe(view_cd_det, use_container_width=True, hide_index=True)
+
+    with gtab4:
         st.markdown("**A. Tiendas Sin Coordenadas en Maestro UNIGIS**")
         st.dataframe(sin_coord_tbl, use_container_width=True, hide_index=True)
 
