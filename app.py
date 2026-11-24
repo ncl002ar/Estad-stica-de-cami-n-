@@ -622,7 +622,10 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
             Ref_Clean=("Ref_Clean", "first"),
             Transportista=("Transportista", "first"),
             Dominio=("Dominio", "first"),
+            Interno=("Interno", "first"),
             Tipo_Camion=("Tipo de Camion", "first"),
+            Tipo_Vehiculo=("Tipo_Vehiculo", "first"),
+            Satelital=("Satelital", "first"),
             Categoria=("Categoria", "first"),
             KMS_Total=("KMS Total Viaje_num", "first"),
             KMS_Retorno=("KMS Retorno_num", "first"),
@@ -739,6 +742,28 @@ def build_estadias_excel(df_seg, df_mat, df_rank, df_clean_st) -> bytes:
         df_mat.to_excel(writer, sheet_name="2_Matriz_CD_x_Vehiculo", index=False)
         df_rank.to_excel(writer, sheet_name="3_Ranking_Tiendas", index=False)
         df_clean_st.to_excel(writer, sheet_name="4_Base_Limpia_Estadias", index=False)
+    return output.getvalue()
+
+
+def build_velocidades_excel(df_vp, df_vs, df_vr, df_vmax, df_tramos_clean) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_vp.to_excel(writer, sheet_name="1_Vel_Entre_Paradas", index=False)
+        df_vs.to_excel(writer, sheet_name="2_Vel_Deposito_Salida", index=False)
+        df_vr.to_excel(writer, sheet_name="3_Vel_Deposito_Llegada", index=False)
+        df_vmax.to_excel(writer, sheet_name="4_Vel_Maxima_P95_P98", index=False)
+        df_tramos_clean.to_excel(writer, sheet_name="5_Base_Limpia_Tramos", index=False)
+    return output.getvalue()
+
+
+def build_viajes_jornadas_excel(df_v_res, df_j_res, df_v_clean, df_j_clean, df_j_excl) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df_v_res.to_excel(writer, sheet_name="1_Resumen_Viajes", index=False)
+        df_j_res.to_excel(writer, sheet_name="2_Resumen_Jornadas", index=False)
+        df_v_clean.to_excel(writer, sheet_name="3_Base_Limpia_Viajes_OK", index=False)
+        df_j_clean.to_excel(writer, sheet_name="4_Base_Limpia_Jornadas", index=False)
+        df_j_excl.to_excel(writer, sheet_name="5_Jornadas_Excluidas_Audit", index=False)
     return output.getvalue()
 
 
@@ -3110,19 +3135,796 @@ with tab3:
     )
 
 # =============================================================================
-# PLACEHOLDERS PARA SOLAPAS 4 Y 5
+# SOLAPA 4: VELOCIDADES CAMIONES
 # =============================================================================
 with tab4:
-    st.info(
-        "🚧 **Próximo paso (Solapa 4 — Velocidades y Parametrización UNIGIS):** "
-        "Cálculo de las 4 velocidades de UNIGIS (`Velocidad promedio entre paradas`, `Velocidad depósito salida`, "
-        "`Velocidad depósito llegada` y `Velocidad máxima`) abiertas por **Operación (CD)** y **Tipo de Vehículo (Nómina)**, "
-        "con su bloque de limpieza de tramos y diagramas de cajas."
+    st.subheader("Velocidades Camiones (Tramos y Tránsitos)")
+    st.caption(
+        "Muestra independiente sobre tramos válidos, abierta por Operación (CD) y Tipo de Vehículo (Nómina). "
+        "Separa `Salida de Depósito (CD -> 1ª Tienda)`, `Entre Paradas (Tienda -> Tienda)` y `Retorno a Depósito (Última Tienda -> CD)`."
     )
 
+    with st.expander("🎛️ Parámetros de Depuración de Tramos y Velocidades (Ajustables)", expanded=False):
+        vc1, vc2, vc3, vc4 = st.columns(4)
+        with vc1:
+            min_vel_v = st.number_input(
+                "Velocidad mínima válida (km/h):",
+                min_value=1.0,
+                max_value=20.0,
+                value=3.0,
+                step=1.0,
+                help="Descarta tramos congestionados o detenidos que distorsionan la velocidad de circulación.",
+                key="s4_min_vel",
+            )
+            max_vel_v = st.number_input(
+                "Velocidad máxima válida (km/h):",
+                min_value=60.0,
+                max_value=200.0,
+                value=120.0,
+                step=10.0,
+                help="Descarta saltos de coordenadas GPS irreales.",
+                key="s4_max_vel",
+            )
+        with vc2:
+            min_dist_v = st.number_input(
+                "Distancia mínima del tramo (km):",
+                min_value=0.1,
+                max_value=10.0,
+                value=0.5,
+                step=0.1,
+                help="Evita calcular velocidades en maniobras de <500 metros donde 1 minuto cambia mucho el cociente.",
+                key="s4_min_dist",
+            )
+            max_ret_cerc_v = st.number_input(
+                "Retorno máx. Cercana (min):",
+                min_value=120,
+                max_value=720,
+                value=360,
+                step=60,
+                help="Filtra retornos abiertos para el cálculo de Velocidad Depósito Llegada (Lejana aplica el doble).",
+                key="s4_max_ret",
+            )
+        with vc3:
+            st.write("")
+            excl_solape_v = st.checkbox(
+                "Excluir solapamiento horario",
+                value=True,
+                help="Descarta tramos cuya llegada ocurre antes de salir de la parada anterior.",
+                key="s4_excl_solape",
+            )
+            solo_consecutivos_v = st.checkbox(
+                "Solo tramos consecutivos (sin saltos)",
+                value=True,
+                help="Excluye el tramo si la parada anterior quedó 'No visitada' para no mezclar desvíos.",
+                key="s4_solo_consec",
+            )
+        with vc4:
+            st.write("")
+            tukey_v = st.checkbox(
+                "Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)",
+                value=True,
+                key="s4_tukey",
+            )
+
+    # 1. Limpieza de Tramos de Reparto (Salida CD + Entre Paradas)
+    tr_st = dq_stores_filt[dq_stores_filt["visita_efectiva"]].copy()
+    tr_st["Tramo_Tipo"] = np.where(
+        tr_st["Orden Visita Tienda"] == 1,
+        "Salida Depósito (CD -> 1ª Tienda)",
+        "Entre Paradas (Tienda -> Tienda)",
+    )
+
+    r_dist_v = tr_st["KMS Parada_num"].isna() | (tr_st["KMS Parada_num"] < float(min_dist_v))
+    r_time_v = tr_st["Tiempo en Viaje"].isna() | (tr_st["Tiempo en Viaje"] <= 0)
+    vel_calc_raw = np.where(
+        tr_st["Tiempo en Viaje"].fillna(0) > 0,
+        tr_st["KMS Parada_num"].fillna(0) / (tr_st["Tiempo en Viaje"].fillna(0) / 60.0),
+        0.0,
+    )
+    r_vel_v = (vel_calc_raw < float(min_vel_v)) | (vel_calc_raw > float(max_vel_v))
+    r_solape_v = (
+        (
+            tr_st["dt_ini_real"].notna()
+            & tr_st["prev_dt_fin_real"].notna()
+            & (tr_st["dt_ini_real"] < tr_st["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+        )
+        if excl_solape_v
+        else pd.Series(False, index=tr_st.index)
+    )
+
+    if solo_consecutivos_v:
+        all_st_ordered = dq_stores_filt.sort_values(["Id Viaje", "dt_ini_real"]).copy()
+        all_st_ordered["_prev_vis_ok"] = all_st_ordered.groupby("Id Viaje")["visita_efectiva"].shift(1)
+        prev_ok_aligned = all_st_ordered["_prev_vis_ok"].reindex(tr_st.index)
+        r_salto_v = (tr_st["Orden Visita Tienda"] > 1) & (prev_ok_aligned == False)
+    else:
+        r_salto_v = pd.Series(False, index=tr_st.index)
+
+    tr_clean = tr_st[(~r_dist_v) & (~r_time_v) & (~r_vel_v) & (~r_solape_v) & (~r_salto_v)].copy()
+    tr_clean["Vel_Calculada"] = (
+        tr_clean["KMS Parada_num"] / (tr_clean["Tiempo en Viaje"] / 60.0)
+    ).round(1)
+
+    # 2. Limpieza de Retornos (Última Tienda -> CD) para Velocidad Depósito Llegada
+    max_ret_vec_v = np.where(dq_trips_filt["Categoria"] == "Lejana", max_ret_cerc_v * 2, max_ret_cerc_v)
+    tr_ret = dq_trips_filt[
+        (~dq_trips_filt["obs_err_fin"])
+        & (dq_trips_filt["KMS_Retorno"].fillna(0) >= float(min_dist_v))
+        & (dq_trips_filt["Tiempo_Retorno"].fillna(0) > 0)
+        & (dq_trips_filt["Tiempo_Retorno"].fillna(0) <= max_ret_vec_v)
+    ].copy()
+    tr_ret["Vel_Retorno"] = (tr_ret["KMS_Retorno"] / (tr_ret["Tiempo_Retorno"] / 60.0)).round(1)
+    tr_ret_clean = tr_ret[
+        (tr_ret["Vel_Retorno"] >= float(min_vel_v)) & (tr_ret["Vel_Retorno"] <= float(max_vel_v))
+    ].copy()
+
+    # KPIs de Velocidades
+    tot_tr_raw = len(tr_st)
+    ok_tr_v = len(tr_clean)
+    pct_ret_v = (ok_tr_v / tot_tr_raw * 100) if tot_tr_raw > 0 else 0.0
+
+    sal_cd_s = tr_clean[tr_clean["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]["Vel_Calculada"]
+    ent_par_s = tr_clean[tr_clean["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]["Vel_Calculada"]
+    lleg_cd_s = tr_ret_clean["Vel_Retorno"]
+
+    med_sal_cd = float(sal_cd_s.median()) if len(sal_cd_s) > 0 else 0.0
+    med_ent_par = float(ent_par_s.median()) if len(ent_par_s) > 0 else 0.0
+    med_lleg_cd = float(lleg_cd_s.median()) if len(lleg_cd_s) > 0 else 0.0
+    p95_vel_flota = float(np.percentile(tr_clean["Vel_Calculada"], 95)) if ok_tr_v > 0 else 0.0
+    p98_vel_flota = float(np.percentile(tr_clean["Vel_Calculada"], 98)) if ok_tr_v > 0 else 0.0
+
+    kv1, kv2, kv3, kv4 = st.columns(4)
+    with kv1:
+        st.markdown(
+            _kpi_card_html(
+                "Velocidad Entre Paradas",
+                f"{med_ent_par:.1f} km/h",
+                f"Mediana en {_fmt_int(len(ent_par_s))} tramos Tienda->Tienda",
+                "#16a34a",
+                f"Base limpia: <b>{_fmt_int(ok_tr_v)}</b> tramos ({_fmt_pct(pct_ret_v)})",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kv2:
+        st.markdown(
+            _kpi_card_html(
+                "Velocidad Depósito Salida",
+                f"{med_sal_cd:.1f} km/h",
+                f"Mediana en {_fmt_int(len(sal_cd_s))} tramos CD->1ª Tienda",
+                "#1d4ed8",
+                "Camión cargado saliendo del CD",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kv3:
+        st.markdown(
+            _kpi_card_html(
+                "Velocidad Depósito Llegada",
+                f"{med_lleg_cd:.1f} km/h",
+                f"Mediana en {_fmt_int(len(lleg_cd_s))} retornos limpios",
+                "#0f172a",
+                "Camión descargado (Última Tienda->CD)",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kv4:
+        st.markdown(
+            _kpi_card_html(
+                "Velocidad Máxima (P95 / P98)",
+                f"{p95_vel_flota:.0f} km/h",
+                f"Percentil 98: {p98_vel_flota:.0f} km/h",
+                "#d97706",
+                "Referencia operativa para alarmas GPS",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 1: MATRICES POR OPERACION (CD) Y TIPO DE VEHICULO (NOMINA)
+    # -------------------------------------------------------------------------
+    st.markdown("### 1. Velocidades por Operación (CD) y Tipo de Vehículo (Nómina)")
+
+    def _build_vel_matrix(df_src: pd.DataFrame, val_col: str, agg_fn="median", p_val: int = 95) -> pd.DataFrame:
+        if df_src.empty:
+            return pd.DataFrame(columns=["Operación"])
+        d_tmp = df_src.copy()
+        d_tmp["CD_Str"] = "CD " + d_tmp["Operacion"].astype(str)
+        if agg_fn == "median":
+            piv_v = d_tmp.pivot_table(index="CD_Str", columns="Tipo_Vehiculo", values=val_col, aggfunc="median").round(1)
+        else:
+            piv_v = d_tmp.pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values=val_col,
+                aggfunc=lambda s: round(float(np.percentile(s.dropna(), p_val)), 1) if len(s.dropna()) > 0 else np.nan,
+            )
+        piv_n = d_tmp.pivot_table(index="CD_Str", columns="Tipo_Vehiculo", values=val_col, aggfunc="count").fillna(0).astype(int)
+
+        out_m = pd.DataFrame(index=piv_v.index)
+        for col_c in piv_v.columns:
+            out_m[col_c] = [
+                f"{piv_v.loc[r_i, col_c]:.1f} km/h (n={piv_n.loc[r_i, col_c]:,})".replace(",", ".")
+                if pd.notna(piv_v.loc[r_i, col_c]) and piv_n.loc[r_i, col_c] > 0
+                else "—"
+                for r_i in piv_v.index
+            ]
+        return out_m.reset_index().rename(columns={"CD_Str": "Operación"})
+
+    df_vp_src = tr_clean[tr_clean["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
+    df_vs_src = tr_clean[tr_clean["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
+
+    mat_vp = _build_vel_matrix(df_vp_src, "Vel_Calculada", "median")
+    mat_vs = _build_vel_matrix(df_vs_src, "Vel_Calculada", "median")
+    mat_vr = _build_vel_matrix(tr_ret_clean, "Vel_Retorno", "median")
+    mat_vmax = _build_vel_matrix(tr_clean, "Vel_Calculada", "percentile", p_val=95)
+
+    vtab1, vtab2, vtab3, vtab4 = st.tabs(
+        [
+            "🛣️ Velocidad Entre Paradas (Tienda -> Tienda)",
+            "🏭 Velocidad Depósito Salida (CD -> 1ª Tienda)",
+            "🔄 Velocidad Depósito Llegada (Última -> CD)",
+            "⚡ Velocidad Máxima (Percentil 95)",
+        ]
+    )
+
+    with vtab1:
+        st.caption("Mediana de velocidad real entre paradas consecutivas de entrega.")
+        st.dataframe(mat_vp, use_container_width=True, hide_index=True)
+
+    with vtab2:
+        st.caption("Mediana de velocidad real desde la salida del CD hasta la primera tienda (camión cargado).")
+        st.dataframe(mat_vs, use_container_width=True, hide_index=True)
+
+    with vtab3:
+        st.caption("Mediana de velocidad real desde la última tienda hasta el regreso al CD (camión descargado).")
+        st.dataframe(mat_vr, use_container_width=True, hide_index=True)
+
+    with vtab4:
+        st.caption("Percentil 95 de velocidad real observada por tipo de vehículo y operación.")
+        st.dataframe(mat_vmax, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 2: DIAGRAMAS DE CAJAS DE VELOCIDADES + DESCARGA EXCEL
+    # -------------------------------------------------------------------------
+    st.markdown("### 2. Distribución de Velocidades por Segmento (Diagrama de Cajas)")
+
+    vdim_map = {
+        "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+        "Operación (CD)": "Operacion",
+        "Categoría (Cercana vs. Lejana)": "Categoria",
+    }
+    vdim_lbl = st.selectbox(
+        "Agrupar eje principal por:",
+        options=list(vdim_map.keys()),
+        index=0,
+        key="s4_dim_box",
+    )
+    vdim_col = vdim_map[vdim_lbl]
+
+    if not tr_clean.empty:
+        df_vplot = tr_clean.copy()
+        if vdim_col == "Operacion":
+            df_vplot[vdim_col] = "CD " + df_vplot[vdim_col].astype(str)
+        else:
+            df_vplot[vdim_col] = df_vplot[vdim_col].fillna("Sin dato").astype(str)
+
+        v_cat_order = (
+            df_vplot.groupby(vdim_col)["Vel_Calculada"]
+            .median()
+            .sort_values(ascending=False)
+            .index.tolist()
+        )
+
+        fig_vbox = go.Figure()
+        tramo_colors = {
+            "Salida Depósito (CD -> 1ª Tienda)": "#1d4ed8",
+            "Entre Paradas (Tienda -> Tienda)": "#16a34a",
+        }
+
+        def _tukey_v(s: pd.Series):
+            q1, q3 = np.percentile(s, [25, 75])
+            iqr = q3 - q1
+            return max(float(s.min()), float(q1 - 1.5 * iqr)), min(float(s.max()), float(q3 + 1.5 * iqr))
+
+        for t_name, t_col_hex in tramo_colors.items():
+            sub_t = df_vplot[df_vplot["Tramo_Tipo"] == t_name]
+            if tukey_v:
+                xc, lf, q1l, medl, q3l, uf, mnl = [], [], [], [], [], [], []
+                for cv in v_cat_order:
+                    sv = sub_t[sub_t[vdim_col] == cv]["Vel_Calculada"].dropna()
+                    if len(sv) == 0:
+                        continue
+                    lo, hi = _tukey_v(sv)
+                    q1v, medv, q3v = np.percentile(sv, [25, 50, 75])
+                    xc.append(cv)
+                    lf.append(lo)
+                    q1l.append(q1v)
+                    medl.append(medv)
+                    q3l.append(q3v)
+                    uf.append(hi)
+                    mnl.append(float(sv.mean()))
+                fig_vbox.add_trace(
+                    go.Box(
+                        x=xc,
+                        lowerfence=lf,
+                        q1=q1l,
+                        median=medl,
+                        q3=q3l,
+                        upperfence=uf,
+                        mean=mnl,
+                        name=t_name,
+                        marker_color=t_col_hex,
+                    )
+                )
+            else:
+                fig_vbox.add_trace(
+                    go.Box(
+                        x=sub_t[vdim_col],
+                        y=sub_t["Vel_Calculada"],
+                        name=t_name,
+                        boxmean=True,
+                        boxpoints=False,
+                        marker_color=t_col_hex,
+                    )
+                )
+
+        fig_vbox.update_layout(
+            boxmode="group",
+            height=410,
+            margin=dict(l=20, r=20, t=30, b=20),
+            xaxis=dict(categoryorder="array", categoryarray=v_cat_order),
+            yaxis_title="Velocidad Real (km/h)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_vbox, use_container_width=True)
+
+    tr_clean_exp = tr_clean.copy()
+    tr_clean_exp["Fecha Reparto"] = tr_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    vel_excel_bytes = build_velocidades_excel(mat_vp, mat_vs, mat_vr, mat_vmax, tr_clean_exp)
+    st.download_button(
+        label="📥 Descargar Tablas de Velocidades y Base Limpia (.xlsx)",
+        data=vel_excel_bytes,
+        file_name="Velocidades_Camiones_por_CD_y_Vehiculo.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+# =============================================================================
+# SOLAPA 5: VIAJES Y JORNADAS (1 vs 2+ VUELTAS CON LIMPIEZA ESTRICTA DE JORNADA)
+# =============================================================================
 with tab5:
-    st.info(
-        "🚧 **Solapa 5 — Internos, CD Origen y Jornada Diaria:** "
-        "Permanencia en CD Origen, desvío vs. `Hora Reparto`, análisis de vueltas por día (`1` vs `2` vs `3+ vueltas`) "
-        "y jornada del chofer por interno/patente."
+    st.subheader("Viajes y Jornadas Diarias (1 Vuelta vs. 2+ Vueltas)")
+    st.caption(
+        "Paso 1: Se depura la base de **Viajes OK** (CD Origen OK + 100% Tiendas OK + sin incongruencias de tiempos/odómetro). "
+        "Paso 2: Para armar **Jornadas Camión-Día**, solo se incluyen días donde **el 100% de los viajes del camión en ese día quedaron en la base OK** "
+        "(si un camión hizo 2 viajes y 1 fue excluido por falta de datos, la jornada completa de ese día se excluye para no distorsionar horas ni vueltas)."
+    )
+
+    with st.expander("🎛️ Parámetros de Limpieza de Viajes OK y Jornadas (Ajustables)", expanded=False):
+        jc1, jc2, jc3, jc4 = st.columns(4)
+        with jc1:
+            min_cd_j = st.number_input("Estadía mín. CD Origen (min):", min_value=0, max_value=60, value=10, step=5, key="s5_min_cd")
+            max_cd_j = st.number_input("Estadía máx. CD Origen (min):", min_value=120, max_value=720, value=360, step=60, key="s5_max_cd")
+        with jc2:
+            min_dur_v = st.number_input("Duración mín. Viaje (hs):", min_value=0.2, max_value=3.0, value=0.5, step=0.1, key="s5_min_dv")
+            max_dur_v = st.number_input("Duración máx. Viaje (hs):", min_value=8.0, max_value=24.0, value=16.0, step=1.0, key="s5_max_dv")
+        with jc3:
+            min_dur_j = st.number_input("Duración mín. Jornada (hs):", min_value=0.5, max_value=4.0, value=1.0, step=0.5, key="s5_min_dj")
+            max_dur_j = st.number_input("Duración máx. Jornada (hs):", min_value=10.0, max_value=24.0, value=18.0, step=1.0, key="s5_max_dj")
+        with jc4:
+            st.write("")
+            tukey_j = st.checkbox("Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)", value=True, key="s5_tukey")
+
+    # -------------------------------------------------------------------------
+    # PASO 1: LIMPIEZA DE VIAJES OK (INDEPENDIENTE DEL RETORNO)
+    # -------------------------------------------------------------------------
+    trips_base_s5 = dq_trips_filt.copy()
+    stops_base_s5 = dq_stores_filt.copy()
+
+    st_trip_times = (
+        stops_base_s5.groupby("Id Viaje", as_index=False)
+        .agg(
+            Fin_Ultima_Tienda=("dt_fin_real", "max"),
+            Suma_Estadia_Tiendas_min=("Tiempo de Estadia", "sum"),
+            Min_Estadia_Tienda=("Tiempo de Estadia", "min"),
+            Max_Estadia_Tienda=("Tiempo de Estadia", "max"),
+            Tiene_Solape=(
+                "dt_ini_real",
+                lambda s: bool(
+                    (
+                        s.notna()
+                        & stops_base_s5.loc[s.index, "prev_dt_fin_real"].notna()
+                        & (s < stops_base_s5.loc[s.index, "prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+                    ).any()
+                ),
+            ),
+        )
+    )
+
+    trips_eval_s5 = trips_base_s5.merge(st_trip_times, on="Id Viaje", how="left")
+    trips_eval_s5["dt_ini_cd"] = pd.to_datetime(
+        trips_eval_s5["Ini_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+    trips_eval_s5["Duracion_Viaje_hs"] = (
+        (trips_eval_s5["Fin_Ultima_Tienda"] - trips_eval_s5["dt_ini_cd"]).dt.total_seconds() / 3600.0
+    ).round(2)
+
+    trips_eval_s5["Tiempo_CD_hs"] = (trips_eval_s5["Estadia_CD_Origen"].fillna(0) / 60.0).round(2)
+    trips_eval_s5["Tiempo_Tiendas_hs"] = (trips_eval_s5["Suma_Estadia_Tiendas_min"].fillna(0) / 60.0).round(2)
+    trips_eval_s5["Tiempo_Ruta_hs"] = (
+        (trips_eval_s5["Duracion_Viaje_hs"] - trips_eval_s5["Tiempo_CD_hs"] - trips_eval_s5["Tiempo_Tiendas_hs"])
+        .clip(lower=0.0)
+        .round(2)
+    )
+
+    max_st_trip_lim = np.where(trips_eval_s5["Categoria"] == "Lejana", 360.0, 240.0)
+
+    cond_viaje_ok = (
+        trips_eval_s5["Viaje_Completo_Base"]
+        & (trips_eval_s5["Estadia_CD_Origen"] >= float(min_cd_j))
+        & (trips_eval_s5["Estadia_CD_Origen"] <= float(max_cd_j))
+        & (trips_eval_s5["Min_Estadia_Tienda"].fillna(0) >= 5.0)
+        & (trips_eval_s5["Max_Estadia_Tienda"].fillna(9999) <= max_st_trip_lim)
+        & (~trips_eval_s5["Tiene_Solape"].fillna(True))
+        & (trips_eval_s5["KMS_Total"].fillna(0) > 0)
+        & (trips_eval_s5["KMS_Total"].fillna(0) <= 1500)
+        & (trips_eval_s5["Duracion_Viaje_hs"].fillna(0) >= float(min_dur_v))
+        & (trips_eval_s5["Duracion_Viaje_hs"].fillna(0) <= float(max_dur_v))
+    )
+
+    trips_eval_s5["Viaje_OK_S5"] = cond_viaje_ok
+    viajes_ok_s5 = trips_eval_s5[trips_eval_s5["Viaje_OK_S5"]].copy()
+
+    # -------------------------------------------------------------------------
+    # PASO 2: LIMPIEZA ESTRICTA DE JORNADAS CAMION-DIA (100% VIAJES DEL DIA OK)
+    # -------------------------------------------------------------------------
+    trips_eval_s5["Dominio_Clean"] = (
+        trips_eval_s5["Dominio"].fillna("").astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
+    )
+    trips_eval_s5["Dominio_Valido"] = (
+        ~trips_eval_s5["Dominio_Clean"].isin(["", "SINDOMINIO", "XXX000", "XXXXXX", "NAN"])
+    ) & (~trips_eval_s5["Dominio_Clean"].str.startswith("XXX"))
+
+    valid_fleet_all = trips_eval_s5[trips_eval_s5["Dominio_Valido"]].copy()
+
+    jornadas_all = (
+        valid_fleet_all.groupby(["Operacion", "Fecha_Reparto", "Dominio_Clean"], as_index=False)
+        .agg(
+            Dominio=("Dominio", "first"),
+            Interno=("Interno", "first"),
+            Tipo_Vehiculo=("Tipo_Vehiculo", "first"),
+            Transportista=("Transportista", "first"),
+            Viajes_Plan_Dia=("Id Viaje", "nunique"),
+            Viajes_OK_Dia=("Viaje_OK_S5", lambda s: int(s.sum())),
+            Inicio_Jornada=("dt_ini_cd", "min"),
+            Fin_Jornada=("Fin_Ultima_Tienda", "max"),
+            Suma_Horas_Viajes=("Duracion_Viaje_hs", "sum"),
+            KMS_Dia=("KMS_Total", "sum"),
+            Tiendas_Dia=("Tiendas_Plan_Viaje", "sum"),
+        )
+    )
+
+    jornadas_all["Todos_Viajes_OK"] = jornadas_all["Viajes_Plan_Dia"] == jornadas_all["Viajes_OK_Dia"]
+    jornadas_all["Duracion_Jornada_hs"] = (
+        (jornadas_all["Fin_Jornada"] - jornadas_all["Inicio_Jornada"]).dt.total_seconds() / 3600.0
+    ).round(2)
+    jornadas_all["Entre_Vueltas_hs"] = (
+        (jornadas_all["Duracion_Jornada_hs"] - jornadas_all["Suma_Horas_Viajes"]).clip(lower=0.0).round(2)
+    )
+
+    cond_jornada_limpia = (
+        jornadas_all["Todos_Viajes_OK"]
+        & (jornadas_all["Duracion_Jornada_hs"].fillna(0) >= float(min_dur_j))
+        & (jornadas_all["Duracion_Jornada_hs"].fillna(0) <= float(max_dur_j))
+    )
+    jornadas_all["Jornada_Limpia"] = cond_jornada_limpia
+
+    jornadas_clean_s5 = jornadas_all[jornadas_all["Jornada_Limpia"]].copy()
+    jornadas_excl_s5 = jornadas_all[~jornadas_all["Jornada_Limpia"]].copy()
+    jornadas_excl_s5["Motivo_Exclusion_Jornada"] = np.where(
+        ~jornadas_excl_s5["Todos_Viajes_OK"],
+        "Al menos 1 viaje del día excluido por falta de datos/anomalía",
+        "Duración de jornada fuera de rango físico",
+    )
+
+    jornadas_clean_s5["Vueltas_Label"] = np.select(
+        [jornadas_clean_s5["Viajes_Plan_Dia"] == 1, jornadas_clean_s5["Viajes_Plan_Dia"] == 2],
+        ["1 Vuelta", "2 Vueltas"],
+        default="3+ Vueltas",
+    )
+
+    tot_v_s5 = len(trips_eval_s5)
+    ok_v_s5 = len(viajes_ok_s5)
+    pct_v_ok_s5 = (ok_v_s5 / tot_v_s5 * 100) if tot_v_s5 > 0 else 0.0
+    med_dur_v_s5 = float(viajes_ok_s5["Duracion_Viaje_hs"].median()) if ok_v_s5 > 0 else 0.0
+
+    tot_j_s5 = len(jornadas_all)
+    ok_j_s5 = len(jornadas_clean_s5)
+    excl_j_incomp = int((~jornadas_all["Todos_Viajes_OK"]).sum())
+    pct_j_ok_s5 = (ok_j_s5 / tot_j_s5 * 100) if tot_j_s5 > 0 else 0.0
+
+    j_1v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "1 Vuelta"]
+    j_2v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "2 Vueltas"]
+    j_2mas_cnt = int((jornadas_clean_s5["Viajes_Plan_Dia"] >= 2).sum())
+    pct_2mas = (j_2mas_cnt / ok_j_s5 * 100) if ok_j_s5 > 0 else 0.0
+
+    med_j_1v = float(j_1v["Duracion_Jornada_hs"].median()) if len(j_1v) > 0 else 0.0
+    med_j_2v = float(j_2v["Duracion_Jornada_hs"].median()) if len(j_2v) > 0 else 0.0
+    med_entre_v_min = float(j_2v["Entre_Vueltas_hs"].median() * 60.0) if len(j_2v) > 0 else 0.0
+
+    kj1, kj2, kj3, kj4 = st.columns(4)
+    with kj1:
+        st.markdown(
+            _kpi_card_html(
+                "Base Limpia Viajes OK",
+                _fmt_int(ok_v_s5),
+                f"{_fmt_pct(pct_v_ok_s5)} de {_fmt_int(tot_v_s5)} viajes TMS",
+                "#16a34a",
+                f"Duración mediana viaje: <b>{med_dur_v_s5:.1f} hs</b>",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kj2:
+        st.markdown(
+            _kpi_card_html(
+                "Jornadas Camión-Día Limpias",
+                _fmt_int(ok_j_s5),
+                f"{_fmt_pct(pct_j_ok_s5)} de {_fmt_int(tot_j_s5)} jornadas",
+                "#1d4ed8",
+                f"Excluidas x viaje incompleto: <b>{_fmt_int(excl_j_incomp)}</b>",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kj3:
+        st.markdown(
+            _kpi_card_html(
+                "Jornadas de 2+ Vueltas",
+                _fmt_int(j_2mas_cnt),
+                f"{_fmt_pct(pct_2mas)} de las jornadas limpias",
+                "#d97706",
+                f"Re-carga entre vueltas: <b>{med_entre_v_min:.0f} min</b>",
+            ),
+            unsafe_allow_html=True,
+        )
+    with kj4:
+        st.markdown(
+            _kpi_card_html(
+                "Mediana Horas de Jornada",
+                f"{float(jornadas_clean_s5['Duracion_Jornada_hs'].median()) if ok_j_s5 > 0 else 0.0:.1f} hs",
+                f"1 Vuelta: {med_j_1v:.1f} hs  |  2 Vueltas: {med_j_2v:.1f} hs",
+                "#0f172a",
+                "Desde inicio carga CD a últ. tienda",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 1: ANALISIS DE TIEMPOS DE VIAJE (SOBRE VIAJES OK LIMPIOS)
+    # -------------------------------------------------------------------------
+    st.markdown("### 1. Duración de Viajes OK (Inicio Carga CD $\rightarrow$ Salida Última Tienda)")
+
+    v_dim_map = {
+        "Tipo de Viaje (Directo / Compartido / Rutas)": "Tipo_Viaje",
+        "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+        "Operación (CD)": "Operacion",
+        "Categoría (Cercana vs. Lejana)": "Categoria",
+    }
+    v_sub_map = {
+        "Sin sub-corte": None,
+        "Categoría (Cercana vs. Lejana)": "Categoria",
+        "Tipo de Viaje": "Tipo_Viaje",
+        "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+    }
+
+    vc_1, vc_2 = st.columns([1.3, 1.2])
+    with vc_1:
+        v_dim_lbl = st.selectbox("Agrupar viajes por:", list(v_dim_map.keys()), index=0, key="s5_v_dim")
+    with vc_2:
+        v_sub_lbl = st.selectbox("Sub-dividir cajas por color:", list(v_sub_map.keys()), index=1, key="s5_v_sub")
+
+    v_dim_col = v_dim_map[v_dim_lbl]
+    v_sub_col = v_sub_map[v_sub_lbl]
+    if v_sub_col == v_dim_col:
+        v_sub_col = None
+
+    df_v_res = pd.DataFrame()
+    if not viajes_ok_s5.empty:
+        df_vp_s5 = viajes_ok_s5.copy()
+        if v_dim_col == "Operacion":
+            df_vp_s5[v_dim_col] = "CD " + df_vp_s5[v_dim_col].astype(str)
+        else:
+            df_vp_s5[v_dim_col] = df_vp_s5[v_dim_col].fillna("Sin dato").astype(str)
+
+        if v_dim_col == "Tipo_Viaje":
+            v_ord = [c for c in ["Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"] if c in df_vp_s5[v_dim_col].unique()]
+        else:
+            v_ord = df_vp_s5.groupby(v_dim_col)["Duracion_Viaje_hs"].median().sort_values(ascending=False).index.tolist()
+
+        fig_vbox_s5 = go.Figure()
+        pal_s5 = ["#1d4ed8", "#d97706", "#16a34a", "#7c3aed", "#dc2626", "#0891b2"]
+
+        def _tukey_hs(s: pd.Series):
+            q1, q3 = np.percentile(s, [25, 75])
+            iqr = q3 - q1
+            return max(float(s.min()), float(q1 - 1.5 * iqr)), min(float(s.max()), float(q3 + 1.5 * iqr))
+
+        if v_sub_col is None:
+            for idx_i, cv in enumerate(v_ord):
+                sv = df_vp_s5[df_vp_s5[v_dim_col] == cv]["Duracion_Viaje_hs"].dropna()
+                if len(sv) == 0:
+                    continue
+                if tukey_j:
+                    lo, hi = _tukey_hs(sv)
+                    q1v, medv, q3v = np.percentile(sv, [25, 50, 75])
+                    fig_vbox_s5.add_trace(
+                        go.Box(
+                            x=[f"{cv} (n={len(sv):,})"],
+                            lowerfence=[lo], q1=[q1v], median=[medv], q3=[q3v], upperfence=[hi],
+                            mean=[float(sv.mean())], name=f"{cv} (n={len(sv):,})",
+                            marker_color=pal_s5[idx_i % len(pal_s5)],
+                        )
+                    )
+                else:
+                    fig_vbox_s5.add_trace(
+                        go.Box(y=sv, name=f"{cv} (n={len(sv):,})", boxmean=True, boxpoints=False, marker_color=pal_s5[idx_i % len(pal_s5)])
+                    )
+        else:
+            df_vp_s5[v_sub_col] = df_vp_s5[v_sub_col].fillna("Sin dato").astype(str)
+            svals = sorted(df_vp_s5[v_sub_col].unique().tolist())
+            for idx_s, sv_name in enumerate(svals):
+                sub_d = df_vp_s5[df_vp_s5[v_sub_col] == sv_name]
+                if tukey_j:
+                    xc, lf, q1l, medl, q3l, uf, mnl = [], [], [], [], [], [], []
+                    for cv in v_ord:
+                        s_sub = sub_d[sub_d[v_dim_col] == cv]["Duracion_Viaje_hs"].dropna()
+                        if len(s_sub) == 0:
+                            continue
+                        lo, hi = _tukey_hs(s_sub)
+                        q1v, medv, q3v = np.percentile(s_sub, [25, 50, 75])
+                        xc.append(cv); lf.append(lo); q1l.append(q1v); medl.append(medv); q3l.append(q3v); uf.append(hi); mnl.append(float(s_sub.mean()))
+                    fig_vbox_s5.add_trace(
+                        go.Box(x=xc, lowerfence=lf, q1=q1l, median=medl, q3=q3l, upperfence=uf, mean=mnl, name=sv_name, marker_color=pal_s5[idx_s % len(pal_s5)])
+                    )
+                else:
+                    fig_vbox_s5.add_trace(
+                        go.Box(x=sub_d[v_dim_col], y=sub_d["Duracion_Viaje_hs"], name=sv_name, boxmean=True, boxpoints=False, marker_color=pal_s5[idx_s % len(pal_s5)])
+                    )
+            fig_vbox_s5.update_layout(boxmode="group", xaxis=dict(categoryorder="array", categoryarray=v_ord))
+
+        fig_vbox_s5.update_layout(
+            height=390,
+            margin=dict(l=20, r=20, t=30, b=20),
+            yaxis_title="Duración del Viaje (horas)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        )
+        st.plotly_chart(fig_vbox_s5, use_container_width=True)
+
+        g_cols_v = [v_dim_col] if v_sub_col is None else [v_dim_col, v_sub_col]
+        v_rows = []
+        for keys, grp in df_vp_s5.groupby(g_cols_v):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            sd = grp["Duracion_Viaje_hs"]
+            rd = {g_cols_v[i]: keys[i] for i in range(len(g_cols_v))}
+            rd.update(
+                {
+                    "Viajes OK": int(len(sd)),
+                    "Mediana KMS": round(float(grp["KMS_Total"].median()), 1),
+                    "Med. CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
+                    "Med. Ruta (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
+                    "Med. Tiendas (hs)": round(float(grp["Tiempo_Tiendas_hs"].median()), 2),
+                    "P25 Viaje (hs)": round(float(np.percentile(sd, 25)), 2),
+                    "Mediana Viaje (hs)": round(float(sd.median()), 2),
+                    "P75 Viaje (hs)": round(float(np.percentile(sd, 75)), 2),
+                    "P90 Viaje (hs)": round(float(np.percentile(sd, 90)), 2),
+                }
+            )
+            v_rows.append(rd)
+        df_v_res = pd.DataFrame(v_rows)
+        st.dataframe(df_v_res, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 2: ANALISIS DE JORNADAS DIARIAS (1 VUELTA vs 2+ VUELTAS)
+    # -------------------------------------------------------------------------
+    st.markdown("### 2. Análisis de Jornadas Diarias (1 Vuelta vs. 2+ Vueltas)")
+    st.caption(
+        "Construido exclusivamente sobre días donde **todos** los viajes del camión estuvieron completos y limpios."
+    )
+
+    df_j_res = pd.DataFrame()
+    if not jornadas_clean_s5.empty:
+        j_col1, j_col2 = st.columns([1.2, 1.3])
+        with j_col1:
+            j_cut = st.selectbox(
+                "Abrir jornadas por:",
+                options=["Operación (CD)", "Tipo de Vehículo (Nómina)"],
+                index=0,
+                key="s5_j_cut",
+            )
+            j_cut_col = "Operacion" if j_cut == "Operación (CD)" else "Tipo_Vehiculo"
+
+            df_jp = jornadas_clean_s5.copy()
+            if j_cut_col == "Operacion":
+                df_jp[j_cut_col] = "CD " + df_jp[j_cut_col].astype(str)
+            else:
+                df_jp[j_cut_col] = df_jp[j_cut_col].fillna("Sin dato").astype(str)
+
+            j_rows = []
+            for k_val, grp in df_jp.groupby(j_cut_col):
+                g1 = grp[grp["Vueltas_Label"] == "1 Vuelta"]
+                g2 = grp[grp["Vueltas_Label"] == "2 Vueltas"]
+                g3 = grp[grp["Vueltas_Label"] == "3+ Vueltas"]
+                j_rows.append(
+                    {
+                        j_cut: k_val,
+                        "Jornadas Limpias": int(len(grp)),
+                        "1 Vuelta": int(len(g1)),
+                        "2 Vueltas": int(len(g2)),
+                        "3+ Vueltas": int(len(g3)),
+                        "Med. 1 Vuelta (hs)": round(float(g1["Duracion_Jornada_hs"].median()), 1) if len(g1) > 0 else None,
+                        "Med. 2 Vueltas (hs)": round(float(g2["Duracion_Jornada_hs"].median()), 1) if len(g2) > 0 else None,
+                        "P90 Jornada (hs)": round(float(np.percentile(grp["Duracion_Jornada_hs"], 90)), 1),
+                        "Mediana KMS/Día": round(float(grp["KMS_Dia"].median()), 1),
+                    }
+                )
+            df_j_res = pd.DataFrame(j_rows).sort_values("Jornadas Limpias", ascending=False)
+            st.dataframe(df_j_res, use_container_width=True, hide_index=True)
+
+        with j_col2:
+            fig_jbox = go.Figure()
+            vueltas_ord = ["1 Vuelta", "2 Vueltas", "3+ Vueltas"]
+            vueltas_pal = {"1 Vuelta": "#1d4ed8", "2 Vueltas": "#d97706", "3+ Vueltas": "#dc2626"}
+            for vl in vueltas_ord:
+                sv_j = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == vl]["Duracion_Jornada_hs"].dropna()
+                if len(sv_j) == 0:
+                    continue
+                if tukey_j:
+                    q1, q3 = np.percentile(sv_j, [25, 75])
+                    iqr = q3 - q1
+                    lo = max(float(sv_j.min()), float(q1 - 1.5 * iqr))
+                    hi = min(float(sv_j.max()), float(q3 + 1.5 * iqr))
+                    medv = float(sv_j.median())
+                    fig_jbox.add_trace(
+                        go.Box(
+                            x=[f"{vl} (n={len(sv_j):,})"],
+                            lowerfence=[lo], q1=[q1], median=[medv], q3=[q3], upperfence=[hi],
+                            mean=[float(sv_j.mean())], name=f"{vl} (n={len(sv_j):,})",
+                            marker_color=vueltas_pal[vl],
+                        )
+                    )
+                else:
+                    fig_jbox.add_trace(
+                        go.Box(y=sv_j, name=f"{vl} (n={len(sv_j):,})", boxmean=True, boxpoints=False, marker_color=vueltas_pal[vl])
+                    )
+
+            fig_jbox.update_layout(
+                title="Distribución de Horas de Jornada según Cantidad de Vueltas",
+                height=390,
+                margin=dict(l=20, r=20, t=40, b=20),
+                yaxis_title="Duración de Jornada (horas)",
+                showlegend=False,
+            )
+            st.plotly_chart(fig_jbox, use_container_width=True)
+
+    # Descarga Excel de Viajes y Jornadas
+    v_clean_exp = viajes_ok_s5.copy()
+    v_clean_exp["Fecha Reparto"] = v_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    j_clean_exp = jornadas_clean_s5.copy()
+    j_clean_exp["Fecha Reparto"] = j_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    j_excl_exp = jornadas_excl_s5.copy()
+    j_excl_exp["Fecha Reparto"] = j_excl_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+
+    vj_excel_bytes = build_viajes_jornadas_excel(df_v_res, df_j_res, v_clean_exp, j_clean_exp, j_excl_exp)
+    st.download_button(
+        label="📥 Descargar Análisis de Viajes y Jornadas (.xlsx)",
+        data=vj_excel_bytes,
+        file_name="Analisis_Viajes_y_Jornadas.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
