@@ -2260,27 +2260,28 @@ with tab2:
             columns=["Tienda", "CD(s)", "Paradas Afectadas", "Viajes Únicos", "Primera Fecha", "Última Fecha"]
         )
 
-    # 3D. Detalle de paradas sin GPS para exportacion
-    raw_fails_export = (
-        gps_filt[gps_filt["Diagnostico_GPS"] != "Visitada (OK)"][
-            [
-                "Operacion",
-                "Fecha_Reparto",
-                "Hora Reparto",
-                "Ref_Clean",
-                "Id Viaje",
-                "Transportista",
-                "Dominio",
-                "Tipo de Camion",
-                "Tienda_Cod",
-                "Diagnostico_GPS",
-            ]
-        ]
-        .copy()
-        .sort_values(["Operacion", "Fecha_Reparto", "Ref_Clean"])
+    # 3D. Detalle de paradas sin GPS para consulta puntual y exportacion
+    raw_fails_df = gps_filt[gps_filt["Diagnostico_GPS"] != "Visitada (OK)"].copy()
+    raw_fails_df["Causa_Parada"] = np.select(
+        [
+            raw_fails_df["Diagnostico_GPS"] == "Sin coordenadas",
+            raw_fails_df["Diagnostico_GPS"] == "Viaje Ciego (GPS/Unidad)",
+            (raw_fails_df["Diagnostico_GPS"] == "Falla Geocerca (Parcial)") & (~raw_fails_df["obs_act_tarde"]),
+            (raw_fails_df["Diagnostico_GPS"] == "Falla Geocerca (Parcial)") & (raw_fails_df["obs_act_tarde"]),
+        ],
+        [
+            "Sin coordenadas",
+            "Viaje Ciego (GPS/Unidad)",
+            "Falla Geozona (Activ. OK)",
+            "Por Activ. Tarde (>5 km)",
+        ],
+        default=raw_fails_df["Diagnostico_GPS"],
     )
-    raw_fails_export["Fecha Reparto"] = raw_fails_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    raw_fails_export = raw_fails_export[
+    raw_fails_df = raw_fails_df.sort_values(["Fecha_Reparto", "Operacion", "Ref_Clean"], ascending=[False, True, True])
+    raw_fails_df["Fecha Reparto"] = raw_fails_df["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+    raw_fails_df["Dist. Activ. (km)"] = raw_fails_df["Dist_Activacion_km"].round(2)
+
+    raw_fails_export = raw_fails_df[
         [
             "Operacion",
             "Fecha Reparto",
@@ -2289,17 +2290,20 @@ with tab2:
             "Id Viaje",
             "Transportista",
             "Dominio",
-            "Tipo de Camion",
+            "Tipo_Vehiculo",
             "Tienda_Cod",
+            "Dist. Activ. (km)",
             "Diagnostico_GPS",
+            "Causa_Parada",
         ]
     ].rename(
         columns={
             "Operacion": "CD",
             "Ref_Clean": "Ref Externa Viaje",
-            "Tipo de Camion": "Tipo Camión",
+            "Tipo_Vehiculo": "Tipo Vehículo",
             "Tienda_Cod": "Tienda",
-            "Diagnostico_GPS": "Diagnóstico GPS",
+            "Diagnostico_GPS": "Categoría Gráfico",
+            "Causa_Parada": "Causa Raíz",
         }
     )
 
@@ -2470,6 +2474,46 @@ with tab2:
                 ),
             },
         )
+
+        with st.expander("🔍 Ver detalle puntual de paradas sin visita (filtrable por Fecha exacta, ej. Sáb 21/11)", expanded=False):
+            fechas_disp_gps = sorted(
+                raw_fails_df["Fecha_Reparto"].dropna().dt.floor("D").unique(),
+                reverse=True,
+            )
+            fechas_str_opts = ["Todas"] + [pd.Timestamp(f).strftime("%d/%m/%Y") for f in fechas_disp_gps]
+            df_col1, df_col2 = st.columns([1.2, 1.5])
+            with df_col1:
+                fecha_puntual_sel = st.selectbox(
+                    "Filtrar por Fecha Reparto:",
+                    options=fechas_str_opts,
+                    index=0,
+                    key="s2_fecha_puntual_sel",
+                )
+            with df_col2:
+                causa_puntual_sel = st.selectbox(
+                    "Filtrar por Categoría / Causa:",
+                    options=[
+                        "Todas",
+                        "Falla Geocerca (Parcial) — Total gráfico",
+                        "Falla Geozona (Activ. OK)",
+                        "Por Activ. Tarde (>5 km)",
+                        "Viaje Ciego (GPS/Unidad)",
+                        "Sin coordenadas",
+                    ],
+                    index=1,
+                    key="s2_causa_puntual_sel",
+                )
+
+            det_view = raw_fails_export.copy()
+            if fecha_puntual_sel != "Todas":
+                det_view = det_view[det_view["Fecha Reparto"] == fecha_puntual_sel]
+            if causa_puntual_sel == "Falla Geocerca (Parcial) — Total gráfico":
+                det_view = det_view[det_view["Categoría Gráfico"] == "Falla Geocerca (Parcial)"]
+            elif causa_puntual_sel != "Todas":
+                det_view = det_view[det_view["Causa Raíz"] == causa_puntual_sel]
+
+            st.caption(f"Mostrando **{len(det_view):,}** paradas que coinciden con el filtro seleccionado.")
+            st.dataframe(det_view, use_container_width=True, hide_index=True)
 
     with gtab2:
         st.caption(
