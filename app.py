@@ -234,14 +234,15 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
     # 2. Limpieza AMREPA (WMS)
     df_a = df_a_raw.copy()
-    # Excluir internos administrativos/especiales de AMREPA (1331 Transferencias, 1333 Dev. picking, 50000 Salta)
-    internos_excl_amrepa = {"1331", "1333", "50000"}
-    col_interno_a = next((c for c in df_a.columns if "interno" in c.lower()), None)
-    if col_interno_a is not None:
-        int_clean_a = _clean_int_str(df_a[col_interno_a]).fillna(
-            df_a[col_interno_a].fillna("").astype(str).str.strip()
-        )
-        df_a = df_a[~int_clean_a.isin(internos_excl_amrepa)].copy()
+    # Excluir internos/transportistas administrativos o especiales (1331 Transferencias, 1333 Dev. picking, 50000 Salta)
+    codigos_excl_especiales = {"1331", "1333", "50000"}
+    for col_a in df_a.columns:
+        c_low = col_a.lower()
+        if "interno" in c_low or "transportista" in c_low:
+            val_clean_a = _clean_int_str(df_a[col_a]).fillna(
+                df_a[col_a].fillna("").astype(str).str.strip()
+            )
+            df_a = df_a[~val_clean_a.isin(codigos_excl_especiales)].copy()
 
     df_a["Operacion"] = pd.to_numeric(df_a["[Codigo almacen]"], errors="coerce").astype("Int64")
     df_a["Contador"] = pd.to_numeric(df_a["[Contador transporte]"], errors="coerce").astype("Int64")
@@ -259,12 +260,28 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
     # 3. Limpieza UNIGIS (TMS)
     df_u = df_u_raw.copy()
-    # Excluir tambien en UNIGIS los internos administrativos/especiales (1331, 1333, 50000)
     if "Interno" in df_u.columns:
         int_clean_u = _clean_int_str(df_u["Interno"]).fillna(
             df_u["Interno"].fillna("").astype(str).str.strip()
         )
-        df_u = df_u[~int_clean_u.isin(internos_excl_amrepa)].copy()
+        df_u = df_u[~int_clean_u.isin(codigos_excl_especiales)].copy()
+
+    # Tambien excluir en UNIGIS cualquier viaje cuya Ref Externa corresponda a un viaje excluido de AMREPA
+    refs_excluidas_amrepa = set()
+    for col_a_raw in df_a_raw.columns:
+        c_low_raw = col_a_raw.lower()
+        if "interno" in c_low_raw or "transportista" in c_low_raw:
+            v_raw = _clean_int_str(df_a_raw[col_a_raw]).fillna(
+                df_a_raw[col_a_raw].fillna("").astype(str).str.strip()
+            )
+            mask_ex = v_raw.isin(codigos_excl_especiales)
+            if mask_ex.any():
+                op_ex = pd.to_numeric(df_a_raw.loc[mask_ex, "[Codigo almacen]"], errors="coerce").astype("Int64")
+                cnt_ex = pd.to_numeric(df_a_raw.loc[mask_ex, "[Contador transporte]"], errors="coerce").astype("Int64")
+                refs_excluidas_amrepa.update((op_ex.astype(str) + " - " + cnt_ex.astype(str)).dropna().tolist())
+
+    if refs_excluidas_amrepa and "Ref Externa Viaje" in df_u.columns:
+        df_u = df_u[~df_u["Ref Externa Viaje"].fillna("").astype(str).str.strip().isin(refs_excluidas_amrepa)].copy()
 
     df_u["Operacion"] = pd.to_numeric(df_u["Operacion"], errors="coerce").astype("Int64")
     df_u["Fecha_Reparto"] = pd.to_datetime(df_u["Fecha Reparto"], format="%d/%m/%Y", errors="coerce")
