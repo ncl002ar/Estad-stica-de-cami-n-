@@ -234,6 +234,15 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
     # 2. Limpieza AMREPA (WMS)
     df_a = df_a_raw.copy()
+    # Excluir internos administrativos/especiales de AMREPA (1331 Transferencias, 1333 Dev. picking, 50000 Salta)
+    internos_excl_amrepa = {"1331", "1333", "50000"}
+    col_interno_a = next((c for c in df_a.columns if "interno" in c.lower()), None)
+    if col_interno_a is not None:
+        int_clean_a = _clean_int_str(df_a[col_interno_a]).fillna(
+            df_a[col_interno_a].fillna("").astype(str).str.strip()
+        )
+        df_a = df_a[~int_clean_a.isin(internos_excl_amrepa)].copy()
+
     df_a["Operacion"] = pd.to_numeric(df_a["[Codigo almacen]"], errors="coerce").astype("Int64")
     df_a["Contador"] = pd.to_numeric(df_a["[Contador transporte]"], errors="coerce").astype("Int64")
     df_a["Transportista"] = _clean_int_str(df_a["[Codigo de Transportista]"]).fillna("Sin dato")
