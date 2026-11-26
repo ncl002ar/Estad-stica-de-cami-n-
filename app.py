@@ -164,14 +164,14 @@ def _to_float_safe(series: pd.Series) -> pd.Series:
 
 def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
     if nomina_bytes is None:
-        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+        return pd.DataFrame(columns=["Interno_Nom", "Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
     try:
         df_n = pd.read_excel(io.BytesIO(nomina_bytes), sheet_name=0)
     except Exception:
-        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+        return pd.DataFrame(columns=["Interno_Nom", "Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
 
     if "Patente" not in df_n.columns:
-        return pd.DataFrame(columns=["Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
+        return pd.DataFrame(columns=["Interno_Nom", "Tipo_Vehiculo_Nom", "Satelital_Nom", "Empresa_Nom"])
 
     df_n = df_n.copy()
     df_n["Patente_Clean"] = (
@@ -201,6 +201,11 @@ def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
     df_n = df_n.sort_values("_rank").drop_duplicates("Patente_Clean", keep="first").set_index("Patente_Clean")
 
     out = pd.DataFrame(index=df_n.index)
+    out["Interno_Nom"] = (
+        _clean_int_str(df_n["Interno"]).fillna(df_n["Interno"].fillna("").astype(str).str.strip())
+        if "Interno" in df_n.columns
+        else ""
+    )
     out["Tipo_Vehiculo_Nom"] = (
         df_n["Tipo Camion"].fillna("").astype(str).str.strip().str.upper()
         if "Tipo Camion" in df_n.columns
@@ -482,6 +487,28 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         .agg(Transportista=("Transportista", lambda s: " / ".join(sorted(s.unique()))))
     )
 
+    def _merge_trans_nomina(trans_series: pd.Series, nom_int_series: pd.Series) -> pd.Series:
+        t_clean = trans_series.fillna("Sin dato WMS").astype(str).str.strip()
+        n_clean = nom_int_series.fillna("").astype(str).str.strip()
+        # Si Nomina tiene interno valido y NO coincide con AMREPA (ni esta ya contenido en AMREPA)
+        diff_mask = (
+            (n_clean != "")
+            & (n_clean != "0")
+            & (n_clean.str.lower() != "nan")
+            & (t_clean != n_clean)
+            & (~t_clean.isin(["Sin dato", "Sin dato WMS"]))
+        )
+        # Verificar tambien si t_clean tiene multiples transportistas separados por " / "
+        already_in = pd.Series(
+            [n in [p.strip() for p in t.split("/")] for t, n in zip(t_clean, n_clean)],
+            index=trans_series.index,
+        )
+        show_both = diff_mask & (~already_in)
+        return pd.Series(
+            np.where(show_both, t_clean + " / " + n_clean + " (Nóm.)", t_clean),
+            index=trans_series.index,
+        )
+
     stores_gps = u_stores_only.copy()
     stores_gps = stores_gps.merge(a_trans_map, on=["Operacion", "Ref_Clean"], how="left")
     stores_gps["Transportista"] = stores_gps["Transportista"].fillna("Sin dato WMS")
@@ -493,6 +520,8 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         mapped_tipo = stores_gps["Dominio_Clean"].map(nomina_lut["Tipo_Vehiculo_Nom"]).fillna("")
         stores_gps["Tipo_Vehiculo"] = np.where(mapped_tipo != "", mapped_tipo, stores_gps["Tipo de Camion"])
         stores_gps["Satelital"] = stores_gps["Dominio_Clean"].map(nomina_lut["Satelital_Nom"]).fillna("Sin dato")
+        mapped_int_nom = stores_gps["Dominio_Clean"].map(nomina_lut["Interno_Nom"]).fillna("")
+        stores_gps["Transportista"] = _merge_trans_nomina(stores_gps["Transportista"], mapped_int_nom)
     else:
         stores_gps["Tipo_Vehiculo"] = stores_gps["Tipo de Camion"]
         stores_gps["Satelital"] = "Sin dato"
@@ -585,6 +614,8 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         u_clean_num["Tipo_Vehiculo"] = np.where(mapped_tv != "", mapped_tv, u_clean_num["Tipo de Camion"])
         u_clean_num["Satelital"] = u_clean_num["Dominio_Clean"].map(nomina_lut["Satelital_Nom"]).fillna("Sin dato")
         u_clean_num["Empresa_Flota"] = u_clean_num["Dominio_Clean"].map(nomina_lut["Empresa_Nom"]).fillna("Sin dato")
+        mapped_int_u = u_clean_num["Dominio_Clean"].map(nomina_lut["Interno_Nom"]).fillna("")
+        u_clean_num["Transportista"] = _merge_trans_nomina(u_clean_num["Transportista"], mapped_int_u)
     else:
         u_clean_num["Tipo_Vehiculo"] = u_clean_num["Tipo de Camion"]
         u_clean_num["Satelital"] = "Sin dato"
