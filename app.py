@@ -925,6 +925,7 @@ def _rank_tiendas_s3_cached(
     df_all_s3: pd.DataFrame,
     st_clean_s3: pd.DataFrame,
     min_vis_rk: int,
+    filtro_cd_rk: str,
     filtro_tv_rk: str,
     filtro_cat_rk: str,
 ) -> pd.DataFrame:
@@ -947,7 +948,7 @@ def _rank_tiendas_s3_cached(
     if st_clean_s3.empty:
         return pd.DataFrame(columns=cols_out)
 
-    # Calcular Mediana del Segmento + cantidad de tiendas únicas y paradas limpias que forman esa referencia
+    # Calcular Mediana del Segmento a nivel global del período (antes de filtrar por CD puntual)
     seg_ref = (
         st_clean_s3.assign(_pair=st_clean_s3["Operacion"].astype(str) + "_" + st_clean_s3["Tienda_Cod"].astype(str))
         .groupby(["Tipo_Viaje", "Categoria"], as_index=False)
@@ -966,6 +967,8 @@ def _rank_tiendas_s3_cached(
 
     # Conteo de Visitas Totales (todas las paradas en el periodo/filtros, antes de limpieza de estadía)
     tot_base = df_all_s3.copy()
+    if filtro_cd_rk != "Todos":
+        tot_base = tot_base[tot_base["Operacion"].astype(int).astype(str) == str(filtro_cd_rk)]
     if filtro_tv_rk != "Todos":
         tot_base = tot_base[tot_base["Tipo_Viaje"] == filtro_tv_rk]
     if filtro_cat_rk != "Todas":
@@ -977,6 +980,8 @@ def _rank_tiendas_s3_cached(
     )
 
     rk_base = st_clean_s3.copy()
+    if filtro_cd_rk != "Todos":
+        rk_base = rk_base[rk_base["Operacion"].astype(int).astype(str) == str(filtro_cd_rk)]
     if filtro_tv_rk != "Todos":
         rk_base = rk_base[rk_base["Tipo_Viaje"] == filtro_tv_rk]
     if filtro_cat_rk != "Todas":
@@ -1146,13 +1151,15 @@ if isinstance(date_range, tuple) and len(date_range) == 2:
 else:
     d_start = d_end = pd.to_datetime(date_range)
 
-# 4. Filtro por Operacion (CD)
+# 4. Filtro por Operacion (CD) — vacio = todos los CDs (permite elegir 1 puntual rapido)
 all_ops = sorted(master["Operacion"].dropna().unique().tolist())
-selected_ops = st.sidebar.multiselect(
+selected_ops_raw = st.sidebar.multiselect(
     "Operación (CD)",
     options=all_ops,
-    default=all_ops,
+    default=[],
+    placeholder="Todos los CDs",
 )
+selected_ops = selected_ops_raw if selected_ops_raw else all_ops
 
 # Aplicar filtros globales sobre master
 mask_base = (
@@ -1277,7 +1284,7 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
 # SOLAPA 1: VISION MACRO - CONCILIACION WMS VS TMS
 # =============================================================================
 with tab1:
-    st.subheader("Conciliación Macro: Despachos WMS (AMREPA) vs. Rutas TMS (UNIGIS)")
+    st.subheader("Conciliación Macro: Despachos WMS (AMREPA) vs. Viajes TMS (UNIGIS)")
 
     viajes_wms = int((df_filt["_merge"].isin(["both", "left_only"])).sum())
     viajes_tms = int((df_filt["_merge"].isin(["both", "right_only"])).sum())
@@ -3220,48 +3227,62 @@ with tab3:
         df_plot_s3 = st_clean_s3.copy()
         df_tot_plot_s3 = dq_stores_filt.copy()
 
-        # Caso especial: Analisis de una Tienda puntual en el tiempo
+        # Caso especial: Analisis de una Tienda puntual con selector de CD + buscador de Tienda
         if dim_col == "Tienda_Puntual":
+            cds_disp_s3 = sorted(df_plot_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+            t_c1, t_c2, t_c3 = st.columns([0.85, 1.35, 1.15])
+            with t_c1:
+                cd_t_sel = st.selectbox(
+                    "CD de la tienda:",
+                    options=["Todos"] + cds_disp_s3,
+                    index=0,
+                    key="s3_cd_tienda_sel",
+                )
+            df_t_cand = (
+                df_plot_s3
+                if cd_t_sel == "Todos"
+                else df_plot_s3[df_plot_s3["Operacion"].astype(int).astype(str) == cd_t_sel]
+            )
             tiendas_opts_df = (
-                df_plot_s3.groupby(["Tienda_Cod", "Operacion"], as_index=False)
+                df_t_cand.groupby(["Tienda_Cod", "Operacion"], as_index=False)
                 .size()
-                .sort_values(["size", "Tienda_Cod"], ascending=[False, True])
+                .sort_values(["Tienda_Cod", "Operacion"], ascending=[True, True])
             )
             tiendas_opts_df["lbl"] = (
-                "Tienda "
-                + tiendas_opts_df["Tienda_Cod"].astype(str)
+                tiendas_opts_df["Tienda_Cod"].astype(str)
                 + " (CD "
                 + tiendas_opts_df["Operacion"].astype(int).astype(str)
                 + " — "
                 + tiendas_opts_df["size"].astype(str)
-                + " visitas limpias)"
+                + " visitas)"
             )
-            t_c1, t_c2 = st.columns([1.6, 1.1])
-            with t_c1:
+            with t_c2:
                 tienda_sel_lbl = st.selectbox(
-                    "Seleccioná la Tienda a evaluar:",
+                    "Buscar / elegir Tienda (escribí el código):",
                     options=tiendas_opts_df["lbl"].tolist(),
                     index=0,
                     key="s3_tienda_puntual_sel",
                 )
-            with t_c2:
+            with t_c3:
                 eje_tienda_tiempo = st.radio(
-                    "Eje temporal de la tienda:",
+                    "Eje temporal:",
                     options=["Semana", "Mes", "Fecha (Día)"],
                     index=0,
                     horizontal=True,
                     key="s3_eje_tienda_t",
                 )
-            sel_row_t = tiendas_opts_df[tiendas_opts_df["lbl"] == tienda_sel_lbl].iloc[0]
-            t_cod_sel = sel_row_t["Tienda_Cod"]
-            op_cod_sel = sel_row_t["Operacion"]
 
-            df_plot_s3 = df_plot_s3[
-                (df_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_plot_s3["Operacion"] == op_cod_sel)
-            ].copy()
-            df_tot_plot_s3 = df_tot_plot_s3[
-                (df_tot_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_tot_plot_s3["Operacion"] == op_cod_sel)
-            ].copy()
+            if not tiendas_opts_df.empty and tienda_sel_lbl:
+                sel_row_t = tiendas_opts_df[tiendas_opts_df["lbl"] == tienda_sel_lbl].iloc[0]
+                t_cod_sel = sel_row_t["Tienda_Cod"]
+                op_cod_sel = sel_row_t["Operacion"]
+
+                df_plot_s3 = df_plot_s3[
+                    (df_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_plot_s3["Operacion"] == op_cod_sel)
+                ].copy()
+                df_tot_plot_s3 = df_tot_plot_s3[
+                    (df_tot_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_tot_plot_s3["Operacion"] == op_cod_sel)
+                ].copy()
 
             if eje_tienda_tiempo == "Mes":
                 active_dim = "Evol_Mes"
@@ -3376,104 +3397,90 @@ with tab3:
             hi = min(float(s.max()), float(q3 + 1.5 * iqr))
             return lo, hi
 
-        # Hover en español limpio (Mediana, Media, Q1, Q3, Mín/Máx) sin repetir ítems en leyenda
+        # Callouts individuales por punto (q1, q3, media, mediana, big.maximo, big.minimo)
+        # con name="" para que no repita el nombre de la categoría ni el N en cada globito
         if sub_col is None:
-            x_lbls_ordered = []
-            lf_all, q1_all, med_all, q3_all, uf_all, mean_all, custom_all = [], [], [], [], [], [], []
-            for cat_val in cat_order:
+            for idx_c, cat_val in enumerate(cat_order):
                 vals = df_plot_s3[df_plot_s3[active_dim] == cat_val]["Tiempo de Estadia"].dropna()
                 if len(vals) == 0:
                     continue
-                lo_w, hi_w = _tukey_bounds(vals) if bigotes_tukey_s3 else (float(vals.min()), float(vals.max()))
-                q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
-                mean_v = float(vals.mean())
+                box_color = "#1d4ed8" if is_temporal_s3 else palette_box[idx_c % len(palette_box)]
                 x_lbl = f"{cat_val}<br>(n={len(vals):,})" if is_temporal_s3 else f"{cat_val} (n={len(vals):,})"
-                x_lbls_ordered.append(x_lbl)
-                lf_all.append(lo_w)
-                q1_all.append(q1_v)
-                med_all.append(med_v)
-                q3_all.append(q3_v)
-                uf_all.append(hi_w)
-                mean_all.append(mean_v)
-                custom_all.append([cat_val, len(vals), med_v, mean_v, q1_v, q3_v, lo_w, hi_w])
-
-            if x_lbls_ordered:
-                # 1 única traza agrupada -> 1 solo ítem en leyenda sin repeticiones ni "(n=...)" redundante
-                fig_box.add_trace(
-                    go.Box(
-                        x=x_lbls_ordered,
-                        lowerfence=lf_all,
-                        q1=q1_all,
-                        median=med_all,
-                        q3=q3_all,
-                        upperfence=uf_all,
-                        mean=mean_all,
-                        name="Estadía en Tienda (min)",
-                        marker_color="#1d4ed8",
-                        customdata=custom_all,
-                        hoverinfo="none",
+                if bigotes_tukey_s3:
+                    lo_w, hi_w = _tukey_bounds(vals)
+                    q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
+                    fig_box.add_trace(
+                        go.Box(
+                            x=[x_lbl],
+                            lowerfence=[round(lo_w, 1)],
+                            q1=[round(q1_v, 1)],
+                            median=[round(med_v, 1)],
+                            q3=[round(q3_v, 1)],
+                            upperfence=[round(hi_w, 1)],
+                            mean=[round(float(vals.mean()), 1)],
+                            name="",
+                            showlegend=False,
+                            marker_color=box_color,
+                            hovertemplate="%{y:.1f} min<extra></extra>",
+                        )
                     )
-                )
-                # Puntos invisibles para tooltip limpio 100% en español
-                fig_box.add_trace(
-                    go.Scatter(
-                        x=x_lbls_ordered,
-                        y=med_all,
-                        mode="markers",
-                        marker=dict(size=14, opacity=0),
-                        showlegend=False,
-                        customdata=custom_all,
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b> (n=%{customdata[1]:,})<br>"
-                            "Mediana: <b>%{customdata[2]:.0f} min</b><br>"
-                            "Media: <b>%{customdata[3]:.1f} min</b><br>"
-                            "Q1 – Q3: %{customdata[4]:.0f} – %{customdata[5]:.0f} min<br>"
-                            "Bigotes (Mín – Máx): %{customdata[6]:.0f} – %{customdata[7]:.0f} min"
-                            "<extra></extra>"
-                        ),
+                else:
+                    fig_box.add_trace(
+                        go.Box(
+                            x=[x_lbl] * len(vals),
+                            y=vals,
+                            name="",
+                            showlegend=False,
+                            boxmean=True,
+                            boxpoints=False,
+                            marker_color=box_color,
+                            hovertemplate="%{y:.1f} min<extra></extra>",
+                        )
                     )
-                )
             fig_box.update_layout(showlegend=False)
         else:
             sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
             for idx_s, sv in enumerate(sub_vals):
                 sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
-                x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l, cust_l = [], [], [], [], [], [], [], []
-                for cv in cat_order:
-                    v_sub = sub_df[sub_df[active_dim] == cv]["Tiempo de Estadia"].dropna()
-                    if len(v_sub) == 0:
-                        continue
-                    lo_w, hi_w = _tukey_bounds(v_sub) if bigotes_tukey_s3 else (float(v_sub.min()), float(v_sub.max()))
-                    q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
-                    mean_v = float(v_sub.mean())
-                    x_cats.append(cv)
-                    lf_l.append(lo_w)
-                    q1_l.append(q1_v)
-                    med_l.append(med_v)
-                    q3_l.append(q3_v)
-                    uf_l.append(hi_w)
-                    mean_l.append(mean_v)
-                    cust_l.append([cv, sv, len(v_sub), med_v, mean_v, q1_v, q3_v])
-                fig_box.add_trace(
-                    go.Box(
-                        x=x_cats,
-                        lowerfence=lf_l,
-                        q1=q1_l,
-                        median=med_l,
-                        q3=q3_l,
-                        upperfence=uf_l,
-                        mean=mean_l,
-                        name=sv,
-                        marker_color=palette_box[idx_s % len(palette_box)],
-                        customdata=cust_l,
-                        hovertemplate=(
-                            "<b>%{customdata[0]} — %{customdata[1]}</b> (n=%{customdata[2]:,})<br>"
-                            "Mediana: <b>%{customdata[3]:.0f} min</b> | Media: <b>%{customdata[4]:.1f} min</b><br>"
-                            "Q1 – Q3: %{customdata[5]:.0f} – %{customdata[6]:.0f} min"
-                            "<extra></extra>"
-                        ),
+                if bigotes_tukey_s3:
+                    x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
+                    for cv in cat_order:
+                        v_sub = sub_df[sub_df[active_dim] == cv]["Tiempo de Estadia"].dropna()
+                        if len(v_sub) == 0:
+                            continue
+                        lo_w, hi_w = _tukey_bounds(v_sub)
+                        q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
+                        x_cats.append(cv)
+                        lf_l.append(round(lo_w, 1))
+                        q1_l.append(round(q1_v, 1))
+                        med_l.append(round(med_v, 1))
+                        q3_l.append(round(q3_v, 1))
+                        uf_l.append(round(hi_w, 1))
+                        mean_l.append(round(float(v_sub.mean()), 1))
+                    fig_box.add_trace(
+                        go.Box(
+                            x=x_cats,
+                            lowerfence=lf_l,
+                            q1=q1_l,
+                            median=med_l,
+                            q3=q3_l,
+                            upperfence=uf_l,
+                            mean=mean_l,
+                            name=sv,
+                            marker_color=palette_box[idx_s % len(palette_box)],
+                        )
                     )
-                )
+                else:
+                    fig_box.add_trace(
+                        go.Box(
+                            x=sub_df[active_dim],
+                            y=sub_df["Tiempo de Estadia"],
+                            name=sv,
+                            boxmean=True,
+                            boxpoints=False,
+                            marker_color=palette_box[idx_s % len(palette_box)],
+                        )
+                    )
             fig_box.update_layout(
                 boxmode="group",
                 xaxis=dict(categoryorder="array", categoryarray=cat_order),
@@ -3486,7 +3493,7 @@ with tab3:
             yaxis_title="Tiempo de Estadía en Tienda (minutos)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(tickangle=-35 if len(cat_order) > 12 else 0),
-            hovermode="x unified" if sub_col is None else "closest",
+            hovermode="closest",
         )
         st.plotly_chart(fig_box, use_container_width=True)
 
@@ -3617,10 +3624,23 @@ with tab3:
     st.markdown("### 3. Ranking de Tiendas: Mayor Demora vs. Menor Estadía (vs. Mediana del Segmento)")
     st.caption(
         "Compara la **Mediana de Estadía** de cada tienda contra la **Mediana del Segmento** (`Tipo de Viaje` + `Categoría`), "
-        "mostrando cuántas tiendas y paradas limpias componen esa referencia, además de sus **Visitas Totales** vs. **Visitas Limpias**."
+        "mostrando el segmento exacto contra el que se compara y las **Visitas Totales** vs. **Visitas Limpias**."
     )
 
-    rk_c1, rk_c2, rk_c3, rk_c4 = st.columns([1.0, 1.0, 1.15, 1.05])
+    cds_rk_opts = ["Todos"] + (
+        sorted(st_clean_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+        if not st_clean_s3.empty
+        else []
+    )
+
+    rk_c0, rk_c1, rk_c2, rk_c3, rk_c4 = st.columns([0.85, 0.85, 0.95, 1.25, 1.0])
+    with rk_c0:
+        filtro_cd_rk = st.selectbox(
+            "Filtrar por CD:",
+            options=cds_rk_opts,
+            index=0,
+            key="s3_cd_rk",
+        )
     with rk_c1:
         top_n_rk = st.selectbox(
             "Cantidad Top:",
@@ -3630,7 +3650,7 @@ with tab3:
         )
     with rk_c2:
         min_vis_rk = st.number_input(
-            "Mínimo visitas limpias:",
+            "Mín. visitas limpias:",
             min_value=1,
             max_value=100,
             value=5,
@@ -3668,6 +3688,7 @@ with tab3:
         dq_stores_filt,
         st_clean_s3,
         int(min_vis_rk),
+        filtro_cd_rk,
         filtro_tv_rk,
         filtro_cat_rk,
     )
@@ -3686,11 +3707,15 @@ with tab3:
             metric_lbl = "Demora Extra vs. Segmento (min)"
 
         valid_metric_df = df_rk_tiendas.dropna(subset=[metric_col]).copy()
+        valid_metric_df["Seg_Corto"] = (
+            valid_metric_df["Tipo Viaje Ppal."].str.split(" ").str[0]
+            + " · "
+            + valid_metric_df["Categoría"]
+        )
         valid_metric_df["Tienda_Label"] = (
-            "Tienda " + valid_metric_df["Tienda"] + " (CD " + valid_metric_df["CD"] + ")"
+            "T." + valid_metric_df["Tienda"] + " (CD " + valid_metric_df["CD"] + " | " + valid_metric_df["Seg_Corto"] + ")"
         )
 
-        # Dos gráficos lado a lado: Top Mayor Demora (críticas) y Top Menor Estadía (más rápidas)
         col_top_hi, col_top_lo = st.columns(2)
 
         with col_top_hi:
@@ -3714,6 +3739,7 @@ with tab3:
                         (
                             top_hi["Mediana Est. (min)"],
                             top_hi["Mediana del Segmento (min)"],
+                            top_hi["Tipo Viaje Ppal."] + " — " + top_hi["Categoría"],
                             top_hi["Base Segmento (Tiendas / Paradas)"],
                             top_hi["Visitas Limpias"],
                             top_hi["Visitas Totales"],
@@ -3722,9 +3748,10 @@ with tab3:
                     )[0],
                     hovertemplate=(
                         "<b>%{y}</b><br>"
+                        "Segmento: <b>%{customdata[2]}</b><br>"
                         "Mediana Tienda: <b>%{customdata[0]:.0f} min</b> | Mediana Segmento: <b>%{customdata[1]:.0f} min</b><br>"
-                        "Referencia formada por: %{customdata[2]}<br>"
-                        "Visitas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales | Mediana: %{customdata[5]:,.0f} bultos"
+                        "Base Segmento: %{customdata[3]}<br>"
+                        "Visitas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales | Mediana: %{customdata[6]:,.0f} bultos"
                         "<extra></extra>"
                     ),
                 )
@@ -3736,13 +3763,12 @@ with tab3:
                 margin=dict(l=10, r=55, t=40, b=20),
                 xaxis_title=metric_lbl,
                 yaxis_title="",
-                xaxis=dict(range=[min(0.0, float(top_hi[metric_col].min())), max_hi * 1.22]),
+                xaxis=dict(range=[min(0.0, float(top_hi[metric_col].min())), max_hi * 1.24]),
             )
             st.plotly_chart(fig_hi, use_container_width=True)
 
         with col_top_lo:
             top_lo = valid_metric_df.tail(int(top_n_rk)).copy()
-            # Ordenar de la más rápida (arriba) hacia arriba
             top_lo = top_lo.sort_values(metric_col, ascending=False)
             colors_lo = [
                 "#16a34a" if v <= 0 else ("#3b82f6" if v < 15 else "#f59e0b")
@@ -3763,6 +3789,7 @@ with tab3:
                         (
                             top_lo["Mediana Est. (min)"],
                             top_lo["Mediana del Segmento (min)"],
+                            top_lo["Tipo Viaje Ppal."] + " — " + top_lo["Categoría"],
                             top_lo["Base Segmento (Tiendas / Paradas)"],
                             top_lo["Visitas Limpias"],
                             top_lo["Visitas Totales"],
@@ -3771,9 +3798,10 @@ with tab3:
                     )[0],
                     hovertemplate=(
                         "<b>%{y}</b><br>"
+                        "Segmento: <b>%{customdata[2]}</b><br>"
                         "Mediana Tienda: <b>%{customdata[0]:.0f} min</b> | Mediana Segmento: <b>%{customdata[1]:.0f} min</b><br>"
-                        "Referencia formada por: %{customdata[2]}<br>"
-                        "Visitas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales | Mediana: %{customdata[5]:,.0f} bultos"
+                        "Base Segmento: %{customdata[3]}<br>"
+                        "Visitas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales | Mediana: %{customdata[6]:,.0f} bultos"
                         "<extra></extra>"
                     ),
                 )
@@ -3786,7 +3814,7 @@ with tab3:
                 margin=dict(l=10, r=55, t=40, b=20),
                 xaxis_title=metric_lbl,
                 yaxis_title="",
-                xaxis=dict(range=[min_lo * 1.24 if min_lo < 0 else 0.0, max(10.0, max_lo * 1.22)]),
+                xaxis=dict(range=[min_lo * 1.26 if min_lo < 0 else 0.0, max(10.0, max_lo * 1.24)]),
             )
             st.plotly_chart(fig_lo, use_container_width=True)
 
