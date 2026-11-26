@@ -833,6 +833,172 @@ def build_viajes_jornadas_excel(df_v_res, df_j_res, df_v_clean, df_j_clean, df_j
     return output.getvalue()
 
 
+
+@st.cache_data(show_spinner=False)
+def _clean_estadias_cached(
+    df_in: pd.DataFrame,
+    min_est_directo: int,
+    min_est_comp: int,
+    min_est_rutas: int,
+    min_min100b_phys: float,
+    max_est_cerc: int,
+    max_est_lej: int,
+    excl_solape_s3: bool,
+):
+    st_all_vis = df_in[df_in["visita_efectiva"]].copy()
+    if st_all_vis.empty:
+        return st_all_vis, {"corta": 0, "phys": 0, "larga": 0, "solape": 0, "tot": 0}
+
+    min_est_vec_s3 = np.select(
+        [
+            st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)",
+            st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)",
+        ],
+        [float(min_est_directo), float(min_est_comp)],
+        default=float(min_est_rutas),
+    )
+
+    is_lej_s3 = st_all_vis["Categoria"] == "Lejana"
+    max_est_vec_s3 = np.select(
+        [
+            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & is_lej_s3,
+            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & is_lej_s3,
+            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & (~is_lej_s3),
+            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & is_lej_s3,
+        ],
+        [
+            float(max_est_cerc),
+            float(max_est_lej),
+            round(float(max_est_cerc) * 0.75, 0),
+            round(float(max_est_lej) * 0.8333, 0),
+            round(float(max_est_cerc) * 0.625, 0),
+            round(float(max_est_lej) * 0.6667, 0),
+        ],
+        default=float(max_est_cerc),
+    )
+
+    bultos_s3 = st_all_vis["Total Bultos_num"].fillna(0)
+    min_100b_raw = np.where(
+        bultos_s3 > 0,
+        st_all_vis["Tiempo de Estadia"] / (bultos_s3 / 100.0),
+        np.nan,
+    )
+    r_phys_s3 = (bultos_s3 >= 50) & (min_100b_raw < float(min_min100b_phys))
+    r_corta_s3 = st_all_vis["Tiempo de Estadia"].isna() | (st_all_vis["Tiempo de Estadia"] < min_est_vec_s3)
+    r_larga_s3 = st_all_vis["Tiempo de Estadia"] > max_est_vec_s3
+    r_solape_s3 = (
+        (
+            st_all_vis["dt_ini_real"].notna()
+            & st_all_vis["prev_dt_fin_real"].notna()
+            & (st_all_vis["dt_ini_real"] < st_all_vis["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+        )
+        if excl_solape_s3
+        else pd.Series(False, index=st_all_vis.index)
+    )
+
+    st_clean = st_all_vis[(~r_corta_s3) & (~r_larga_s3) & (~r_phys_s3) & (~r_solape_s3)].copy()
+    st_clean["Orden_Parada_Grupo"] = np.select(
+        [
+            st_clean["Orden Visita Tienda"] == 1,
+            st_clean["Orden Visita Tienda"] == 2,
+            st_clean["Orden Visita Tienda"] == 3,
+            st_clean["Orden Visita Tienda"] >= 4,
+        ],
+        ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"],
+        default="Sin orden",
+    )
+    stats = {
+        "tot": int(len(st_all_vis)),
+        "corta": int(r_corta_s3.sum()),
+        "phys": int(r_phys_s3.sum()),
+        "larga": int(r_larga_s3.sum()),
+        "solape": int(r_solape_s3.sum()),
+    }
+    return st_clean, stats
+
+
+@st.cache_data(show_spinner=False)
+def _rank_tiendas_s3_cached(
+    st_clean_s3: pd.DataFrame,
+    min_vis_rk: int,
+    filtro_tv_rk: str,
+    filtro_cat_rk: str,
+) -> pd.DataFrame:
+    cols_out = [
+        "CD",
+        "Tienda",
+        "Tipo Viaje Ppal.",
+        "Categoría",
+        "Visitas Limpias",
+        "Mediana Bultos",
+        "Mediana Est. (min)",
+        "P90 Est. (min)",
+        "Bench Segmento",
+        "Desvío vs Bench",
+        "Min / 100 Bultos",
+    ]
+    if st_clean_s3.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    bench_df = (
+        st_clean_s3.groupby(["Tipo_Viaje", "Categoria"], as_index=False)["Tiempo de Estadia"]
+        .median()
+        .rename(columns={"Tiempo de Estadia": "Mediana_Bench"})
+    )
+
+    rk_base = st_clean_s3.copy()
+    if filtro_tv_rk != "Todos":
+        rk_base = rk_base[rk_base["Tipo_Viaje"] == filtro_tv_rk]
+    if filtro_cat_rk != "Todas":
+        rk_base = rk_base[rk_base["Categoria"] == filtro_cat_rk]
+    if rk_base.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    rk_base = rk_base.merge(bench_df, on=["Tipo_Viaje", "Categoria"], how="left")
+
+    # Vectorized aggregation instead of slow Python for-loop over 800+ stores
+    g_cnt = rk_base.groupby(["Operacion", "Tienda_Cod"]).size()
+    valid_pairs = g_cnt[g_cnt >= min_vis_rk].index
+    if len(valid_pairs) == 0:
+        return pd.DataFrame(columns=cols_out)
+
+    rk_sub = rk_base.set_index(["Operacion", "Tienda_Cod"]).loc[valid_pairs].reset_index()
+
+    agg_main = rk_sub.groupby(["Operacion", "Tienda_Cod"], as_index=False).agg(
+        Visitas_Limpias=("Tiempo de Estadia", "count"),
+        Mediana_Bultos=("Total Bultos_num", "median"),
+        Mediana_Est=("Tiempo de Estadia", "median"),
+        P90_Est=("Tiempo de Estadia", lambda s: float(np.percentile(s.dropna(), 90))),
+        Bench_Seg=("Mediana_Bench", "mean"),
+        Tipo_Viaje_Ppal=("Tipo_Viaje", lambda s: s.value_counts().index[0]),
+        Categoria_Ppal=("Categoria", lambda s: s.value_counts().index[0]),
+    )
+
+    prod_sub = rk_sub[rk_sub["Total Bultos_num"].fillna(0) >= 20].copy()
+    if not prod_sub.empty:
+        prod_sub["_m100"] = prod_sub["Tiempo de Estadia"] / (prod_sub["Total Bultos_num"] / 100.0)
+        m100_agg = prod_sub.groupby(["Operacion", "Tienda_Cod"], as_index=False)["_m100"].median()
+        agg_main = agg_main.merge(m100_agg, on=["Operacion", "Tienda_Cod"], how="left")
+    else:
+        agg_main["_m100"] = np.nan
+
+    agg_main["CD"] = agg_main["Operacion"].astype(int).astype(str)
+    agg_main["Tienda"] = agg_main["Tienda_Cod"].astype(str)
+    agg_main["Tipo Viaje Ppal."] = agg_main["Tipo_Viaje_Ppal"]
+    agg_main["Categoría"] = agg_main["Categoria_Ppal"]
+    agg_main["Visitas Limpias"] = agg_main["Visitas_Limpias"].astype(int)
+    agg_main["Mediana Bultos"] = agg_main["Mediana_Bultos"].round(0)
+    agg_main["Mediana Est. (min)"] = agg_main["Mediana_Est"].round(0)
+    agg_main["P90 Est. (min)"] = agg_main["P90_Est"].round(0)
+    agg_main["Bench Segmento"] = agg_main["Bench_Seg"].round(1)
+    agg_main["Desvío vs Bench"] = (agg_main["Mediana_Est"] - agg_main["Bench_Seg"]).round(1)
+    agg_main["Min / 100 Bultos"] = agg_main["_m100"].round(1)
+
+    return agg_main[cols_out].sort_values("Desvío vs Bench", ascending=False).reset_index(drop=True)
+
+
 # -----------------------------------------------------------------------------
 # CARGA AUTOMATICA DE DATOS (SILENCIOSA PARA PRIORIZAR FILTROS EN SIDEBAR)
 # -----------------------------------------------------------------------------
@@ -2781,162 +2947,106 @@ with tab2:
         st.dataframe(int_cd_summary, use_container_width=True, hide_index=True)
 
 # =============================================================================
-# SOLAPA 3: ESTADIAS Y PRODUCTIVIDAD EN TIENDA (LIMPIEZA PROPIA + BOXPLOTS)
+# SOLAPA 3: ESTADIAS Y PRODUCTIVIDAD EN TIENDA (LIMPIEZA PROPIA + EVOLUCION + TOP)
 # =============================================================================
 with tab3:
     st.subheader("Estadías y Productividad de Descarga en Tienda")
     st.caption(
         "Muestra independiente sobre todas las paradas en tienda con visita GPS efectiva "
-        "(no descarta paradas si faltó estadía en el CD o en otra parada del viaje)."
+        "(no descarta paradas si faltó estadía en el CD o en otra parada del viaje). "
+        "Filtrable por Período en el menú lateral y con apertura temporal interna."
     )
 
-    with st.expander("🎛️ Parámetros de Integridad Estadística de Estadías (Ajustables)", expanded=True):
-        sc1, sc2, sc3, sc4 = st.columns(4)
-        with sc1:
-            min_est_directo = st.number_input(
-                "Piso mín. Directo (1 tienda):",
-                min_value=5,
-                max_value=60,
-                value=15,
-                step=5,
-                help="Un viaje exclusivo (mediana 670 bultos) no puede durar <15 min (default: 15 min).",
-                key="s3_min_dir",
-            )
-            min_est_comp = st.number_input(
-                "Piso mín. Compartido (2 tiendas):",
-                min_value=5,
-                max_value=45,
-                value=10,
-                step=1,
-                help="Piso mínimo para viajes de 2 tiendas (default: 10 min).",
-                key="s3_min_comp",
-            )
-        with sc2:
-            min_est_rutas = st.number_input(
-                "Piso mín. Rutas (3+ tiendas):",
-                min_value=1,
-                max_value=30,
-                value=5,
-                step=1,
-                help="Piso mínimo para repartos capilares de 3+ tiendas (default: 5 min).",
-                key="s3_min_rutas",
-            )
-            min_min100b_phys = st.number_input(
-                "Ritmo físico mín. (min/100 bultos):",
-                min_value=0.0,
-                max_value=10.0,
-                value=3.0,
-                step=0.5,
-                help="En cargas >=50 bultos, <3,0 min/100b (>2.000 bultos/h) indica descarga fuera del polígono o paso de largo.",
-                key="s3_min_phys",
-            )
-        with sc3:
-            max_est_cerc = st.number_input(
-                "Techo máx. Directo Cercana (min):",
-                min_value=120,
-                max_value=720,
-                value=240,
-                step=30,
-                help="Compartido aplica 75% de este techo (180m) y Rutas aplica 62,5% (150m).",
-                key="s3_max_cerc",
-            )
-            max_est_lej = st.number_input(
-                "Techo máx. Directo Lejana (min):",
-                min_value=180,
-                max_value=960,
-                value=360,
-                step=30,
-                help="Compartido Lejana aplica 300m y Rutas Lejana aplica 240m.",
-                key="s3_max_lej",
-            )
-        with sc4:
-            st.write("")
-            excl_solape_s3 = st.checkbox(
-                "Excluir solapamiento horario",
-                value=True,
-                help="Descarta paradas cuya hora de entrada ocurre antes de salir de la parada anterior.",
-                key="s3_excl_solape",
-            )
-            bigotes_tukey_s3 = st.checkbox(
-                "Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)",
-                value=True,
-                help="Evita que 1 caso extremo estire la línea del bigote hasta el techo; desmarcalo para ver Mín–Máx completo.",
-                key="s3_tukey",
-            )
+    with st.expander("🎛️ Parámetros de Integridad Estadística de Estadías (Ajustables)", expanded=False):
+        with st.form("form_params_s3", border=False):
+            sc1, sc2, sc3, sc4 = st.columns(4)
+            with sc1:
+                min_est_directo = st.number_input(
+                    "Piso mín. Directo (1 tienda):",
+                    min_value=5,
+                    max_value=60,
+                    value=15,
+                    step=5,
+                    help="Un viaje exclusivo (mediana 670 bultos) no puede durar <15 min (default: 15 min).",
+                    key="s3_min_dir",
+                )
+                min_est_comp = st.number_input(
+                    "Piso mín. Compartido (2 tiendas):",
+                    min_value=5,
+                    max_value=45,
+                    value=10,
+                    step=1,
+                    help="Piso mínimo para viajes de 2 tiendas (default: 10 min).",
+                    key="s3_min_comp",
+                )
+            with sc2:
+                min_est_rutas = st.number_input(
+                    "Piso mín. Rutas (3+ tiendas):",
+                    min_value=1,
+                    max_value=30,
+                    value=5,
+                    step=1,
+                    help="Piso mínimo para repartos capilares de 3+ tiendas (default: 5 min).",
+                    key="s3_min_rutas",
+                )
+                min_min100b_phys = st.number_input(
+                    "Ritmo físico mín. (min/100 bultos):",
+                    min_value=0.0,
+                    max_value=10.0,
+                    value=3.0,
+                    step=0.5,
+                    help="En cargas >=50 bultos, <3,0 min/100b (>2.000 bultos/h) indica descarga fuera del polígono o paso de largo.",
+                    key="s3_min_phys",
+                )
+            with sc3:
+                max_est_cerc = st.number_input(
+                    "Techo máx. Directo Cercana (min):",
+                    min_value=120,
+                    max_value=720,
+                    value=240,
+                    step=30,
+                    help="Compartido aplica 75% de este techo (180m) y Rutas aplica 62,5% (150m).",
+                    key="s3_max_cerc",
+                )
+                max_est_lej = st.number_input(
+                    "Techo máx. Directo Lejana (min):",
+                    min_value=180,
+                    max_value=960,
+                    value=360,
+                    step=30,
+                    help="Compartido Lejana aplica 300m y Rutas Lejana aplica 240m.",
+                    key="s3_max_lej",
+                )
+            with sc4:
+                st.write("")
+                excl_solape_s3 = st.checkbox(
+                    "Excluir solapamiento horario",
+                    value=True,
+                    help="Descarta paradas cuya hora de entrada ocurre antes de salir de la parada anterior.",
+                    key="s3_excl_solape",
+                )
+                bigotes_tukey_s3 = st.checkbox(
+                    "Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)",
+                    value=True,
+                    help="Evita que 1 caso extremo estire la línea del bigote hasta el techo; desmarcalo para ver Mín–Máx completo.",
+                    key="s3_tukey",
+                )
+            st.form_submit_button("✅ Aplicar parámetros de limpieza")
 
-    # Construccion de la Base Limpia de Estadias en Tienda con 4 reglas de integridad
-    st_all_vis = dq_stores_filt[dq_stores_filt["visita_efectiva"]].copy()
-
-    # 1. Piso minimo diferenciado por Tipo de Viaje
-    min_est_vec_s3 = np.select(
-        [
-            st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)",
-            st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)",
-        ],
-        [float(min_est_directo), float(min_est_comp)],
-        default=float(min_est_rutas),
-    )
-
-    # 2. Techo maximo diferenciado por Tipo de Viaje y Categoria (evita relojes abiertos en rutas chicas)
-    is_lej_s3 = st_all_vis["Categoria"] == "Lejana"
-    max_est_vec_s3 = np.select(
-        [
-            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & (~is_lej_s3),
-            (st_all_vis["Tipo_Viaje"] == "Directo (1 tienda)") & is_lej_s3,
-            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & (~is_lej_s3),
-            (st_all_vis["Tipo_Viaje"] == "Compartido (2 tiendas)") & is_lej_s3,
-            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & (~is_lej_s3),
-            (st_all_vis["Tipo_Viaje"] == "Rutas (3+ tiendas)") & is_lej_s3,
-        ],
-        [
-            float(max_est_cerc),
-            float(max_est_lej),
-            round(float(max_est_cerc) * 0.75, 0),
-            round(float(max_est_lej) * 0.8333, 0),
-            round(float(max_est_cerc) * 0.625, 0),
-            round(float(max_est_lej) * 0.6667, 0),
-        ],
-        default=float(max_est_cerc),
-    )
-
-    # 3. Consistencia fisica Bultos vs Tiempo (descarga imposible / fuera de geozona)
-    bultos_s3 = st_all_vis["Total Bultos_num"].fillna(0)
-    min_100b_raw = np.where(
-        bultos_s3 > 0,
-        st_all_vis["Tiempo de Estadia"] / (bultos_s3 / 100.0),
-        np.nan,
-    )
-    r_phys_s3 = (bultos_s3 >= 50) & (min_100b_raw < float(min_min100b_phys))
-
-    # 4. Piso, Techo y Solape Horario
-    r_corta_s3 = st_all_vis["Tiempo de Estadia"].isna() | (st_all_vis["Tiempo de Estadia"] < min_est_vec_s3)
-    r_larga_s3 = st_all_vis["Tiempo de Estadia"] > max_est_vec_s3
-    r_solape_s3 = (
-        (
-            st_all_vis["dt_ini_real"].notna()
-            & st_all_vis["prev_dt_fin_real"].notna()
-            & (st_all_vis["dt_ini_real"] < st_all_vis["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
-        )
-        if excl_solape_s3
-        else pd.Series(False, index=st_all_vis.index)
-    )
-
-    st_clean_s3 = st_all_vis[(~r_corta_s3) & (~r_larga_s3) & (~r_phys_s3) & (~r_solape_s3)].copy()
-
-    # Etiquetas de orden de parada en ruta
-    st_clean_s3["Orden_Parada_Grupo"] = np.select(
-        [
-            st_clean_s3["Orden Visita Tienda"] == 1,
-            st_clean_s3["Orden Visita Tienda"] == 2,
-            st_clean_s3["Orden Visita Tienda"] == 3,
-            st_clean_s3["Orden Visita Tienda"] >= 4,
-        ],
-        ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"],
-        default="Sin orden",
+    # Construccion cacheada de la Base Limpia de Estadias en Tienda
+    st_clean_s3, clean_stats_s3 = _clean_estadias_cached(
+        dq_stores_filt,
+        int(min_est_directo),
+        int(min_est_comp),
+        int(min_est_rutas),
+        float(min_min100b_phys),
+        int(max_est_cerc),
+        int(max_est_lej),
+        bool(excl_solape_s3),
     )
 
     # KPIs de Limpieza + Estadía + Productividad + Fases de Puerta
-    tot_vis_s3 = len(st_all_vis)
+    tot_vis_s3 = clean_stats_s3["tot"]
     ok_vis_s3 = len(st_clean_s3)
     excl_vis_s3 = tot_vis_s3 - ok_vis_s3
     pct_ret_s3 = (ok_vis_s3 / tot_vis_s3 * 100) if tot_vis_s3 > 0 else 0.0
@@ -2948,14 +3058,16 @@ with tab3:
     p90_est_s3 = float(np.percentile(est_series, 90)) if len(est_series) > 0 else 0.0
 
     # Productividad por Bultos (paradas con >= 20 bultos para evitar distorsiones de 1-2 bultos)
-    prod_s3 = st_clean_s3[st_clean_s3["Total Bultos_num"].fillna(0) >= 20].copy()
-    prod_s3["Min_100_Bultos"] = prod_s3["Tiempo de Estadia"] / (prod_s3["Total Bultos_num"] / 100.0)
-    med_min_100b = float(prod_s3["Min_100_Bultos"].median()) if len(prod_s3) > 0 else 0.0
+    prod_s3 = st_clean_s3[st_clean_s3["Total Bultos_num"].fillna(0) >= 20]
+    if not prod_s3.empty:
+        med_min_100b = float((prod_s3["Tiempo de Estadia"] / (prod_s3["Total Bultos_num"] / 100.0)).median())
+    else:
+        med_min_100b = 0.0
     med_bultos_s3 = float(st_clean_s3["Total Bultos_num"].median()) if ok_vis_s3 > 0 else 0.0
     bultos_hora_s3 = (6000.0 / med_min_100b) if med_min_100b > 0 else 0.0
 
     # Sensor de puerta trasera (pre-conectado para cuando UNIGIS active el dato)
-    puerta_activa_cnt = int((st_clean_s3["Minutos Apertura y Cierre_num"].fillna(0) > 0).sum())
+    puerta_activa_cnt = int((st_clean_s3["Minutos Apertura y Cierre_num"].fillna(0) > 0).sum()) if ok_vis_s3 > 0 else 0
 
     k3_1, k3_2, k3_3, k3_4 = st.columns([1.25, 1.20, 1.20, 1.15])
     with k3_1:
@@ -2965,7 +3077,7 @@ with tab3:
                 _fmt_int(ok_vis_s3),
                 f"{_fmt_pct(pct_ret_s3)} de {_fmt_int(tot_vis_s3)} visitas OK ({_fmt_int(excl_vis_s3)} excl.)",
                 "#16a34a" if pct_ret_s3 >= 90 else "#d97706",
-                f"Piso: <b>{int(r_corta_s3.sum())}</b> | Físico bultos: <b>{int(r_phys_s3.sum())}</b> | Techo: <b>{int(r_larga_s3.sum())}</b> | Solape: <b>{int(r_solape_s3.sum())}</b>",
+                f"Piso: <b>{clean_stats_s3['corta']}</b> | Físico bultos: <b>{clean_stats_s3['phys']}</b> | Techo: <b>{clean_stats_s3['larga']}</b> | Solape: <b>{clean_stats_s3['solape']}</b>",
             ),
             unsafe_allow_html=True,
         )
@@ -3021,12 +3133,15 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: DIAGRAMAS DE CAJAS (BOXPLOTS) Y PERCENTILES POR SEGMENTO
+    # BLOQUE 1: DIAGRAMAS DE CAJAS (POR SEGMENTO O EVOLUCION TEMPORAL)
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Distribución de Estadías (Diagrama de Cajas y Percentiles)")
+    st.markdown("### 1. Distribución y Evolución Temporal de Estadías (Diagrama de Cajas)")
 
     dim_map_s3 = {
         "Tipo de Viaje (Directo / Compartido / Rutas)": "Tipo_Viaje",
+        "Evolución por Mes": "Evol_Mes",
+        "Evolución por Semana": "Evol_Semana",
+        "Evolución por Fecha (Día)": "Evol_Dia",
         "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
         "Operación (CD)": "Operacion",
         "Categoría (Cercana vs. Lejana)": "Categoria",
@@ -3037,12 +3152,13 @@ with tab3:
         "Categoría (Cercana vs. Lejana)": "Categoria",
         "Tipo de Viaje": "Tipo_Viaje",
         "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
+        "Operación (CD)": "Operacion",
     }
 
-    bx_c1, bx_c2 = st.columns([1.3, 1.2])
+    bx_c1, bx_c2 = st.columns([1.35, 1.15])
     with bx_c1:
         dim_label_s3 = st.selectbox(
-            "Agrupar eje principal por:",
+            "Agrupar eje principal por (segmento o período):",
             options=list(dim_map_s3.keys()),
             index=0,
             key="s3_dim_sel",
@@ -3060,29 +3176,86 @@ with tab3:
     if sub_col == dim_col:
         sub_col = None
 
+    df_seg_summary = pd.DataFrame()
     if st_clean_s3.empty:
         st.info("No hay paradas limpias en el rango y filtros seleccionados.")
     else:
         df_plot_s3 = st_clean_s3.copy()
-        if dim_col == "Operacion":
-            df_plot_s3[dim_col] = "CD " + df_plot_s3[dim_col].astype(str)
-        else:
-            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
+        is_temporal_s3 = dim_col in {"Evol_Mes", "Evol_Semana", "Evol_Dia"}
 
-        # Ordenar categorias por mediana descendente (excepto Orden de Parada o Tipo de Viaje)
-        if dim_col == "Tipo_Viaje":
+        # Drill-down por semana cuando el usuario selecciona Evolucion por Fecha (Dia)
+        if dim_col == "Evol_Dia":
+            sems_s3_disp = (
+                df_plot_s3[["Semana_Sort", "Semana_Label"]]
+                .drop_duplicates()
+                .sort_values("Semana_Sort")["Semana_Label"]
+                .tolist()
+            )
+            def_sems_s3 = sems_s3_disp[-2:] if len(sems_s3_disp) >= 2 else sems_s3_disp
+            sems_s3_sel = st.multiselect(
+                "Drill-down — Seleccioná semana(s) para abrir las cajas por día (por defecto últimas 2):",
+                options=sems_s3_disp,
+                default=def_sems_s3,
+                placeholder="Todas las semanas",
+                key="s3_sems_dia_sel",
+            )
+            if sems_s3_sel:
+                df_plot_s3 = df_plot_s3[df_plot_s3["Semana_Label"].isin(sems_s3_sel)].copy()
+
+        if dim_col == "Evol_Mes":
+            df_plot_s3["_p_sort"] = df_plot_s3["Fecha_Reparto"].dt.to_period("M").apply(lambda p: p.start_time)
+            df_plot_s3[dim_col] = df_plot_s3["_p_sort"].dt.strftime("%Y-%m")
+            cat_order = (
+                df_plot_s3[["_p_sort", dim_col]]
+                .drop_duplicates()
+                .sort_values("_p_sort")[dim_col]
+                .tolist()
+            )
+        elif dim_col == "Evol_Semana":
+            df_plot_s3[dim_col] = df_plot_s3["Semana_Label"]
+            cat_order = (
+                df_plot_s3[["Semana_Sort", dim_col]]
+                .drop_duplicates()
+                .sort_values("Semana_Sort")[dim_col]
+                .tolist()
+            )
+        elif dim_col == "Evol_Dia":
+            df_plot_s3["_p_sort"] = df_plot_s3["Fecha_Reparto"].dt.floor("D")
+            df_plot_s3[dim_col] = (
+                df_plot_s3["_p_sort"].dt.dayofweek.map(dias_es)
+                + " "
+                + df_plot_s3["_p_sort"].dt.strftime("%d/%m")
+            )
+            cat_order = (
+                df_plot_s3[["_p_sort", dim_col]]
+                .drop_duplicates()
+                .sort_values("_p_sort")[dim_col]
+                .tolist()
+            )
+        elif dim_col == "Operacion":
+            df_plot_s3[dim_col] = "CD " + df_plot_s3[dim_col].astype(str)
+            cat_order = (
+                df_plot_s3.groupby(dim_col)["Tiempo de Estadia"]
+                .median()
+                .sort_values(ascending=False)
+                .index.tolist()
+            )
+        elif dim_col == "Tipo_Viaje":
+            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
             cat_order = [
                 c
                 for c in ["Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"]
                 if c in df_plot_s3[dim_col].unique()
             ]
         elif dim_col == "Orden_Parada_Grupo":
+            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
             cat_order = [
                 c
                 for c in ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"]
                 if c in df_plot_s3[dim_col].unique()
             ]
         else:
+            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
             cat_order = (
                 df_plot_s3.groupby(dim_col)["Tiempo de Estadia"]
                 .median()
@@ -3105,12 +3278,14 @@ with tab3:
                 vals = df_plot_s3[df_plot_s3[dim_col] == cat_val]["Tiempo de Estadia"].dropna()
                 if len(vals) == 0:
                     continue
+                box_color = "#1d4ed8" if is_temporal_s3 else palette_box[idx_c % len(palette_box)]
+                x_lbl = f"{cat_val}<br>(n={len(vals):,})" if is_temporal_s3 else f"{cat_val} (n={len(vals):,})"
                 if bigotes_tukey_s3:
                     lo_w, hi_w = _tukey_bounds(vals)
                     q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
                     fig_box.add_trace(
                         go.Box(
-                            x=[f"{cat_val} (n={len(vals):,})"],
+                            x=[x_lbl],
                             lowerfence=[lo_w],
                             q1=[q1_v],
                             median=[med_v],
@@ -3118,7 +3293,7 @@ with tab3:
                             upperfence=[hi_w],
                             mean=[float(vals.mean())],
                             name=f"{cat_val} (n={len(vals):,})",
-                            marker_color=palette_box[idx_c % len(palette_box)],
+                            marker_color=box_color,
                         )
                     )
                 else:
@@ -3128,11 +3303,16 @@ with tab3:
                             name=f"{cat_val} (n={len(vals):,})",
                             boxmean=True,
                             boxpoints=False,
-                            marker_color=palette_box[idx_c % len(palette_box)],
+                            marker_color=box_color,
                         )
                     )
+            if is_temporal_s3:
+                fig_box.update_layout(showlegend=False)
         else:
-            df_plot_s3[sub_col] = df_plot_s3[sub_col].fillna("Sin dato").astype(str)
+            if sub_col == "Operacion":
+                df_plot_s3[sub_col] = "CD " + df_plot_s3[sub_col].astype(str)
+            else:
+                df_plot_s3[sub_col] = df_plot_s3[sub_col].fillna("Sin dato").astype(str)
             sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
             for idx_s, sv in enumerate(sub_vals):
                 sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
@@ -3175,19 +3355,34 @@ with tab3:
                             marker_color=palette_box[idx_s % len(palette_box)],
                         )
                     )
-            fig_box.update_layout(boxmode="group", xaxis=dict(categoryorder="array", categoryarray=cat_order))
+            fig_box.update_layout(
+                boxmode="group",
+                xaxis=dict(categoryorder="array", categoryarray=cat_order),
+                showlegend=True,
+            )
 
         fig_box.update_layout(
             height=410,
             margin=dict(l=20, r=20, t=30, b=20),
             yaxis_title="Tiempo de Estadía en Tienda (minutos)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            showlegend=True,
+            xaxis=dict(tickangle=-35 if len(cat_order) > 12 else 0),
         )
         st.plotly_chart(fig_box, use_container_width=True)
 
-        # Tabla resumen estadistico del segmento elegido
+        # Tabla resumen estadistico del segmento o periodo elegido
         grp_cols = [dim_col] if sub_col is None else [dim_col, sub_col]
+        nice_dim_name = {
+            "Evol_Mes": "Mes",
+            "Evol_Semana": "Semana",
+            "Evol_Dia": "Fecha",
+            "Tipo_Viaje": "Tipo de Viaje",
+            "Tipo_Vehiculo": "Tipo de Vehículo",
+            "Operacion": "Operación",
+            "Categoria": "Categoría",
+            "Orden_Parada_Grupo": "Orden Parada",
+        }.get(dim_col, dim_col)
+
         seg_rows = []
         for keys, grp in df_plot_s3.groupby(grp_cols):
             if not isinstance(keys, tuple):
@@ -3199,7 +3394,9 @@ with tab3:
                 if len(g_prod) > 0
                 else np.nan
             )
-            row_dict = {grp_cols[i]: keys[i] for i in range(len(grp_cols))}
+            row_dict = {nice_dim_name: keys[0]}
+            if sub_col is not None:
+                row_dict[sub_col] = keys[1]
             row_dict.update(
                 {
                     "Paradas Limpias": int(len(s_est)),
@@ -3215,8 +3412,8 @@ with tab3:
             seg_rows.append(row_dict)
 
         df_seg_summary = pd.DataFrame(seg_rows)
-        if sub_col is None and dim_col in cat_order:
-            df_seg_summary["_ord"] = df_seg_summary[dim_col].map({v: i for i, v in enumerate(cat_order)})
+        if not df_seg_summary.empty and nice_dim_name in df_seg_summary.columns:
+            df_seg_summary["_ord"] = df_seg_summary[nice_dim_name].map({v: i for i, v in enumerate(cat_order)})
             df_seg_summary = df_seg_summary.sort_values("_ord").drop(columns=["_ord"])
 
         st.dataframe(df_seg_summary, use_container_width=True, hide_index=True)
@@ -3228,6 +3425,7 @@ with tab3:
     # -------------------------------------------------------------------------
     st.markdown("### 2. Matriz por Operación (CD) y Tipo de Vehículo (Nómina)")
 
+    mat_display = pd.DataFrame()
     if not st_clean_s3.empty:
         piv_med_veh = (
             st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
@@ -3251,7 +3449,6 @@ with tab3:
             .astype(int)
         )
 
-        # Combinar "42 min (n=1.230)" en una tabla limpia de lectura gerencial
         mat_display = pd.DataFrame(index=piv_med_veh.index)
         for col_v in piv_med_veh.columns:
             mat_display[col_v] = [
@@ -3279,32 +3476,39 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 3: MATRIZ DE DISPERSION Y RANKING ESTRUCTURAL DE TIENDAS
+    # BLOQUE 3: TOP TIENDAS CON MAYOR DEMORA / DESVIO CONTRA SU SEGMENTO
     # -------------------------------------------------------------------------
-    st.markdown("### 3. Diagnóstico de Demoras (Desvío vs. Benchmark y Percentiles Críticos)")
+    st.markdown("### 3. Top Tiendas con Mayor Estadía y Demora Operativa")
     st.caption(
-        "Este análisis compara la mediana de estadía de cada tienda contra la mediana general de su propio segmento "
-        "(`Tipo de Viaje` y `Categoría`). Las tiendas con un **desvío positivo alto** presentan demoras estructurales."
+        "Ranking directo de las tiendas que más tiempo retienen al camión, comparando su **Mediana de Estadía** "
+        "contra el **Benchmark de su mismo segmento** (`Tipo de Viaje` + `Categoría`)."
     )
 
-    rk_c1, rk_c2, rk_c3 = st.columns([1.2, 1.2, 1.2])
+    rk_c1, rk_c2, rk_c3, rk_c4 = st.columns([1.0, 1.0, 1.15, 1.05])
     with rk_c1:
+        top_n_rk = st.selectbox(
+            "Mostrar Top:",
+            options=[10, 15, 20, 30, 50],
+            index=1,
+            key="s3_top_n_rk",
+        )
+    with rk_c2:
         min_vis_rk = st.number_input(
-            "Mínimo de visitas limpias en la tienda:",
+            "Mínimo visitas limpias:",
             min_value=1,
             max_value=100,
             value=5,
             step=1,
             key="s3_min_vis_rk",
         )
-    with rk_c2:
+    with rk_c3:
         filtro_tv_rk = st.selectbox(
             "Filtrar por Tipo de Viaje:",
             options=["Todos", "Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"],
             index=0,
             key="s3_tv_rk",
         )
-    with rk_c3:
+    with rk_c4:
         filtro_cat_rk = st.selectbox(
             "Filtrar por Categoría:",
             options=["Todas", "Cercana", "Lejana"],
@@ -3312,119 +3516,103 @@ with tab3:
             key="s3_cat_rk",
         )
 
-    rk_base = st_clean_s3.copy()
-    if filtro_tv_rk != "Todos":
-        rk_base = rk_base[rk_base["Tipo_Viaje"] == filtro_tv_rk]
-    if filtro_cat_rk != "Todas":
-        rk_base = rk_base[rk_base["Categoria"] == filtro_cat_rk]
-
-    # Calcular Benchmark por segmento
-    bench_df = (
-        st_clean_s3.groupby(["Tipo_Viaje", "Categoria"])["Tiempo de Estadia"]
-        .median()
-        .reset_index(name="Mediana_Bench")
+    orden_top_rk = st.radio(
+        "Ordenar Top Tiendas por:",
+        options=[
+            "Mayor Desvío vs. Benchmark (+min sobre su segmento)",
+            "Mayor Estadía Mediana Absoluta (min)",
+            "Menor Productividad (Min / 100 Bultos)",
+        ],
+        index=0,
+        horizontal=True,
+        key="s3_orden_top_rk",
     )
-    rk_base = rk_base.merge(bench_df, on=["Tipo_Viaje", "Categoria"], how="left")
 
-    rk_rows = []
-    for (op_r, t_cod), grp in rk_base.groupby(["Operacion", "Tienda_Cod"]):
-        if len(grp) < min_vis_rk:
-            continue
-        s_e = grp["Tiempo de Estadia"]
-        g_p = grp[grp["Total Bultos_num"].fillna(0) >= 20]
-        m100_t = (
-            float((g_p["Tiempo de Estadia"] / (g_p["Total Bultos_num"] / 100.0)).median())
-            if len(g_p) > 0
-            else np.nan
-        )
-        med_est_t = float(s_e.median())
-        med_bench_t = float(grp["Mediana_Bench"].mean())
-        
-        rk_rows.append(
-            {
-                "CD": str(int(op_r)),
-                "Tienda": str(t_cod),
-                "Tipo Viaje Ppal.": grp["Tipo_Viaje"].mode().iloc[0] if not grp["Tipo_Viaje"].empty else "",
-                "Categoría": grp["Categoria"].mode().iloc[0] if not grp["Categoria"].empty else "",
-                "Visitas Limpias": int(len(s_e)),
-                "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
-                "Mediana Est. (min)": round(med_est_t, 0),
-                "P90 Est. (min)": round(float(np.percentile(s_e, 90)), 0),
-                "Bench Segmento": round(med_bench_t, 1),
-                "Desvío vs Bench": round(med_est_t - med_bench_t, 1),
-                "Min / 100 Bultos": round(m100_t, 1) if pd.notna(m100_t) else np.nan,
-            }
-        )
+    df_rk_tiendas = _rank_tiendas_s3_cached(
+        st_clean_s3,
+        int(min_vis_rk),
+        filtro_tv_rk,
+        filtro_cat_rk,
+    )
 
-    df_rk_tiendas = pd.DataFrame(rk_rows)
     if not df_rk_tiendas.empty:
-        df_rk_tiendas = df_rk_tiendas.sort_values("Desvío vs Bench", ascending=False)
-        
-        # Gráfico de Dispersión (Bultos vs Estadía) coloreado por Desvío
-        fig_scatter = go.Figure(
-            data=go.Scatter(
-                x=df_rk_tiendas["Mediana Bultos"],
-                y=df_rk_tiendas["Mediana Est. (min)"],
-                mode="markers",
-                marker=dict(
-                    size=10,
-                    color=df_rk_tiendas["Desvío vs Bench"],
-                    colorscale="RdYlBu_r",
-                    showscale=True,
-                    colorbar=dict(title="Desvío (min)", len=0.8),
-                    line=dict(width=0.5, color="white"),
-                ),
-                text=df_rk_tiendas["Tienda"],
-                customdata=np.dstack((df_rk_tiendas["CD"], df_rk_tiendas["Tipo Viaje Ppal."]))[0],
+        if orden_top_rk == "Mayor Estadía Mediana Absoluta (min)":
+            df_rk_tiendas = df_rk_tiendas.sort_values("Mediana Est. (min)", ascending=False).reset_index(drop=True)
+            metric_col = "Mediana Est. (min)"
+            metric_lbl = "Mediana Estadía (min)"
+        elif orden_top_rk == "Menor Productividad (Min / 100 Bultos)":
+            df_rk_tiendas = df_rk_tiendas.sort_values("Min / 100 Bultos", ascending=False, na_position="last").reset_index(drop=True)
+            metric_col = "Min / 100 Bultos"
+            metric_lbl = "Min / 100 Bultos"
+        else:
+            metric_col = "Desvío vs Bench"
+            metric_lbl = "Desvío vs. Benchmark (min)"
+
+        top_df_chart = df_rk_tiendas.dropna(subset=[metric_col]).head(int(top_n_rk)).iloc[::-1].copy()
+        top_df_chart["Tienda_Label"] = (
+            "Tienda " + top_df_chart["Tienda"] + " (CD " + top_df_chart["CD"] + ")"
+        )
+
+        bar_colors = [
+            "#dc2626" if v >= 30 else ("#f59e0b" if v > 0 else "#16a34a")
+            for v in top_df_chart["Desvío vs Bench"]
+        ]
+
+        fig_top = go.Figure(
+            data=go.Bar(
+                x=top_df_chart[metric_col],
+                y=top_df_chart["Tienda_Label"],
+                orientation="h",
+                marker_color=bar_colors,
+                text=[
+                    f"+{v:.0f} min" if (metric_col == "Desvío vs Bench" and v > 0) else f"{v:.1f}" if metric_col == "Min / 100 Bultos" else f"{v:.0f} min"
+                    for v in top_df_chart[metric_col]
+                ],
+                textposition="outside",
+                customdata=np.dstack(
+                    (
+                        top_df_chart["Mediana Est. (min)"],
+                        top_df_chart["Bench Segmento"],
+                        top_df_chart["Mediana Bultos"],
+                        top_df_chart["Visitas Limpias"],
+                        top_df_chart["Tipo Viaje Ppal."],
+                    )
+                )[0],
                 hovertemplate=(
-                    "<b>Tienda %{text}</b> (CD %{customdata[0]})<br>"
-                    "Volumen: %{x:,.0f} bultos<br>"
-                    "Estadía Mediana: %{y:,.0f} min<br>"
-                    "Desvío vs Bench: %{marker.color:+.1f} min<br>"
-                    "Segmento: %{customdata[1]}<extra></extra>"
+                    "<b>%{y}</b><br>"
+                    "Estadía Mediana: <b>%{customdata[0]:.0f} min</b> (Bench: %{customdata[1]:.0f} min)<br>"
+                    "Volumen típico: %{customdata[2]:,.0f} bultos | Visitas: %{customdata[3]:.0f}<br>"
+                    "Segmento: %{customdata[4]}<extra></extra>"
                 ),
             )
         )
-        fig_scatter.update_layout(
-            height=400,
-            margin=dict(l=20, r=20, t=30, b=20),
-            xaxis_title="Volumen Típico de Descarga (Mediana de Bultos)",
-            yaxis_title="Tiempo de Estadía Habitual (Mediana en min)",
-            title="Matriz Bultos vs. Tiempo de Estadía (cada punto es una Tienda)",
-            hovermode="closest",
+        max_x_top = float(top_df_chart[metric_col].max()) if not top_df_chart.empty else 100.0
+        fig_top.update_layout(
+            title=f"Top {len(top_df_chart)} Tiendas — {metric_lbl}",
+            height=max(360, len(top_df_chart) * 28 + 90),
+            margin=dict(l=20, r=60, t=40, b=20),
+            xaxis_title=metric_lbl,
+            yaxis_title="",
+            xaxis=dict(range=[min(0.0, float(top_df_chart[metric_col].min())), max_x_top * 1.16]),
         )
-        st.plotly_chart(fig_scatter, use_container_width=True)
-    else:
-        df_rk_tiendas = pd.DataFrame(
-            columns=[
-                "CD",
-                "Tienda",
-                "Tipo Viaje Ppal.",
-                "Categoría",
-                "Visitas Limpias",
-                "Mediana Bultos",
-                "Mediana Est. (min)",
-                "P90 Est. (min)",
-                "Bench Segmento",
-                "Desvío vs Bench",
-                "Min / 100 Bultos",
-            ]
-        )
+        st.plotly_chart(fig_top, use_container_width=True)
 
-    clean_s3_export = st_clean_s3.copy()
-    clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    estadias_excel_bytes = build_estadias_excel(
-        df_seg_summary if not st_clean_s3.empty else pd.DataFrame(),
-        mat_display if not st_clean_s3.empty else pd.DataFrame(),
-        df_rk_tiendas,
-        clean_s3_export,
-    )
-    st.download_button(
-        label="📥 Descargar Análisis de Estadías en Tienda (.xlsx)",
-        data=estadias_excel_bytes,
-        file_name="Analisis_Estadias_y_Productividad_Tienda.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    with st.expander("📥 Descargar Excel de Estadías y Productividad (.xlsx)", expanded=False):
+        clean_s3_export = st_clean_s3.copy()
+        if not clean_s3_export.empty:
+            clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+        estadias_excel_bytes = build_estadias_excel(
+            df_seg_summary,
+            mat_display,
+            df_rk_tiendas,
+            clean_s3_export,
+        )
+        st.download_button(
+            label="📥 Descargar Análisis Completo de Estadías en Tienda (.xlsx)",
+            data=estadias_excel_bytes,
+            file_name="Analisis_Estadias_y_Productividad_Tienda.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
     st.dataframe(
         df_rk_tiendas,
@@ -3434,9 +3622,13 @@ with tab3:
             "Desvío vs Bench": st.column_config.NumberColumn(
                 "Desvío vs Bench",
                 help="Diferencia en minutos contra la mediana de su propio segmento",
-                format="%+.1f min"
+                format="%+.1f min",
             ),
-        }
+            "Min / 100 Bultos": st.column_config.NumberColumn(
+                "Min / 100 Bultos",
+                format="%.1f",
+            ),
+        },
     )
 
 # =============================================================================
