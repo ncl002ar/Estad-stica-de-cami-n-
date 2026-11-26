@@ -847,7 +847,7 @@ def _clean_estadias_cached(
 ):
     st_all_vis = df_in[df_in["visita_efectiva"]].copy()
     if st_all_vis.empty:
-        return st_all_vis, {"corta": 0, "phys": 0, "larga": 0, "solape": 0, "tot": 0}
+        return st_all_vis, {"corta": 0, "phys": 0, "larga": 0, "solape": 0, "tot": 0, "plan_tot": int(len(df_in))}
 
     min_est_vec_s3 = np.select(
         [
@@ -910,6 +910,7 @@ def _clean_estadias_cached(
         default="Sin orden",
     )
     stats = {
+        "plan_tot": int(len(df_in)),
         "tot": int(len(st_all_vis)),
         "corta": int(r_corta_s3.sum()),
         "phys": int(r_phys_s3.sum()),
@@ -921,6 +922,7 @@ def _clean_estadias_cached(
 
 @st.cache_data(show_spinner=False)
 def _rank_tiendas_s3_cached(
+    df_all_s3: pd.DataFrame,
     st_clean_s3: pd.DataFrame,
     min_vis_rk: int,
     filtro_tv_rk: str,
@@ -931,21 +933,47 @@ def _rank_tiendas_s3_cached(
         "Tienda",
         "Tipo Viaje Ppal.",
         "Categoría",
+        "Visitas Totales",
         "Visitas Limpias",
+        "% Represent.",
         "Mediana Bultos",
         "Mediana Est. (min)",
         "P90 Est. (min)",
-        "Bench Segmento",
-        "Desvío vs Bench",
+        "Mediana del Segmento (min)",
+        "Base Segmento (Tiendas / Paradas)",
+        "Demora Extra (min)",
         "Min / 100 Bultos",
     ]
     if st_clean_s3.empty:
         return pd.DataFrame(columns=cols_out)
 
-    bench_df = (
-        st_clean_s3.groupby(["Tipo_Viaje", "Categoria"], as_index=False)["Tiempo de Estadia"]
-        .median()
-        .rename(columns={"Tiempo de Estadia": "Mediana_Bench"})
+    # Calcular Mediana del Segmento + cantidad de tiendas únicas y paradas limpias que forman esa referencia
+    seg_ref = (
+        st_clean_s3.assign(_pair=st_clean_s3["Operacion"].astype(str) + "_" + st_clean_s3["Tienda_Cod"].astype(str))
+        .groupby(["Tipo_Viaje", "Categoria"], as_index=False)
+        .agg(
+            Mediana_Seg=("Tiempo de Estadia", "median"),
+            Tiendas_Seg=("_pair", "nunique"),
+            Paradas_Seg=("Tiempo de Estadia", "count"),
+        )
+    )
+    seg_ref["Base_Seg_Str"] = (
+        seg_ref["Tiendas_Seg"].map(lambda x: f"{int(x):,}".replace(",", "."))
+        + " tiendas ("
+        + seg_ref["Paradas_Seg"].map(lambda x: f"{int(x):,}".replace(",", "."))
+        + " par.)"
+    )
+
+    # Conteo de Visitas Totales (todas las paradas en el periodo/filtros, antes de limpieza de estadía)
+    tot_base = df_all_s3.copy()
+    if filtro_tv_rk != "Todos":
+        tot_base = tot_base[tot_base["Tipo_Viaje"] == filtro_tv_rk]
+    if filtro_cat_rk != "Todas":
+        tot_base = tot_base[tot_base["Categoria"] == filtro_cat_rk]
+    tot_cnt_df = (
+        tot_base.groupby(["Operacion", "Tienda_Cod"], as_index=False)
+        .size()
+        .rename(columns={"size": "Visitas_Totales"})
     )
 
     rk_base = st_clean_s3.copy()
@@ -956,9 +984,8 @@ def _rank_tiendas_s3_cached(
     if rk_base.empty:
         return pd.DataFrame(columns=cols_out)
 
-    rk_base = rk_base.merge(bench_df, on=["Tipo_Viaje", "Categoria"], how="left")
+    rk_base = rk_base.merge(seg_ref[["Tipo_Viaje", "Categoria", "Mediana_Seg", "Base_Seg_Str"]], on=["Tipo_Viaje", "Categoria"], how="left")
 
-    # Vectorized aggregation instead of slow Python for-loop over 800+ stores
     g_cnt = rk_base.groupby(["Operacion", "Tienda_Cod"]).size()
     valid_pairs = g_cnt[g_cnt >= min_vis_rk].index
     if len(valid_pairs) == 0:
@@ -971,10 +998,13 @@ def _rank_tiendas_s3_cached(
         Mediana_Bultos=("Total Bultos_num", "median"),
         Mediana_Est=("Tiempo de Estadia", "median"),
         P90_Est=("Tiempo de Estadia", lambda s: float(np.percentile(s.dropna(), 90))),
-        Bench_Seg=("Mediana_Bench", "mean"),
+        Med_Seg_Val=("Mediana_Seg", "mean"),
+        Base_Seg_Main=("Base_Seg_Str", lambda s: s.value_counts().index[0]),
         Tipo_Viaje_Ppal=("Tipo_Viaje", lambda s: s.value_counts().index[0]),
         Categoria_Ppal=("Categoria", lambda s: s.value_counts().index[0]),
     )
+    agg_main = agg_main.merge(tot_cnt_df, on=["Operacion", "Tienda_Cod"], how="left")
+    agg_main["Visitas_Totales"] = agg_main["Visitas_Totales"].fillna(agg_main["Visitas_Limpias"]).astype(int)
 
     prod_sub = rk_sub[rk_sub["Total Bultos_num"].fillna(0) >= 20].copy()
     if not prod_sub.empty:
@@ -988,16 +1018,22 @@ def _rank_tiendas_s3_cached(
     agg_main["Tienda"] = agg_main["Tienda_Cod"].astype(str)
     agg_main["Tipo Viaje Ppal."] = agg_main["Tipo_Viaje_Ppal"]
     agg_main["Categoría"] = agg_main["Categoria_Ppal"]
+    agg_main["Visitas Totales"] = agg_main["Visitas_Totales"]
     agg_main["Visitas Limpias"] = agg_main["Visitas_Limpias"].astype(int)
+    agg_main["% Represent."] = np.where(
+        agg_main["Visitas Totales"] > 0,
+        (agg_main["Visitas Limpias"] / agg_main["Visitas Totales"] * 100).round(1),
+        100.0,
+    )
     agg_main["Mediana Bultos"] = agg_main["Mediana_Bultos"].round(0)
     agg_main["Mediana Est. (min)"] = agg_main["Mediana_Est"].round(0)
     agg_main["P90 Est. (min)"] = agg_main["P90_Est"].round(0)
-    agg_main["Bench Segmento"] = agg_main["Bench_Seg"].round(1)
-    agg_main["Desvío vs Bench"] = (agg_main["Mediana_Est"] - agg_main["Bench_Seg"]).round(1)
+    agg_main["Mediana del Segmento (min)"] = agg_main["Med_Seg_Val"].round(1)
+    agg_main["Base Segmento (Tiendas / Paradas)"] = agg_main["Base_Seg_Main"]
+    agg_main["Demora Extra (min)"] = (agg_main["Mediana_Est"] - agg_main["Med_Seg_Val"]).round(1)
     agg_main["Min / 100 Bultos"] = agg_main["_m100"].round(1)
 
-    return agg_main[cols_out].sort_values("Desvío vs Bench", ascending=False).reset_index(drop=True)
-
+    return agg_main[cols_out].sort_values("Demora Extra (min)", ascending=False).reset_index(drop=True)
 
 # -----------------------------------------------------------------------------
 # CARGA AUTOMATICA DE DATOS (SILENCIOSA PARA PRIORIZAR FILTROS EN SIDEBAR)
@@ -2954,7 +2990,7 @@ with tab3:
     st.caption(
         "Muestra independiente sobre todas las paradas en tienda con visita GPS efectiva "
         "(no descarta paradas si faltó estadía en el CD o en otra parada del viaje). "
-        "Filtrable por Período en el menú lateral y con apertura temporal interna."
+        "Filtrable por Período en el menú lateral y con apertura temporal o por Tienda puntual."
     )
 
     with st.expander("🎛️ Parámetros de Integridad Estadística de Estadías (Ajustables)", expanded=False):
@@ -3133,12 +3169,13 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: DIAGRAMAS DE CAJAS (POR SEGMENTO O EVOLUCION TEMPORAL)
+    # BLOQUE 1: DIAGRAMAS DE CAJAS (POR SEGMENTO, TIEMPO O TIENDA PUNTUAL)
     # -------------------------------------------------------------------------
     st.markdown("### 1. Distribución y Evolución Temporal de Estadías (Diagrama de Cajas)")
 
     dim_map_s3 = {
         "Tipo de Viaje (Directo / Compartido / Rutas)": "Tipo_Viaje",
+        "Tienda (Evolución Temporal de Tienda puntual)": "Tienda_Puntual",
         "Evolución por Mes": "Evol_Mes",
         "Evolución por Semana": "Evol_Semana",
         "Evolución por Fecha (Día)": "Evol_Dia",
@@ -3158,7 +3195,7 @@ with tab3:
     bx_c1, bx_c2 = st.columns([1.35, 1.15])
     with bx_c1:
         dim_label_s3 = st.selectbox(
-            "Agrupar eje principal por (segmento o período):",
+            "Agrupar eje principal por (segmento, período o tienda):",
             options=list(dim_map_s3.keys()),
             index=0,
             key="s3_dim_sel",
@@ -3181,10 +3218,64 @@ with tab3:
         st.info("No hay paradas limpias en el rango y filtros seleccionados.")
     else:
         df_plot_s3 = st_clean_s3.copy()
-        is_temporal_s3 = dim_col in {"Evol_Mes", "Evol_Semana", "Evol_Dia"}
+        df_tot_plot_s3 = dq_stores_filt.copy()
 
-        # Drill-down por semana cuando el usuario selecciona Evolucion por Fecha (Dia)
-        if dim_col == "Evol_Dia":
+        # Caso especial: Analisis de una Tienda puntual en el tiempo
+        if dim_col == "Tienda_Puntual":
+            tiendas_opts_df = (
+                df_plot_s3.groupby(["Tienda_Cod", "Operacion"], as_index=False)
+                .size()
+                .sort_values(["size", "Tienda_Cod"], ascending=[False, True])
+            )
+            tiendas_opts_df["lbl"] = (
+                "Tienda "
+                + tiendas_opts_df["Tienda_Cod"].astype(str)
+                + " (CD "
+                + tiendas_opts_df["Operacion"].astype(int).astype(str)
+                + " — "
+                + tiendas_opts_df["size"].astype(str)
+                + " visitas limpias)"
+            )
+            t_c1, t_c2 = st.columns([1.6, 1.1])
+            with t_c1:
+                tienda_sel_lbl = st.selectbox(
+                    "Seleccioná la Tienda a evaluar:",
+                    options=tiendas_opts_df["lbl"].tolist(),
+                    index=0,
+                    key="s3_tienda_puntual_sel",
+                )
+            with t_c2:
+                eje_tienda_tiempo = st.radio(
+                    "Eje temporal de la tienda:",
+                    options=["Semana", "Mes", "Fecha (Día)"],
+                    index=0,
+                    horizontal=True,
+                    key="s3_eje_tienda_t",
+                )
+            sel_row_t = tiendas_opts_df[tiendas_opts_df["lbl"] == tienda_sel_lbl].iloc[0]
+            t_cod_sel = sel_row_t["Tienda_Cod"]
+            op_cod_sel = sel_row_t["Operacion"]
+
+            df_plot_s3 = df_plot_s3[
+                (df_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_plot_s3["Operacion"] == op_cod_sel)
+            ].copy()
+            df_tot_plot_s3 = df_tot_plot_s3[
+                (df_tot_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_tot_plot_s3["Operacion"] == op_cod_sel)
+            ].copy()
+
+            if eje_tienda_tiempo == "Mes":
+                active_dim = "Evol_Mes"
+            elif eje_tienda_tiempo == "Fecha (Día)":
+                active_dim = "Evol_Dia"
+            else:
+                active_dim = "Evol_Semana"
+        else:
+            active_dim = dim_col
+
+        is_temporal_s3 = active_dim in {"Evol_Mes", "Evol_Semana", "Evol_Dia"}
+
+        # Drill-down por semana cuando el eje es por Fecha (Dia) y no es tienda puntual
+        if active_dim == "Evol_Dia" and dim_col != "Tienda_Puntual":
             sems_s3_disp = (
                 df_plot_s3[["Semana_Sort", "Semana_Label"]]
                 .drop_duplicates()
@@ -3201,63 +3292,75 @@ with tab3:
             )
             if sems_s3_sel:
                 df_plot_s3 = df_plot_s3[df_plot_s3["Semana_Label"].isin(sems_s3_sel)].copy()
+                df_tot_plot_s3 = df_tot_plot_s3[df_tot_plot_s3["Semana_Label"].isin(sems_s3_sel)].copy()
 
-        if dim_col == "Evol_Mes":
-            df_plot_s3["_p_sort"] = df_plot_s3["Fecha_Reparto"].dt.to_period("M").apply(lambda p: p.start_time)
-            df_plot_s3[dim_col] = df_plot_s3["_p_sort"].dt.strftime("%Y-%m")
+        # Preparar columna de agrupacion tanto en df_plot_s3 (limpia) como en df_tot_plot_s3 (totales)
+        def _prep_dim_col(df_target: pd.DataFrame, col_mode: str) -> pd.DataFrame:
+            d = df_target.copy()
+            if col_mode == "Evol_Mes":
+                d["_p_sort"] = d["Fecha_Reparto"].dt.to_period("M").apply(lambda p: p.start_time)
+                d[col_mode] = d["_p_sort"].dt.strftime("%Y-%m")
+            elif col_mode == "Evol_Semana":
+                d[col_mode] = d["Semana_Label"]
+            elif col_mode == "Evol_Dia":
+                d["_p_sort"] = d["Fecha_Reparto"].dt.floor("D")
+                d[col_mode] = (
+                    d["_p_sort"].dt.dayofweek.map(dias_es)
+                    + " "
+                    + d["_p_sort"].dt.strftime("%d/%m")
+                )
+            elif col_mode == "Operacion":
+                d[col_mode] = "CD " + d[col_mode].astype(str)
+            elif col_mode == "Orden_Parada_Grupo":
+                d[col_mode] = np.select(
+                    [
+                        d["Orden Visita Tienda"] == 1,
+                        d["Orden Visita Tienda"] == 2,
+                        d["Orden Visita Tienda"] == 3,
+                        d["Orden Visita Tienda"] >= 4,
+                    ],
+                    ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"],
+                    default="Sin orden",
+                )
+            else:
+                d[col_mode] = d[col_mode].fillna("Sin dato").astype(str)
+            return d
+
+        df_plot_s3 = _prep_dim_col(df_plot_s3, active_dim)
+        df_tot_plot_s3 = _prep_dim_col(df_tot_plot_s3, active_dim)
+        if sub_col is not None:
+            df_plot_s3 = _prep_dim_col(df_plot_s3, sub_col)
+            df_tot_plot_s3 = _prep_dim_col(df_tot_plot_s3, sub_col)
+
+        if active_dim in {"Evol_Mes", "Evol_Dia"}:
             cat_order = (
-                df_plot_s3[["_p_sort", dim_col]]
+                df_plot_s3[["_p_sort", active_dim]]
                 .drop_duplicates()
-                .sort_values("_p_sort")[dim_col]
+                .sort_values("_p_sort")[active_dim]
                 .tolist()
             )
-        elif dim_col == "Evol_Semana":
-            df_plot_s3[dim_col] = df_plot_s3["Semana_Label"]
+        elif active_dim == "Evol_Semana":
             cat_order = (
-                df_plot_s3[["Semana_Sort", dim_col]]
+                df_plot_s3[["Semana_Sort", active_dim]]
                 .drop_duplicates()
-                .sort_values("Semana_Sort")[dim_col]
+                .sort_values("Semana_Sort")[active_dim]
                 .tolist()
             )
-        elif dim_col == "Evol_Dia":
-            df_plot_s3["_p_sort"] = df_plot_s3["Fecha_Reparto"].dt.floor("D")
-            df_plot_s3[dim_col] = (
-                df_plot_s3["_p_sort"].dt.dayofweek.map(dias_es)
-                + " "
-                + df_plot_s3["_p_sort"].dt.strftime("%d/%m")
-            )
-            cat_order = (
-                df_plot_s3[["_p_sort", dim_col]]
-                .drop_duplicates()
-                .sort_values("_p_sort")[dim_col]
-                .tolist()
-            )
-        elif dim_col == "Operacion":
-            df_plot_s3[dim_col] = "CD " + df_plot_s3[dim_col].astype(str)
-            cat_order = (
-                df_plot_s3.groupby(dim_col)["Tiempo de Estadia"]
-                .median()
-                .sort_values(ascending=False)
-                .index.tolist()
-            )
-        elif dim_col == "Tipo_Viaje":
-            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
+        elif active_dim == "Tipo_Viaje":
             cat_order = [
                 c
                 for c in ["Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"]
-                if c in df_plot_s3[dim_col].unique()
+                if c in df_plot_s3[active_dim].unique()
             ]
-        elif dim_col == "Orden_Parada_Grupo":
-            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
+        elif active_dim == "Orden_Parada_Grupo":
             cat_order = [
                 c
                 for c in ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"]
-                if c in df_plot_s3[dim_col].unique()
+                if c in df_plot_s3[active_dim].unique()
             ]
         else:
-            df_plot_s3[dim_col] = df_plot_s3[dim_col].fillna("Sin dato").astype(str)
             cat_order = (
-                df_plot_s3.groupby(dim_col)["Tiempo de Estadia"]
+                df_plot_s3.groupby(active_dim)["Tiempo de Estadia"]
                 .median()
                 .sort_values(ascending=False)
                 .index.tolist()
@@ -3273,88 +3376,104 @@ with tab3:
             hi = min(float(s.max()), float(q3 + 1.5 * iqr))
             return lo, hi
 
+        # Hover en español limpio (Mediana, Media, Q1, Q3, Mín/Máx) sin repetir ítems en leyenda
         if sub_col is None:
-            for idx_c, cat_val in enumerate(cat_order):
-                vals = df_plot_s3[df_plot_s3[dim_col] == cat_val]["Tiempo de Estadia"].dropna()
+            x_lbls_ordered = []
+            lf_all, q1_all, med_all, q3_all, uf_all, mean_all, custom_all = [], [], [], [], [], [], []
+            for cat_val in cat_order:
+                vals = df_plot_s3[df_plot_s3[active_dim] == cat_val]["Tiempo de Estadia"].dropna()
                 if len(vals) == 0:
                     continue
-                box_color = "#1d4ed8" if is_temporal_s3 else palette_box[idx_c % len(palette_box)]
+                lo_w, hi_w = _tukey_bounds(vals) if bigotes_tukey_s3 else (float(vals.min()), float(vals.max()))
+                q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
+                mean_v = float(vals.mean())
                 x_lbl = f"{cat_val}<br>(n={len(vals):,})" if is_temporal_s3 else f"{cat_val} (n={len(vals):,})"
-                if bigotes_tukey_s3:
-                    lo_w, hi_w = _tukey_bounds(vals)
-                    q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
-                    fig_box.add_trace(
-                        go.Box(
-                            x=[x_lbl],
-                            lowerfence=[lo_w],
-                            q1=[q1_v],
-                            median=[med_v],
-                            q3=[q3_v],
-                            upperfence=[hi_w],
-                            mean=[float(vals.mean())],
-                            name=f"{cat_val} (n={len(vals):,})",
-                            marker_color=box_color,
-                        )
+                x_lbls_ordered.append(x_lbl)
+                lf_all.append(lo_w)
+                q1_all.append(q1_v)
+                med_all.append(med_v)
+                q3_all.append(q3_v)
+                uf_all.append(hi_w)
+                mean_all.append(mean_v)
+                custom_all.append([cat_val, len(vals), med_v, mean_v, q1_v, q3_v, lo_w, hi_w])
+
+            if x_lbls_ordered:
+                # 1 única traza agrupada -> 1 solo ítem en leyenda sin repeticiones ni "(n=...)" redundante
+                fig_box.add_trace(
+                    go.Box(
+                        x=x_lbls_ordered,
+                        lowerfence=lf_all,
+                        q1=q1_all,
+                        median=med_all,
+                        q3=q3_all,
+                        upperfence=uf_all,
+                        mean=mean_all,
+                        name="Estadía en Tienda (min)",
+                        marker_color="#1d4ed8",
+                        customdata=custom_all,
+                        hoverinfo="none",
                     )
-                else:
-                    fig_box.add_trace(
-                        go.Box(
-                            y=vals,
-                            name=f"{cat_val} (n={len(vals):,})",
-                            boxmean=True,
-                            boxpoints=False,
-                            marker_color=box_color,
-                        )
+                )
+                # Puntos invisibles para tooltip limpio 100% en español
+                fig_box.add_trace(
+                    go.Scatter(
+                        x=x_lbls_ordered,
+                        y=med_all,
+                        mode="markers",
+                        marker=dict(size=14, opacity=0),
+                        showlegend=False,
+                        customdata=custom_all,
+                        hovertemplate=(
+                            "<b>%{customdata[0]}</b> (n=%{customdata[1]:,})<br>"
+                            "Mediana: <b>%{customdata[2]:.0f} min</b><br>"
+                            "Media: <b>%{customdata[3]:.1f} min</b><br>"
+                            "Q1 – Q3: %{customdata[4]:.0f} – %{customdata[5]:.0f} min<br>"
+                            "Bigotes (Mín – Máx): %{customdata[6]:.0f} – %{customdata[7]:.0f} min"
+                            "<extra></extra>"
+                        ),
                     )
-            if is_temporal_s3:
-                fig_box.update_layout(showlegend=False)
+                )
+            fig_box.update_layout(showlegend=False)
         else:
-            if sub_col == "Operacion":
-                df_plot_s3[sub_col] = "CD " + df_plot_s3[sub_col].astype(str)
-            else:
-                df_plot_s3[sub_col] = df_plot_s3[sub_col].fillna("Sin dato").astype(str)
             sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
             for idx_s, sv in enumerate(sub_vals):
                 sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
-                if bigotes_tukey_s3:
-                    x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
-                    for cv in cat_order:
-                        v_sub = sub_df[sub_df[dim_col] == cv]["Tiempo de Estadia"].dropna()
-                        if len(v_sub) == 0:
-                            continue
-                        lo_w, hi_w = _tukey_bounds(v_sub)
-                        q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
-                        x_cats.append(cv)
-                        lf_l.append(lo_w)
-                        q1_l.append(q1_v)
-                        med_l.append(med_v)
-                        q3_l.append(q3_v)
-                        uf_l.append(hi_w)
-                        mean_l.append(float(v_sub.mean()))
-                    fig_box.add_trace(
-                        go.Box(
-                            x=x_cats,
-                            lowerfence=lf_l,
-                            q1=q1_l,
-                            median=med_l,
-                            q3=q3_l,
-                            upperfence=uf_l,
-                            mean=mean_l,
-                            name=sv,
-                            marker_color=palette_box[idx_s % len(palette_box)],
-                        )
+                x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l, cust_l = [], [], [], [], [], [], [], []
+                for cv in cat_order:
+                    v_sub = sub_df[sub_df[active_dim] == cv]["Tiempo de Estadia"].dropna()
+                    if len(v_sub) == 0:
+                        continue
+                    lo_w, hi_w = _tukey_bounds(v_sub) if bigotes_tukey_s3 else (float(v_sub.min()), float(v_sub.max()))
+                    q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
+                    mean_v = float(v_sub.mean())
+                    x_cats.append(cv)
+                    lf_l.append(lo_w)
+                    q1_l.append(q1_v)
+                    med_l.append(med_v)
+                    q3_l.append(q3_v)
+                    uf_l.append(hi_w)
+                    mean_l.append(mean_v)
+                    cust_l.append([cv, sv, len(v_sub), med_v, mean_v, q1_v, q3_v])
+                fig_box.add_trace(
+                    go.Box(
+                        x=x_cats,
+                        lowerfence=lf_l,
+                        q1=q1_l,
+                        median=med_l,
+                        q3=q3_l,
+                        upperfence=uf_l,
+                        mean=mean_l,
+                        name=sv,
+                        marker_color=palette_box[idx_s % len(palette_box)],
+                        customdata=cust_l,
+                        hovertemplate=(
+                            "<b>%{customdata[0]} — %{customdata[1]}</b> (n=%{customdata[2]:,})<br>"
+                            "Mediana: <b>%{customdata[3]:.0f} min</b> | Media: <b>%{customdata[4]:.1f} min</b><br>"
+                            "Q1 – Q3: %{customdata[5]:.0f} – %{customdata[6]:.0f} min"
+                            "<extra></extra>"
+                        ),
                     )
-                else:
-                    fig_box.add_trace(
-                        go.Box(
-                            x=sub_df[dim_col],
-                            y=sub_df["Tiempo de Estadia"],
-                            name=sv,
-                            boxmean=True,
-                            boxpoints=False,
-                            marker_color=palette_box[idx_s % len(palette_box)],
-                        )
-                    )
+                )
             fig_box.update_layout(
                 boxmode="group",
                 xaxis=dict(categoryorder="array", categoryarray=cat_order),
@@ -3367,11 +3486,12 @@ with tab3:
             yaxis_title="Tiempo de Estadía en Tienda (minutos)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(tickangle=-35 if len(cat_order) > 12 else 0),
+            hovermode="x unified" if sub_col is None else "closest",
         )
         st.plotly_chart(fig_box, use_container_width=True)
 
-        # Tabla resumen estadistico del segmento o periodo elegido
-        grp_cols = [dim_col] if sub_col is None else [dim_col, sub_col]
+        # Tabla resumen estadistico con Paradas Totales + Paradas Limpias + % Represent.
+        grp_cols = [active_dim] if sub_col is None else [active_dim, sub_col]
         nice_dim_name = {
             "Evol_Mes": "Mes",
             "Evol_Semana": "Semana",
@@ -3381,12 +3501,19 @@ with tab3:
             "Operacion": "Operación",
             "Categoria": "Categoría",
             "Orden_Parada_Grupo": "Orden Parada",
-        }.get(dim_col, dim_col)
+        }.get(active_dim, active_dim)
+
+        tot_grp_map = df_tot_plot_s3.groupby(grp_cols).size().to_dict()
 
         seg_rows = []
         for keys, grp in df_plot_s3.groupby(grp_cols):
             if not isinstance(keys, tuple):
                 keys = (keys,)
+            lookup_key = keys[0] if len(keys) == 1 else keys
+            par_tot_g = int(tot_grp_map.get(lookup_key, len(grp)))
+            par_limp_g = int(len(grp))
+            pct_rep_g = round((par_limp_g / par_tot_g * 100), 1) if par_tot_g > 0 else 100.0
+
             s_est = grp["Tiempo de Estadia"]
             g_prod = grp[grp["Total Bultos_num"].fillna(0) >= 20]
             m100 = (
@@ -3399,13 +3526,15 @@ with tab3:
                 row_dict[sub_col] = keys[1]
             row_dict.update(
                 {
-                    "Paradas Limpias": int(len(s_est)),
+                    "Paradas Totales": par_tot_g,
+                    "Paradas Limpias": par_limp_g,
+                    "% Represent.": pct_rep_g,
                     "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
                     "P25 (min)": round(float(np.percentile(s_est, 25)), 0),
                     "Mediana (min)": round(float(s_est.median()), 0),
                     "P75 (min)": round(float(np.percentile(s_est, 75)), 0),
                     "P90 (min)": round(float(np.percentile(s_est, 90)), 0),
-                    "Promedio (min)": round(float(s_est.mean()), 1),
+                    "Media (min)": round(float(s_est.mean()), 1),
                     "Min / 100 Bultos": round(m100, 1) if pd.notna(m100) else None,
                 }
             )
@@ -3416,7 +3545,14 @@ with tab3:
             df_seg_summary["_ord"] = df_seg_summary[nice_dim_name].map({v: i for i, v in enumerate(cat_order)})
             df_seg_summary = df_seg_summary.sort_values("_ord").drop(columns=["_ord"])
 
-        st.dataframe(df_seg_summary, use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_seg_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Represent.": st.column_config.NumberColumn("% Represent.", format="%.1f%%"),
+            },
+        )
 
     st.divider()
 
@@ -3476,18 +3612,18 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 3: TOP TIENDAS CON MAYOR DEMORA / DESVIO CONTRA SU SEGMENTO
+    # BLOQUE 3: TOP TIENDAS (MAYOR DEMORA vs. MENOR ESTADIA)
     # -------------------------------------------------------------------------
-    st.markdown("### 3. Top Tiendas con Mayor Estadía y Demora Operativa")
+    st.markdown("### 3. Ranking de Tiendas: Mayor Demora vs. Menor Estadía (vs. Mediana del Segmento)")
     st.caption(
-        "Ranking directo de las tiendas que más tiempo retienen al camión, comparando su **Mediana de Estadía** "
-        "contra el **Benchmark de su mismo segmento** (`Tipo de Viaje` + `Categoría`)."
+        "Compara la **Mediana de Estadía** de cada tienda contra la **Mediana del Segmento** (`Tipo de Viaje` + `Categoría`), "
+        "mostrando cuántas tiendas y paradas limpias componen esa referencia, además de sus **Visitas Totales** vs. **Visitas Limpias**."
     )
 
     rk_c1, rk_c2, rk_c3, rk_c4 = st.columns([1.0, 1.0, 1.15, 1.05])
     with rk_c1:
         top_n_rk = st.selectbox(
-            "Mostrar Top:",
+            "Cantidad Top:",
             options=[10, 15, 20, 30, 50],
             index=1,
             key="s3_top_n_rk",
@@ -3517,11 +3653,11 @@ with tab3:
         )
 
     orden_top_rk = st.radio(
-        "Ordenar Top Tiendas por:",
+        "Ordenar ranking completo por:",
         options=[
-            "Mayor Desvío vs. Benchmark (+min sobre su segmento)",
-            "Mayor Estadía Mediana Absoluta (min)",
-            "Menor Productividad (Min / 100 Bultos)",
+            "Demora Extra vs. Mediana del Segmento (min)",
+            "Estadía Mediana Absoluta (min)",
+            "Productividad (Min / 100 Bultos)",
         ],
         index=0,
         horizontal=True,
@@ -3529,6 +3665,7 @@ with tab3:
     )
 
     df_rk_tiendas = _rank_tiendas_s3_cached(
+        dq_stores_filt,
         st_clean_s3,
         int(min_vis_rk),
         filtro_tv_rk,
@@ -3536,66 +3673,122 @@ with tab3:
     )
 
     if not df_rk_tiendas.empty:
-        if orden_top_rk == "Mayor Estadía Mediana Absoluta (min)":
+        if orden_top_rk == "Estadía Mediana Absoluta (min)":
             df_rk_tiendas = df_rk_tiendas.sort_values("Mediana Est. (min)", ascending=False).reset_index(drop=True)
             metric_col = "Mediana Est. (min)"
             metric_lbl = "Mediana Estadía (min)"
-        elif orden_top_rk == "Menor Productividad (Min / 100 Bultos)":
+        elif orden_top_rk == "Productividad (Min / 100 Bultos)":
             df_rk_tiendas = df_rk_tiendas.sort_values("Min / 100 Bultos", ascending=False, na_position="last").reset_index(drop=True)
             metric_col = "Min / 100 Bultos"
             metric_lbl = "Min / 100 Bultos"
         else:
-            metric_col = "Desvío vs Bench"
-            metric_lbl = "Desvío vs. Benchmark (min)"
+            metric_col = "Demora Extra (min)"
+            metric_lbl = "Demora Extra vs. Segmento (min)"
 
-        top_df_chart = df_rk_tiendas.dropna(subset=[metric_col]).head(int(top_n_rk)).iloc[::-1].copy()
-        top_df_chart["Tienda_Label"] = (
-            "Tienda " + top_df_chart["Tienda"] + " (CD " + top_df_chart["CD"] + ")"
+        valid_metric_df = df_rk_tiendas.dropna(subset=[metric_col]).copy()
+        valid_metric_df["Tienda_Label"] = (
+            "Tienda " + valid_metric_df["Tienda"] + " (CD " + valid_metric_df["CD"] + ")"
         )
 
-        bar_colors = [
-            "#dc2626" if v >= 30 else ("#f59e0b" if v > 0 else "#16a34a")
-            for v in top_df_chart["Desvío vs Bench"]
-        ]
+        # Dos gráficos lado a lado: Top Mayor Demora (críticas) y Top Menor Estadía (más rápidas)
+        col_top_hi, col_top_lo = st.columns(2)
 
-        fig_top = go.Figure(
-            data=go.Bar(
-                x=top_df_chart[metric_col],
-                y=top_df_chart["Tienda_Label"],
-                orientation="h",
-                marker_color=bar_colors,
-                text=[
-                    f"+{v:.0f} min" if (metric_col == "Desvío vs Bench" and v > 0) else f"{v:.1f}" if metric_col == "Min / 100 Bultos" else f"{v:.0f} min"
-                    for v in top_df_chart[metric_col]
-                ],
-                textposition="outside",
-                customdata=np.dstack(
-                    (
-                        top_df_chart["Mediana Est. (min)"],
-                        top_df_chart["Bench Segmento"],
-                        top_df_chart["Mediana Bultos"],
-                        top_df_chart["Visitas Limpias"],
-                        top_df_chart["Tipo Viaje Ppal."],
-                    )
-                )[0],
-                hovertemplate=(
-                    "<b>%{y}</b><br>"
-                    "Estadía Mediana: <b>%{customdata[0]:.0f} min</b> (Bench: %{customdata[1]:.0f} min)<br>"
-                    "Volumen típico: %{customdata[2]:,.0f} bultos | Visitas: %{customdata[3]:.0f}<br>"
-                    "Segmento: %{customdata[4]}<extra></extra>"
-                ),
+        with col_top_hi:
+            top_hi = valid_metric_df.head(int(top_n_rk)).iloc[::-1].copy()
+            colors_hi = [
+                "#dc2626" if v >= 30 else ("#f59e0b" if v > 0 else "#16a34a")
+                for v in top_hi["Demora Extra (min)"]
+            ]
+            fig_hi = go.Figure(
+                data=go.Bar(
+                    x=top_hi[metric_col],
+                    y=top_hi["Tienda_Label"],
+                    orientation="h",
+                    marker_color=colors_hi,
+                    text=[
+                        f"+{v:.0f}m" if (metric_col == "Demora Extra (min)" and v > 0) else f"{v:.1f}" if metric_col == "Min / 100 Bultos" else f"{v:.0f}m"
+                        for v in top_hi[metric_col]
+                    ],
+                    textposition="outside",
+                    customdata=np.dstack(
+                        (
+                            top_hi["Mediana Est. (min)"],
+                            top_hi["Mediana del Segmento (min)"],
+                            top_hi["Base Segmento (Tiendas / Paradas)"],
+                            top_hi["Visitas Limpias"],
+                            top_hi["Visitas Totales"],
+                            top_hi["Mediana Bultos"],
+                        )
+                    )[0],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Mediana Tienda: <b>%{customdata[0]:.0f} min</b> | Mediana Segmento: <b>%{customdata[1]:.0f} min</b><br>"
+                        "Referencia formada por: %{customdata[2]}<br>"
+                        "Visitas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales | Mediana: %{customdata[5]:,.0f} bultos"
+                        "<extra></extra>"
+                    ),
+                )
             )
-        )
-        max_x_top = float(top_df_chart[metric_col].max()) if not top_df_chart.empty else 100.0
-        fig_top.update_layout(
-            title=f"Top {len(top_df_chart)} Tiendas — {metric_lbl}",
-            height=max(360, len(top_df_chart) * 28 + 90),
-            margin=dict(l=20, r=60, t=40, b=20),
-            xaxis_title=metric_lbl,
-            yaxis_title="",
-            xaxis=dict(range=[min(0.0, float(top_df_chart[metric_col].min())), max_x_top * 1.16]),
-        )
-        st.plotly_chart(fig_top, use_container_width=True)
+            max_hi = float(top_hi[metric_col].max()) if not top_hi.empty else 100.0
+            fig_hi.update_layout(
+                title=f"🔴 Top {len(top_hi)} Mayor Demora — {metric_lbl}",
+                height=max(350, len(top_hi) * 26 + 90),
+                margin=dict(l=10, r=55, t=40, b=20),
+                xaxis_title=metric_lbl,
+                yaxis_title="",
+                xaxis=dict(range=[min(0.0, float(top_hi[metric_col].min())), max_hi * 1.22]),
+            )
+            st.plotly_chart(fig_hi, use_container_width=True)
+
+        with col_top_lo:
+            top_lo = valid_metric_df.tail(int(top_n_rk)).copy()
+            # Ordenar de la más rápida (arriba) hacia arriba
+            top_lo = top_lo.sort_values(metric_col, ascending=False)
+            colors_lo = [
+                "#16a34a" if v <= 0 else ("#3b82f6" if v < 15 else "#f59e0b")
+                for v in top_lo["Demora Extra (min)"]
+            ]
+            fig_lo = go.Figure(
+                data=go.Bar(
+                    x=top_lo[metric_col],
+                    y=top_lo["Tienda_Label"],
+                    orientation="h",
+                    marker_color=colors_lo,
+                    text=[
+                        f"{v:+.0f}m" if metric_col == "Demora Extra (min)" else f"{v:.1f}" if metric_col == "Min / 100 Bultos" else f"{v:.0f}m"
+                        for v in top_lo[metric_col]
+                    ],
+                    textposition="outside",
+                    customdata=np.dstack(
+                        (
+                            top_lo["Mediana Est. (min)"],
+                            top_lo["Mediana del Segmento (min)"],
+                            top_lo["Base Segmento (Tiendas / Paradas)"],
+                            top_lo["Visitas Limpias"],
+                            top_lo["Visitas Totales"],
+                            top_lo["Mediana Bultos"],
+                        )
+                    )[0],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Mediana Tienda: <b>%{customdata[0]:.0f} min</b> | Mediana Segmento: <b>%{customdata[1]:.0f} min</b><br>"
+                        "Referencia formada por: %{customdata[2]}<br>"
+                        "Visitas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales | Mediana: %{customdata[5]:,.0f} bultos"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            min_lo = float(top_lo[metric_col].min()) if not top_lo.empty else -30.0
+            max_lo = float(top_lo[metric_col].max()) if not top_lo.empty else 30.0
+            fig_lo.update_layout(
+                title=f"🟢 Top {len(top_lo)} Menor Estadía — {metric_lbl}",
+                height=max(350, len(top_lo) * 26 + 90),
+                margin=dict(l=10, r=55, t=40, b=20),
+                xaxis_title=metric_lbl,
+                yaxis_title="",
+                xaxis=dict(range=[min_lo * 1.24 if min_lo < 0 else 0.0, max(10.0, max_lo * 1.22)]),
+            )
+            st.plotly_chart(fig_lo, use_container_width=True)
 
     with st.expander("📥 Descargar Excel de Estadías y Productividad (.xlsx)", expanded=False):
         clean_s3_export = st_clean_s3.copy()
@@ -3619,9 +3812,14 @@ with tab3:
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Desvío vs Bench": st.column_config.NumberColumn(
-                "Desvío vs Bench",
-                help="Diferencia en minutos contra la mediana de su propio segmento",
+            "% Represent.": st.column_config.NumberColumn(
+                "% Represent.",
+                help="Visitas Limpias / Visitas Totales",
+                format="%.1f%%",
+            ),
+            "Demora Extra (min)": st.column_config.NumberColumn(
+                "Demora Extra (min)",
+                help="Diferencia en minutos contra la Mediana del Segmento",
                 format="%+.1f min",
             ),
             "Min / 100 Bultos": st.column_config.NumberColumn(
