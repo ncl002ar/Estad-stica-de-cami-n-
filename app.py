@@ -259,6 +259,13 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
     # 3. Limpieza UNIGIS (TMS)
     df_u = df_u_raw.copy()
+    # Excluir tambien en UNIGIS los internos administrativos/especiales (1331, 1333, 50000)
+    if "Interno" in df_u.columns:
+        int_clean_u = _clean_int_str(df_u["Interno"]).fillna(
+            df_u["Interno"].fillna("").astype(str).str.strip()
+        )
+        df_u = df_u[~int_clean_u.isin(internos_excl_amrepa)].copy()
+
     df_u["Operacion"] = pd.to_numeric(df_u["Operacion"], errors="coerce").astype("Int64")
     df_u["Fecha_Reparto"] = pd.to_datetime(df_u["Fecha Reparto"], format="%d/%m/%Y", errors="coerce")
 
