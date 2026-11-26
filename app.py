@@ -801,24 +801,25 @@ def build_gps_audit_excel(df_geo, df_fleet, df_sin_coord, df_raw_fails, df_cd_si
     return output.getvalue()
 
 
-def build_estadias_excel(df_seg, df_mat, df_rank, df_clean_st) -> bytes:
+def build_estadias_excel(df_seg, df_rank, df_clean_st) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_seg.to_excel(writer, sheet_name="1_Resumen_Segmentos", index=False)
-        df_mat.to_excel(writer, sheet_name="2_Matriz_CD_x_Vehiculo", index=False)
-        df_rank.to_excel(writer, sheet_name="3_Ranking_Tiendas", index=False)
-        df_clean_st.to_excel(writer, sheet_name="4_Base_Limpia_Estadias", index=False)
+        df_rank.to_excel(writer, sheet_name="2_Ranking_Tiendas", index=False)
+        df_clean_st.to_excel(writer, sheet_name="3_Base_Limpia_Estadias", index=False)
     return output.getvalue()
 
 
-def build_velocidades_excel(df_vp, df_vs, df_vr, df_vmax, df_tramos_clean) -> bytes:
+def build_camiones_excel(df_vp, df_vs, df_vr, df_vmax, df_mat_est, df_rank_int, df_tramos_clean) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_vp.to_excel(writer, sheet_name="1_Vel_Entre_Paradas", index=False)
         df_vs.to_excel(writer, sheet_name="2_Vel_Deposito_Salida", index=False)
         df_vr.to_excel(writer, sheet_name="3_Vel_Deposito_Llegada", index=False)
-        df_vmax.to_excel(writer, sheet_name="4_Vel_Maxima_P95_P98", index=False)
-        df_tramos_clean.to_excel(writer, sheet_name="5_Base_Limpia_Tramos", index=False)
+        df_vmax.to_excel(writer, sheet_name="4_Vel_Maxima_P95", index=False)
+        df_mat_est.to_excel(writer, sheet_name="5_Estadias_CD_x_Camion", index=False)
+        df_rank_int.to_excel(writer, sheet_name="6_Ranking_Internos", index=False)
+        df_tramos_clean.to_excel(writer, sheet_name="7_Base_Limpia_Tramos", index=False)
     return output.getvalue()
 
 
@@ -1039,6 +1040,156 @@ def _rank_tiendas_s3_cached(
     agg_main["Min / 100 Bultos"] = agg_main["_m100"].round(1)
 
     return agg_main[cols_out].sort_values("Demora Extra (min)", ascending=False).reset_index(drop=True)
+
+
+
+@st.cache_data(show_spinner=False)
+def _rank_internos_s4_cached(
+    df_all_s3: pd.DataFrame,
+    st_clean_s3: pd.DataFrame,
+    tr_clean_all: pd.DataFrame,
+    min_vis_int: int,
+    filtro_cd_int: str,
+    filtro_tv_int: str,
+) -> pd.DataFrame:
+    cols_out = [
+        "CD",
+        "Interno",
+        "Dominio",
+        "Tipo Camión",
+        "Satelital",
+        "Paradas Totales",
+        "Paradas Limpias",
+        "% Represent.",
+        "Mediana Bultos",
+        "Mediana Est. (min)",
+        "P90 Est. (min)",
+        "Mediana Tipo Camión (min)",
+        "Base Tipo Camión (Internos / Paradas)",
+        "Demora Extra (min)",
+        "Vel. Entre Paradas (km/h)",
+        "Min / 100 Bultos",
+    ]
+    if st_clean_s3.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    # Identificador operativo de unidad: Interno de UNIGIS si es válido; si es S/D/0, usa Dominio
+    def _unit_id(df_x: pd.DataFrame) -> pd.Series:
+        ic = _clean_int_str(df_x["Interno"]).fillna(df_x["Interno"].fillna("").astype(str).str.strip())
+        dom = df_x["Dominio"].fillna("S/D").astype(str).str.strip().str.upper()
+        return np.where(ic.isin(["", "0", "S/D", "NAN", "None"]), "S/D (" + dom + ")", ic)
+
+    st_c = st_clean_s3.copy()
+    st_c["_unit"] = _unit_id(st_c)
+    st_c["Tipo_Vehiculo"] = st_c["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+
+    # Referencia por Tipo de Camión (a nivel global del período filtrado)
+    veh_ref = (
+        st_c.assign(_pair=st_c["Operacion"].astype(str) + "_" + st_c["_unit"].astype(str))
+        .groupby("Tipo_Vehiculo", as_index=False)
+        .agg(
+            Mediana_Veh=("Tiempo de Estadia", "median"),
+            Units_Veh=("_pair", "nunique"),
+            Paradas_Veh=("Tiempo de Estadia", "count"),
+        )
+    )
+    veh_ref["Base_Veh_Str"] = (
+        veh_ref["Units_Veh"].map(lambda x: f"{int(x):,}".replace(",", "."))
+        + " int. ("
+        + veh_ref["Paradas_Veh"].map(lambda x: f"{int(x):,}".replace(",", "."))
+        + " par.)"
+    )
+
+    # Paradas Totales por unidad
+    tot_b = df_all_s3.copy()
+    tot_b["_unit"] = _unit_id(tot_b)
+    if filtro_cd_int != "Todos":
+        tot_b = tot_b[tot_b["Operacion"].astype(int).astype(str) == str(filtro_cd_int)]
+    if filtro_tv_int != "Todos":
+        tot_b = tot_b[tot_b["Tipo_Vehiculo"].fillna("Sin dato").astype(str) == filtro_tv_int]
+    tot_cnt = (
+        tot_b.groupby(["Operacion", "_unit"], as_index=False)
+        .size()
+        .rename(columns={"size": "Paradas_Totales"})
+    )
+
+    rk_b = st_c.copy()
+    if filtro_cd_int != "Todos":
+        rk_b = rk_b[rk_b["Operacion"].astype(int).astype(str) == str(filtro_cd_int)]
+    if filtro_tv_int != "Todos":
+        rk_b = rk_b[rk_b["Tipo_Vehiculo"] == filtro_tv_int]
+    if rk_b.empty:
+        return pd.DataFrame(columns=cols_out)
+
+    rk_b = rk_b.merge(veh_ref[["Tipo_Vehiculo", "Mediana_Veh", "Base_Veh_Str"]], on="Tipo_Vehiculo", how="left")
+
+    g_cnt = rk_b.groupby(["Operacion", "_unit"]).size()
+    valid_u = g_cnt[g_cnt >= min_vis_int].index
+    if len(valid_u) == 0:
+        return pd.DataFrame(columns=cols_out)
+
+    rk_sub = rk_b.set_index(["Operacion", "_unit"]).loc[valid_u].reset_index()
+
+    agg_u = rk_sub.groupby(["Operacion", "_unit"], as_index=False).agg(
+        Dominio=("Dominio", lambda s: " / ".join(sorted(s.dropna().astype(str).unique()))),
+        Tipo_Camion=("Tipo_Vehiculo", lambda s: s.value_counts().index[0]),
+        Satelital=("Satelital", lambda s: s.value_counts().index[0]),
+        Paradas_Limpias=("Tiempo de Estadia", "count"),
+        Mediana_Bultos=("Total Bultos_num", "median"),
+        Mediana_Est=("Tiempo de Estadia", "median"),
+        P90_Est=("Tiempo de Estadia", lambda s: float(np.percentile(s.dropna(), 90))),
+        Med_Veh_Val=("Mediana_Veh", "mean"),
+        Base_Veh_Main=("Base_Veh_Str", lambda s: s.value_counts().index[0]),
+    )
+    agg_u = agg_u.merge(tot_cnt, on=["Operacion", "_unit"], how="left")
+    agg_u["Paradas_Totales"] = agg_u["Paradas_Totales"].fillna(agg_u["Paradas_Limpias"]).astype(int)
+
+    # Productividad Min / 100 Bultos
+    prod_u = rk_sub[rk_sub["Total Bultos_num"].fillna(0) >= 20].copy()
+    if not prod_u.empty:
+        prod_u["_m100"] = prod_u["Tiempo de Estadia"] / (prod_u["Total Bultos_num"] / 100.0)
+        m100_u = prod_u.groupby(["Operacion", "_unit"], as_index=False)["_m100"].median()
+        agg_u = agg_u.merge(m100_u, on=["Operacion", "_unit"], how="left")
+    else:
+        agg_u["_m100"] = np.nan
+
+    # Velocidad mediana entre paradas por unidad
+    if not tr_clean_all.empty:
+        tr_u = tr_clean_all[tr_clean_all["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"].copy()
+        if not tr_u.empty:
+            tr_u["_unit"] = _unit_id(tr_u)
+            vel_u = (
+                tr_u.groupby(["Operacion", "_unit"], as_index=False)["Vel_Calculada"]
+                .median()
+                .rename(columns={"Vel_Calculada": "_vel_med"})
+            )
+            agg_u = agg_u.merge(vel_u, on=["Operacion", "_unit"], how="left")
+        else:
+            agg_u["_vel_med"] = np.nan
+    else:
+        agg_u["_vel_med"] = np.nan
+
+    agg_u["CD"] = agg_u["Operacion"].astype(int).astype(str)
+    agg_u["Interno"] = agg_u["_unit"].astype(str)
+    agg_u["Tipo Camión"] = agg_u["Tipo_Camion"]
+    agg_u["Paradas Totales"] = agg_u["Paradas_Totales"]
+    agg_u["Paradas Limpias"] = agg_u["Paradas_Limpias"].astype(int)
+    agg_u["% Represent."] = np.where(
+        agg_u["Paradas Totales"] > 0,
+        (agg_u["Paradas Limpias"] / agg_u["Paradas Totales"] * 100).round(1),
+        100.0,
+    )
+    agg_u["Mediana Bultos"] = agg_u["Mediana_Bultos"].round(0)
+    agg_u["Mediana Est. (min)"] = agg_u["Mediana_Est"].round(0)
+    agg_u["P90 Est. (min)"] = agg_u["P90_Est"].round(0)
+    agg_u["Mediana Tipo Camión (min)"] = agg_u["Med_Veh_Val"].round(1)
+    agg_u["Base Tipo Camión (Internos / Paradas)"] = agg_u["Base_Veh_Main"]
+    agg_u["Demora Extra (min)"] = (agg_u["Mediana_Est"] - agg_u["Med_Veh_Val"]).round(1)
+    agg_u["Vel. Entre Paradas (km/h)"] = agg_u["_vel_med"].round(1)
+    agg_u["Min / 100 Bultos"] = agg_u["_m100"].round(1)
+
+    return agg_u[cols_out].sort_values("Demora Extra (min)", ascending=False).reset_index(drop=True)
+
 
 # -----------------------------------------------------------------------------
 # CARGA AUTOMATICA DE DATOS (SILENCIOSA PARA PRIORIZAR FILTROS EN SIDEBAR)
@@ -1275,8 +1426,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(
         "📊 1. Conciliación Macro (WMS vs. TMS)",
         "📍 2. Visitas GPS y Geocercas",
         "🏪 3. Estadías y Productividad en Tienda",
-        "🛣️ 4. Velocidades Camiones",
-        "🚛 5. Viajes y Jornadas",
+        "🚛 4. Camiones",
+        "📅 5. Viajes y Jornadas",
     ]
 )
 
@@ -3227,43 +3378,22 @@ with tab3:
         df_plot_s3 = st_clean_s3.copy()
         df_tot_plot_s3 = dq_stores_filt.copy()
 
-        # Caso especial: Analisis de una Tienda puntual con selector de CD + buscador de Tienda
+        # Caso especial: Analisis de una Tienda puntual (solo desplegable de Tienda; respeta CD del menu lateral)
+        chart_title_s3 = None
         if dim_col == "Tienda_Puntual":
-            cds_disp_s3 = sorted(df_plot_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
-            t_c1, t_c2, t_c3 = st.columns([0.85, 1.35, 1.15])
+            tiendas_unicas_s3 = sorted(
+                df_plot_s3["Tienda_Cod"].dropna().astype(str).unique().tolist(),
+                key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+            )
+            t_c1, t_c2 = st.columns([1.4, 1.2])
             with t_c1:
-                cd_t_sel = st.selectbox(
-                    "CD de la tienda:",
-                    options=["Todos"] + cds_disp_s3,
-                    index=0,
-                    key="s3_cd_tienda_sel",
-                )
-            df_t_cand = (
-                df_plot_s3
-                if cd_t_sel == "Todos"
-                else df_plot_s3[df_plot_s3["Operacion"].astype(int).astype(str) == cd_t_sel]
-            )
-            tiendas_opts_df = (
-                df_t_cand.groupby(["Tienda_Cod", "Operacion"], as_index=False)
-                .size()
-                .sort_values(["Tienda_Cod", "Operacion"], ascending=[True, True])
-            )
-            tiendas_opts_df["lbl"] = (
-                tiendas_opts_df["Tienda_Cod"].astype(str)
-                + " (CD "
-                + tiendas_opts_df["Operacion"].astype(int).astype(str)
-                + " — "
-                + tiendas_opts_df["size"].astype(str)
-                + " visitas)"
-            )
-            with t_c2:
-                tienda_sel_lbl = st.selectbox(
-                    "Buscar / elegir Tienda (escribí el código):",
-                    options=tiendas_opts_df["lbl"].tolist(),
+                t_cod_sel = st.selectbox(
+                    "Seleccionar / buscar Tienda:",
+                    options=tiendas_unicas_s3,
                     index=0,
                     key="s3_tienda_puntual_sel",
                 )
-            with t_c3:
+            with t_c2:
                 eje_tienda_tiempo = st.radio(
                     "Eje temporal:",
                     options=["Semana", "Mes", "Fecha (Día)"],
@@ -3272,17 +3402,12 @@ with tab3:
                     key="s3_eje_tienda_t",
                 )
 
-            if not tiendas_opts_df.empty and tienda_sel_lbl:
-                sel_row_t = tiendas_opts_df[tiendas_opts_df["lbl"] == tienda_sel_lbl].iloc[0]
-                t_cod_sel = sel_row_t["Tienda_Cod"]
-                op_cod_sel = sel_row_t["Operacion"]
-
-                df_plot_s3 = df_plot_s3[
-                    (df_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_plot_s3["Operacion"] == op_cod_sel)
-                ].copy()
-                df_tot_plot_s3 = df_tot_plot_s3[
-                    (df_tot_plot_s3["Tienda_Cod"] == t_cod_sel) & (df_tot_plot_s3["Operacion"] == op_cod_sel)
-                ].copy()
+            if t_cod_sel:
+                df_plot_s3 = df_plot_s3[df_plot_s3["Tienda_Cod"].astype(str) == str(t_cod_sel)].copy()
+                df_tot_plot_s3 = df_tot_plot_s3[df_tot_plot_s3["Tienda_Cod"].astype(str) == str(t_cod_sel)].copy()
+                cds_de_tienda = sorted(df_plot_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+                cd_titulo_str = f"CD {', '.join(cds_de_tienda)}" if cds_de_tienda else "Todos los CDs"
+                chart_title_s3 = f"{cd_titulo_str} y Tienda {t_cod_sel}"
 
             if eje_tienda_tiempo == "Mes":
                 active_dim = "Evol_Mes"
@@ -3488,8 +3613,9 @@ with tab3:
             )
 
         fig_box.update_layout(
+            title=chart_title_s3 if chart_title_s3 else None,
             height=410,
-            margin=dict(l=20, r=20, t=30, b=20),
+            margin=dict(l=20, r=20, t=42 if chart_title_s3 else 30, b=20),
             yaxis_title="Tiempo de Estadía en Tienda (minutos)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(tickangle=-35 if len(cat_order) > 12 else 0),
@@ -3564,64 +3690,9 @@ with tab3:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 2: MATRIZ CD x TIPO DE VEHICULO (NOMINA) + FASES PUERTA TRASERA
+    # BLOQUE 2: TOP TIENDAS (MAYOR DEMORA vs. MENOR ESTADIA)
     # -------------------------------------------------------------------------
-    st.markdown("### 2. Matriz por Operación (CD) y Tipo de Vehículo (Nómina)")
-
-    mat_display = pd.DataFrame()
-    if not st_clean_s3.empty:
-        piv_med_veh = (
-            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
-            .pivot_table(
-                index="CD_Str",
-                columns="Tipo_Vehiculo",
-                values="Tiempo de Estadia",
-                aggfunc="median",
-            )
-            .round(0)
-        )
-        piv_cnt_veh = (
-            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
-            .pivot_table(
-                index="CD_Str",
-                columns="Tipo_Vehiculo",
-                values="Tiempo de Estadia",
-                aggfunc="count",
-            )
-            .fillna(0)
-            .astype(int)
-        )
-
-        mat_display = pd.DataFrame(index=piv_med_veh.index)
-        for col_v in piv_med_veh.columns:
-            mat_display[col_v] = [
-                f"{int(piv_med_veh.loc[idx_r, col_v])} min (n={piv_cnt_veh.loc[idx_r, col_v]:,})".replace(",", ".")
-                if pd.notna(piv_med_veh.loc[idx_r, col_v]) and piv_cnt_veh.loc[idx_r, col_v] > 0
-                else "—"
-                for idx_r in piv_med_veh.index
-            ]
-        mat_display = mat_display.reset_index().rename(columns={"CD_Str": "Operación"})
-        st.dataframe(mat_display, use_container_width=True, hide_index=True)
-
-        with st.expander("🚪 Fases de Estadía en Tienda (Sensor Puerta Trasera)", expanded=False):
-            st.markdown(
-                """
-                Cuando UNIGIS active la telemetría de puerta trasera (`Apertura Puerta Trasera` y `Cierre Puerta Trasera`),
-                este bloque abrirá automáticamente cada estadía en sus **3 fases operativas**:
-                1. **Fase 1 — Espera / Recepción en Tienda:** `Apertura Puerta Trasera − Inicio Horario Visita Real` *(demora hasta que abren cortina/reciben)*.
-                2. **Fase 2 — Descarga Efectiva:** `Minutos Apertura y Cierre` *(tiempo real de descarga física de mercadería)*.
-                3. **Fase 3 — Cierre Documental y Egreso:** `Fecha Hora Salida − Cierre Puerta Trasera` *(demora de remito/firma y salida de geocerca)*.
-                """
-            )
-            if puerta_activa_cnt == 0:
-                st.info("Estado actual del archivo UNIGIS: las 3 columnas de puerta trasera vienen en `0` en el 100% de las paradas.")
-
-    st.divider()
-
-    # -------------------------------------------------------------------------
-    # BLOQUE 3: TOP TIENDAS (MAYOR DEMORA vs. MENOR ESTADIA)
-    # -------------------------------------------------------------------------
-    st.markdown("### 3. Ranking de Tiendas: Mayor Demora vs. Menor Estadía (vs. Mediana del Segmento)")
+    st.markdown("### 2. Ranking de Tiendas: Mayor Demora vs. Menor Estadía (vs. Mediana del Segmento)")
     st.caption(
         "Compara la **Mediana de Estadía** de cada tienda contra la **Mediana del Segmento** (`Tipo de Viaje` + `Categoría`), "
         "mostrando el segmento exacto contra el que se compara y las **Visitas Totales** vs. **Visitas Limpias**."
@@ -3824,7 +3895,6 @@ with tab3:
             clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
         estadias_excel_bytes = build_estadias_excel(
             df_seg_summary,
-            mat_display,
             df_rk_tiendas,
             clean_s3_export,
         )
@@ -3858,17 +3928,17 @@ with tab3:
     )
 
 # =============================================================================
-# SOLAPA 4: VELOCIDADES CAMIONES
+# SOLAPA 4: CAMIONES (VELOCIDADES, ESTADIAS POR TIPO DE CAMION Y RANKING INTERNOS)
 # =============================================================================
 with tab4:
-    st.subheader("Velocidades Camiones (Tramos y Tránsitos)")
+    st.subheader("Camiones: Velocidades, Estadías por Tipo de Vehículo y Ranking de Internos")
     st.caption(
-        "Muestra independiente sobre tramos válidos, abierta por Operación (CD), Tipo de Vehículo (Nómina) y Categoría (Cercana vs. Lejana). "
-        "Separa `Salida de Depósito (CD -> 1ª Tienda)`, `Entre Paradas (Tienda -> Tienda)` y `Retorno a Depósito (Última Tienda -> CD)`."
+        "Vista integral de la flota (cruzada con `Nomina.xlsx` por patente): "
+        "analiza **velocidades por tramo**, **estadías en tienda por tipo de camión** y **desempeño individual por Interno**."
     )
 
     cat_v_sel = st.radio(
-        "Filtrar Categoría de Viaje (actualiza tarjetas y matrices):",
+        "Filtrar Categoría de Viaje (actualiza tarjetas y matrices de velocidad):",
         options=["Todas", "Cercana", "Lejana"],
         index=0,
         horizontal=True,
@@ -3977,8 +4047,6 @@ with tab4:
     ).round(1)
 
     # 2. Limpieza de Retornos (Última Tienda -> CD) para Velocidad Depósito Llegada
-    # UNIGIS entrega KMS Retorno y Tiempo Retorno; se excluyen viajes con 'Error en finalizacion'
-    # y retornos con reloj abierto (>360 min Cercana / >720 min Lejana).
     max_ret_vec_v = np.where(dq_trips_filt["Categoria"] == "Lejana", max_ret_cerc_v * 2, max_ret_cerc_v)
     tr_ret = dq_trips_filt[
         (~dq_trips_filt["obs_err_fin"])
@@ -4064,11 +4132,10 @@ with tab4:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: MATRICES POR OPERACION (CD) Y TIPO DE VEHICULO (NOMINA)
+    # BLOQUE 1: VELOCIDADES POR OPERACION (CD) Y TIPO DE VEHICULO (NOMINA)
     # -------------------------------------------------------------------------
     st.markdown(f"### 1. Velocidades por Operación (CD) y Tipo de Vehículo — Categoría: `{cat_v_sel}`")
 
-    # Tabla comparativa rapida Cercana vs Lejana
     cat_comp_rows = []
     for c_name in ["Cercana", "Lejana"]:
         sub_c = tr_clean_all[tr_clean_all["Categoria"] == c_name]
@@ -4154,7 +4221,7 @@ with tab4:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 2: DIAGRAMAS DE CAJAS DE VELOCIDADES + DESCARGA EXCEL
+    # BLOQUE 2: DIAGRAMAS DE CAJAS DE VELOCIDADES
     # -------------------------------------------------------------------------
     st.markdown("### 2. Distribución de Velocidades por Segmento (Diagrama de Cajas)")
 
@@ -4207,12 +4274,12 @@ with tab4:
                     lo, hi = _tukey_v(sv)
                     q1v, medv, q3v = np.percentile(sv, [25, 50, 75])
                     xc.append(cv)
-                    lf.append(lo)
-                    q1l.append(q1v)
-                    medl.append(medv)
-                    q3l.append(q3v)
-                    uf.append(hi)
-                    mnl.append(float(sv.mean()))
+                    lf.append(round(lo, 1))
+                    q1l.append(round(q1v, 1))
+                    medl.append(round(medv, 1))
+                    q3l.append(round(q3v, 1))
+                    uf.append(round(hi, 1))
+                    mnl.append(round(float(sv.mean()), 1))
                 fig_vbox.add_trace(
                     go.Box(
                         x=xc,
@@ -4248,14 +4315,338 @@ with tab4:
         )
         st.plotly_chart(fig_vbox, use_container_width=True)
 
-    tr_clean_exp = tr_clean.copy()
-    tr_clean_exp["Fecha Reparto"] = tr_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-    vel_excel_bytes = build_velocidades_excel(mat_vp, mat_vs, mat_vr, mat_vmax, tr_clean_exp)
-    st.download_button(
-        label="📥 Descargar Tablas de Velocidades y Base Limpia (.xlsx)",
-        data=vel_excel_bytes,
-        file_name="Velocidades_Camiones_por_CD_y_Vehiculo.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 3: ESTADIAS EN TIENDA POR OPERACION (CD) Y TIPO DE CAMION (NOMINA)
+    # -------------------------------------------------------------------------
+    st.markdown("### 3. Estadías en Tienda por Operación (CD) y Tipo de Camión (Nómina)")
+    st.caption(
+        "Mediana de tiempo de descarga en tienda y cantidad de paradas limpias según el porte del vehículo (`Nomina.xlsx`)."
+    )
+
+    mat_display_s4 = pd.DataFrame()
+    if not st_clean_s3.empty:
+        piv_med_veh = (
+            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
+            .pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values="Tiempo de Estadia",
+                aggfunc="median",
+            )
+            .round(0)
+        )
+        piv_cnt_veh = (
+            st_clean_s3.assign(CD_Str="CD " + st_clean_s3["Operacion"].astype(str))
+            .pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values="Tiempo de Estadia",
+                aggfunc="count",
+            )
+            .fillna(0)
+            .astype(int)
+        )
+
+        mat_display_s4 = pd.DataFrame(index=piv_med_veh.index)
+        for col_v in piv_med_veh.columns:
+            mat_display_s4[col_v] = [
+                f"{int(piv_med_veh.loc[idx_r, col_v])} min (n={piv_cnt_veh.loc[idx_r, col_v]:,})".replace(",", ".")
+                if pd.notna(piv_med_veh.loc[idx_r, col_v]) and piv_cnt_veh.loc[idx_r, col_v] > 0
+                else "—"
+                for idx_r in piv_med_veh.index
+            ]
+        mat_display_s4 = mat_display_s4.reset_index().rename(columns={"CD_Str": "Operación"})
+        st.dataframe(mat_display_s4, use_container_width=True, hide_index=True)
+
+        with st.expander("🚪 Fases de Estadía en Tienda (Sensor Puerta Trasera)", expanded=False):
+            st.markdown(
+                """
+                Cuando UNIGIS active la telemetría de puerta trasera (`Apertura Puerta Trasera` y `Cierre Puerta Trasera`),
+                este bloque abrirá automáticamente cada estadía en sus **3 fases operativas**:
+                1. **Fase 1 — Espera / Recepción en Tienda:** `Apertura Puerta Trasera − Inicio Horario Visita Real` *(demora hasta que abren cortina/reciben)*.
+                2. **Fase 2 — Descarga Efectiva:** `Minutos Apertura y Cierre` *(tiempo real de descarga física de mercadería)*.
+                3. **Fase 3 — Cierre Documental y Egreso:** `Fecha Hora Salida − Cierre Puerta Trasera` *(demora de remito/firma y salida de geocerca)*.
+                """
+            )
+            if puerta_activa_cnt == 0:
+                st.info("Estado actual del archivo UNIGIS: las 3 columnas de puerta trasera vienen en `0` en el 100% de las paradas.")
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 4: RANKING DE INTERNOS / UNIDADES (MAYOR DEMORA vs. MAS AGILES)
+    # -------------------------------------------------------------------------
+    st.markdown("### 4. Ranking de Internos: Mayor Estadía vs. Más Ágiles (vs. Mediana del Tipo de Camión)")
+    st.caption(
+        "Compara la **Mediana de Estadía** de cada Interno contra la **Mediana de su Tipo de Camión** (`CHASIS`, `BALANCIN`, `SEMI`, `AVISPA`, etc.), "
+        "mostrando también sus **Paradas Totales** vs. **Paradas Limpias** y su **Velocidad Entre Paradas**."
+    )
+
+    cds_int_opts = ["Todos"] + (
+        sorted(st_clean_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+        if not st_clean_s3.empty
+        else []
+    )
+    tv_int_opts = ["Todos"] + (
+        sorted(st_clean_s3["Tipo_Vehiculo"].dropna().astype(str).unique().tolist())
+        if not st_clean_s3.empty
+        else []
+    )
+
+    ic0, ic1, ic2, ic3 = st.columns([0.9, 0.9, 1.0, 1.3])
+    with ic0:
+        filtro_cd_int = st.selectbox(
+            "Filtrar por CD:",
+            options=cds_int_opts,
+            index=0,
+            key="s4_cd_int",
+        )
+    with ic1:
+        top_n_int = st.selectbox(
+            "Cantidad Top:",
+            options=[10, 15, 20, 30, 50],
+            index=1,
+            key="s4_top_n_int",
+        )
+    with ic2:
+        min_vis_int = st.number_input(
+            "Mín. paradas limpias:",
+            min_value=1,
+            max_value=200,
+            value=10,
+            step=5,
+            key="s4_min_vis_int",
+        )
+    with ic3:
+        filtro_tv_int = st.selectbox(
+            "Filtrar por Tipo de Camión:",
+            options=tv_int_opts,
+            index=0,
+            key="s4_tv_int",
+        )
+
+    orden_top_int = st.radio(
+        "Ordenar ranking de internos por:",
+        options=[
+            "Demora Extra vs. Mediana Tipo Camión (min)",
+            "Estadía Mediana Absoluta (min)",
+            "Productividad (Min / 100 Bultos)",
+            "Velocidad Entre Paradas (km/h)",
+        ],
+        index=0,
+        horizontal=True,
+        key="s4_orden_top_int",
+    )
+
+    df_rk_internos = _rank_internos_s4_cached(
+        dq_stores_filt,
+        st_clean_s3,
+        tr_clean_all,
+        int(min_vis_int),
+        filtro_cd_int,
+        filtro_tv_int,
+    )
+
+    if not df_rk_internos.empty:
+        if orden_top_int == "Estadía Mediana Absoluta (min)":
+            df_rk_internos = df_rk_internos.sort_values("Mediana Est. (min)", ascending=False).reset_index(drop=True)
+            m_col_i = "Mediana Est. (min)"
+            m_lbl_i = "Mediana Estadía (min)"
+        elif orden_top_int == "Productividad (Min / 100 Bultos)":
+            df_rk_internos = df_rk_internos.sort_values("Min / 100 Bultos", ascending=False, na_position="last").reset_index(drop=True)
+            m_col_i = "Min / 100 Bultos"
+            m_lbl_i = "Min / 100 Bultos"
+        elif orden_top_int == "Velocidad Entre Paradas (km/h)":
+            df_rk_internos = df_rk_internos.sort_values("Vel. Entre Paradas (km/h)", ascending=False, na_position="last").reset_index(drop=True)
+            m_col_i = "Vel. Entre Paradas (km/h)"
+            m_lbl_i = "Velocidad Entre Paradas (km/h)"
+        else:
+            m_col_i = "Demora Extra (min)"
+            m_lbl_i = "Demora Extra vs. Tipo Camión (min)"
+
+        valid_int_df = df_rk_internos.dropna(subset=[m_col_i]).copy()
+        valid_int_df["Int_Label"] = (
+            "Int. "
+            + valid_int_df["Interno"]
+            + " ("
+            + valid_int_df["Dominio"]
+            + " | CD "
+            + valid_int_df["CD"]
+            + " · "
+            + valid_int_df["Tipo Camión"]
+            + ")"
+        )
+
+        col_int_hi, col_int_lo = st.columns(2)
+
+        with col_int_hi:
+            top_int_hi = valid_int_df.head(int(top_n_int)).iloc[::-1].copy()
+            c_int_hi = [
+                "#1d4ed8"
+                if m_col_i == "Vel. Entre Paradas (km/h)"
+                else ("#dc2626" if v >= 20 else ("#f59e0b" if v > 0 else "#16a34a"))
+                for v in top_int_hi["Demora Extra (min)"]
+            ]
+            fig_int_hi = go.Figure(
+                data=go.Bar(
+                    x=top_int_hi[m_col_i],
+                    y=top_int_hi["Int_Label"],
+                    orientation="h",
+                    marker_color=c_int_hi,
+                    text=[
+                        f"+{v:.0f}m"
+                        if (m_col_i == "Demora Extra (min)" and v > 0)
+                        else f"{v:.1f}"
+                        if m_col_i in {"Min / 100 Bultos", "Vel. Entre Paradas (km/h)"}
+                        else f"{v:.0f}m"
+                        for v in top_int_hi[m_col_i]
+                    ],
+                    textposition="outside",
+                    customdata=np.dstack(
+                        (
+                            top_int_hi["Mediana Est. (min)"],
+                            top_int_hi["Mediana Tipo Camión (min)"],
+                            top_int_hi["Tipo Camión"],
+                            top_int_hi["Base Tipo Camión (Internos / Paradas)"],
+                            top_int_hi["Paradas Limpias"],
+                            top_int_hi["Paradas Totales"],
+                            top_int_hi["Vel. Entre Paradas (km/h)"].fillna(0),
+                        )
+                    )[0],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Tipo Camión: <b>%{customdata[2]}</b><br>"
+                        "Mediana Interno: <b>%{customdata[0]:.0f} min</b> | Mediana Tipo Camión: <b>%{customdata[1]:.0f} min</b><br>"
+                        "Referencia formada por: %{customdata[3]}<br>"
+                        "Paradas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales | Vel. Mediana: %{customdata[6]:.1f} km/h"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            max_i_hi = float(top_int_hi[m_col_i].max()) if not top_int_hi.empty else 100.0
+            title_hi_int = (
+                f"⚡ Top {len(top_int_hi)} Mayor Velocidad — {m_lbl_i}"
+                if m_col_i == "Vel. Entre Paradas (km/h)"
+                else f"🔴 Top {len(top_int_hi)} Mayor Estadía — {m_lbl_i}"
+            )
+            fig_int_hi.update_layout(
+                title=title_hi_int,
+                height=max(350, len(top_int_hi) * 26 + 90),
+                margin=dict(l=10, r=55, t=40, b=20),
+                xaxis_title=m_lbl_i,
+                yaxis_title="",
+                xaxis=dict(range=[min(0.0, float(top_int_hi[m_col_i].min())), max_i_hi * 1.24]),
+            )
+            st.plotly_chart(fig_int_hi, use_container_width=True)
+
+        with col_int_lo:
+            top_int_lo = valid_int_df.tail(int(top_n_int)).copy()
+            top_int_lo = top_int_lo.sort_values(m_col_i, ascending=False)
+            c_int_lo = [
+                "#f59e0b"
+                if m_col_i == "Vel. Entre Paradas (km/h)"
+                else ("#16a34a" if v <= 0 else ("#3b82f6" if v < 15 else "#f59e0b"))
+                for v in top_int_lo["Demora Extra (min)"]
+            ]
+            fig_int_lo = go.Figure(
+                data=go.Bar(
+                    x=top_int_lo[m_col_i],
+                    y=top_int_lo["Int_Label"],
+                    orientation="h",
+                    marker_color=c_int_lo,
+                    text=[
+                        f"{v:+.0f}m"
+                        if m_col_i == "Demora Extra (min)"
+                        else f"{v:.1f}"
+                        if m_col_i in {"Min / 100 Bultos", "Vel. Entre Paradas (km/h)"}
+                        else f"{v:.0f}m"
+                        for v in top_int_lo[m_col_i]
+                    ],
+                    textposition="outside",
+                    customdata=np.dstack(
+                        (
+                            top_int_lo["Mediana Est. (min)"],
+                            top_int_lo["Mediana Tipo Camión (min)"],
+                            top_int_lo["Tipo Camión"],
+                            top_int_lo["Base Tipo Camión (Internos / Paradas)"],
+                            top_int_lo["Paradas Limpias"],
+                            top_int_lo["Paradas Totales"],
+                            top_int_lo["Vel. Entre Paradas (km/h)"].fillna(0),
+                        )
+                    )[0],
+                    hovertemplate=(
+                        "<b>%{y}</b><br>"
+                        "Tipo Camión: <b>%{customdata[2]}</b><br>"
+                        "Mediana Interno: <b>%{customdata[0]:.0f} min</b> | Mediana Tipo Camión: <b>%{customdata[1]:.0f} min</b><br>"
+                        "Referencia formada por: %{customdata[3]}<br>"
+                        "Paradas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales | Vel. Mediana: %{customdata[6]:.1f} km/h"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            min_i_lo = float(top_int_lo[m_col_i].min()) if not top_int_lo.empty else -30.0
+            max_i_lo = float(top_int_lo[m_col_i].max()) if not top_int_lo.empty else 30.0
+            title_lo_int = (
+                f"🐢 Top {len(top_int_lo)} Menor Velocidad — {m_lbl_i}"
+                if m_col_i == "Vel. Entre Paradas (km/h)"
+                else f"🟢 Top {len(top_int_lo)} Más Ágiles — {m_lbl_i}"
+            )
+            fig_int_lo.update_layout(
+                title=title_lo_int,
+                height=max(350, len(top_int_lo) * 26 + 90),
+                margin=dict(l=10, r=55, t=40, b=20),
+                xaxis_title=m_lbl_i,
+                yaxis_title="",
+                xaxis=dict(range=[min_i_lo * 1.26 if min_i_lo < 0 else 0.0, max(10.0, max_i_lo * 1.24)]),
+            )
+            st.plotly_chart(fig_int_lo, use_container_width=True)
+
+    with st.expander("📥 Descargar Excel Completo de Camiones (.xlsx)", expanded=False):
+        tr_clean_exp = tr_clean.copy()
+        if not tr_clean_exp.empty:
+            tr_clean_exp["Fecha Reparto"] = tr_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+        vel_excel_bytes = build_camiones_excel(
+            mat_vp,
+            mat_vs,
+            mat_vr,
+            mat_vmax,
+            mat_display_s4,
+            df_rk_internos,
+            tr_clean_exp,
+        )
+        st.download_button(
+            label="📥 Descargar Reporte de Camiones (Velocidades, Estadías y Ranking Internos) (.xlsx)",
+            data=vel_excel_bytes,
+            file_name="Analisis_Camiones_Velocidades_y_Estadias.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    st.dataframe(
+        df_rk_internos,
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "% Represent.": st.column_config.NumberColumn(
+                "% Represent.",
+                help="Paradas Limpias / Paradas Totales",
+                format="%.1f%%",
+            ),
+            "Demora Extra (min)": st.column_config.NumberColumn(
+                "Demora Extra (min)",
+                help="Diferencia en minutos contra la Mediana de su Tipo de Camión",
+                format="%+.1f min",
+            ),
+            "Vel. Entre Paradas (km/h)": st.column_config.NumberColumn(
+                "Vel. Entre Paradas (km/h)",
+                format="%.1f km/h",
+            ),
+            "Min / 100 Bultos": st.column_config.NumberColumn(
+                "Min / 100 Bultos",
+                format="%.1f",
+            ),
+        },
     )
 
 # =============================================================================
