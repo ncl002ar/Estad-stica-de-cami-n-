@@ -1684,6 +1684,8 @@ with tab2:
     )
 
     act_tarde_df = gps_filt[gps_filt["obs_act_tarde"]]
+    paradas_act_tarde_cnt = int(len(act_tarde_df))
+    pct_paradas_act_tarde = (paradas_act_tarde_cnt / tot_paradas * 100) if tot_paradas > 0 else 0.0
     viajes_act_tarde_cnt = int(act_tarde_df["Id Viaje"].nunique())
     viajes_act_tarde_ok_cnt = int(
         act_tarde_df.groupby("Id Viaje")["Diagnostico_GPS"]
@@ -1691,7 +1693,6 @@ with tab2:
         .sum()
     )
     viajes_act_tarde_fail_cnt = viajes_act_tarde_cnt - viajes_act_tarde_ok_cnt
-    pct_viajes_act_tarde = (viajes_act_tarde_cnt / viajes_gps_tot * 100) if viajes_gps_tot > 0 else 0.0
 
     geo_only_df = gps_filt[gps_filt["Diagnostico_GPS"] == "Falla Geocerca (Parcial)"]
     paradas_geo_act_ok = int((~geo_only_df["obs_act_tarde"]).sum())
@@ -1749,11 +1750,11 @@ with tab2:
     with g5:
         st.markdown(
             _kpi_card_html(
-                "Activación Tarde (Viajes)",
-                _fmt_int(viajes_act_tarde_cnt),
-                f"{_fmt_pct(pct_viajes_act_tarde)} de viajes (>5 km CD)",
+                "Activación Tarde (Paradas)",
+                _fmt_int(paradas_act_tarde_cnt),
+                f"{_fmt_pct(pct_paradas_act_tarde)} del total de paradas",
                 "#475569",
-                f"<b>{_fmt_int(viajes_act_tarde_ok_cnt)}</b> con visitas OK | <b>{_fmt_int(viajes_act_tarde_fail_cnt)}</b> c/ pérdida",
+                f"En <b>{_fmt_int(viajes_act_tarde_cnt)}</b> viajes (>5 km CD): <b>{_fmt_int(viajes_act_tarde_ok_cnt)}</b> OK | <b>{_fmt_int(viajes_act_tarde_fail_cnt)}</b> c/ pérdida",
             ),
             unsafe_allow_html=True,
         )
