@@ -232,7 +232,7 @@ def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
 
 
 @st.cache_data(max_entries=1, show_spinner="Procesando y conciliando bases AMREPA, UNIGIS y Nómina...")
-def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None):
+def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None, _schema_v: int = 3):
     # 1. Lectura de archivos Excel
     df_a_raw = pd.read_excel(io.BytesIO(amrepa_bytes), sheet_name=0)
     xls_u = pd.ExcelFile(io.BytesIO(unigis_bytes))
@@ -1772,8 +1772,13 @@ def _eval_viajes_jornadas_s5_cached(
     )
 
     # Usa salida real de CD (dt_fin_cd) o, si falto el sello de salida CD, reconstruye con el tiempo real de viaje a la 1a tienda
+    t_1ra_ser = (
+        trips_eval_s5["Tiempo_Viaje_1ra_min"]
+        if "Tiempo_Viaje_1ra_min" in trips_eval_s5.columns
+        else pd.Series(np.nan, index=trips_eval_s5.index)
+    )
     salida_cd_real_o_tramo = trips_eval_s5["dt_fin_cd"].fillna(
-        trips_eval_s5["Ini_Primera_Tienda"] - pd.to_timedelta(trips_eval_s5["Tiempo_Viaje_1ra_min"], unit="m")
+        trips_eval_s5["Ini_Primera_Tienda"] - pd.to_timedelta(t_1ra_ser, unit="m")
     )
     dt_ini_cd_imputado = salida_cd_real_o_tramo - pd.to_timedelta(
         trips_eval_s5["Estadia_CD_Std_min"], unit="m"
