@@ -815,6 +815,12 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         & dq_stores["prev_dt_fin_real"].notna()
         & (dq_stores["dt_ini_real"] < dq_stores["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
     )
+    st_1ra_viaje = (
+        dq_stores[(dq_stores["Orden Visita Tienda"] == 1) & (dq_stores["Tiempo en Viaje"].fillna(0) > 0)]
+        .groupby("Id Viaje", as_index=False)["Tiempo en Viaje"]
+        .first()
+        .rename(columns={"Tiempo en Viaje": "Tiempo_Viaje_1ra_min"})
+    )
     st_tt_def = (
         dq_stores.assign(_solape=has_sol_s5)
         .groupby("Id Viaje", as_index=False)
@@ -826,6 +832,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
             Max_Estadia_Tienda=("Tiempo de Estadia", "max"),
             Tiene_Solape=("_solape", "any"),
         )
+        .merge(st_1ra_viaje, on="Id Viaje", how="left")
     )
     trips_pre_s5 = dq_trips.merge(st_tt_def, on="Id Viaje", how="left")
     trips_pre_s5["dt_ini_cd"] = pd.to_datetime(trips_pre_s5["Ini_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
@@ -1764,8 +1771,11 @@ def _eval_viajes_jornadas_s5_cached(
         & (trips_eval_s5["Estadia_CD_Origen"].fillna(9999) <= float(max_cd_real_j))
     )
 
-    # Sin suposiciones arbitrarias: requiere hora real de salida de la geozona del CD (dt_fin_cd)
-    dt_ini_cd_imputado = trips_eval_s5["dt_fin_cd"] - pd.to_timedelta(
+    # Usa salida real de CD (dt_fin_cd) o, si falto el sello de salida CD, reconstruye con el tiempo real de viaje a la 1a tienda
+    salida_cd_real_o_tramo = trips_eval_s5["dt_fin_cd"].fillna(
+        trips_eval_s5["Ini_Primera_Tienda"] - pd.to_timedelta(trips_eval_s5["Tiempo_Viaje_1ra_min"], unit="m")
+    )
+    dt_ini_cd_imputado = salida_cd_real_o_tramo - pd.to_timedelta(
         trips_eval_s5["Estadia_CD_Std_min"], unit="m"
     )
 
@@ -5431,13 +5441,8 @@ with tab5:
                 unsafe_allow_html=True,
             )
 
-        # Tabla resumen de representatividad, embudo de recuperación y diagnóstico por CD
-        with st.expander("📊 Ver Cobertura, Embudo de Recuperación y Diagnóstico por CD", expanded=False):
-            act_lbl = f"<= {max_dist_act_km:.1f} km" if max_dist_act_km < 900 else "Sin límite km"
-            st.caption(
-                f"Dimensiona cuántos viajes son **100% Reales**, cuántos se recuperan limpiamente con **CD Ajustable ({act_lbl})**, "
-                f"y cuántos quedan fuera por **Activación Tardía (> {max_dist_act_km:.1f} km)** o por **falta de salida CD / GPS en tiendas**."
-            )
+        # Tabla resumen simplificada de cobertura y recuperación por CD
+        with st.expander("📊 Ver Cobertura por CD (Real vs. con Ajuste de Estadía CD)", expanded=False):
             cov_rows_s5 = []
             for op_s5 in sorted(trips_eval_s5["Operacion"].dropna().unique()):
                 sub_t5 = trips_eval_s5[trips_eval_s5["Operacion"] == op_s5]
@@ -5445,18 +5450,6 @@ with tab5:
                 vr_op = int(sub_t5["Viaje_OK_Real"].sum())
                 va_op = int(sub_t5["Viaje_OK_Ajust"].sum())
                 recup_op = max(0, va_op - vr_op)
-
-                # Viajes que tienen tiendas/KMS OK y salida real de CD, pero quedaron fuera por activacion tardia (> max_dist_act_km)
-                excl_act_op = int(
-                    (
-                        sub_t5["Tiendas_y_KMS_OK_Flag"]
-                        & (~sub_t5["Viaje_OK_Real"])
-                        & sub_t5["dt_fin_cd"].notna()
-                        & (~sub_t5["Act_Dist_OK_Flag"])
-                    ).sum()
-                )
-                # Resto de excluidos (sin dt_fin_cd o sin GPS/estadías válidas en tiendas)
-                excl_faltante_op = max(0, tv_op - va_op - excl_act_op)
 
                 sub_jr = jornadas_real_all[jornadas_real_all["Operacion"] == op_s5] if not jornadas_real_all.empty else pd.DataFrame()
                 sub_ja = jornadas_ajust_all[jornadas_ajust_all["Operacion"] == op_s5] if not jornadas_ajust_all.empty else pd.DataFrame()
@@ -5467,15 +5460,13 @@ with tab5:
                 cov_rows_s5.append(
                     {
                         "CD": str(int(op_s5)),
-                        "Std. CD": f"{int(cd_std_map.get(int(op_s5), med_std_fallback))}m",
+                        "Estadía Std. CD": f"{int(cd_std_map.get(int(op_s5), med_std_fallback))} min",
                         "Viajes Totales": tv_op,
-                        "Viajes OK (Real)": f"{vr_op:,} ({(vr_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        f"+Recup. CD ({act_lbl})": f"+{recup_op:,} ({(recup_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        "Viajes OK (Ajustado)": f"{va_op:,} ({(va_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        f"Excl. Activ. >{max_dist_act_km:.0f}km": f"{excl_act_op:,} ({(excl_act_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        "Excl. Faltante GPS/CD": f"{excl_faltante_op:,} ({(excl_faltante_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        "Jornadas OK (Real)": f"{jr_op:,} ({(jr_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
-                        "Jornadas OK (Ajustado)": f"{ja_op:,} ({(ja_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
+                        "Viajes Solo Reales": f"{vr_op:,} ({(vr_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
+                        "Viajes con Ajuste CD": f"{va_op:,} ({(va_op/tv_op*100 if tv_op else 0):.1f}%) [+{recup_op:,}]".replace(",", "."),
+                        "Jornadas Totales": tj_op,
+                        "Jornadas Solo Reales": f"{jr_op:,} ({(jr_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
+                        "Jornadas con Ajuste CD": f"{ja_op:,} ({(ja_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
                     }
                 )
             if cov_rows_s5:
@@ -6253,7 +6244,7 @@ with tab5:
                     "Muestra la evolución cronológica de una unidad puntual comparada contra la **mediana esperada de su segmento exacto** "
                     "e incluye el desglose completo de cada día/recorrido al pie."
                 )
-                f_s5_c1, f_s5_c2, f_s5_c3 = st.columns([1.2, 0.9, 1.3])
+                f_s5_c1, f_s5_c2, f_s5_c3, f_s5_c4 = st.columns([1.05, 0.75, 1.05, 1.35])
                 internos_opts_s5 = sorted(
                     trips_eval_s5["Interno_Clean"].dropna().unique().tolist(),
                     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
@@ -6287,6 +6278,13 @@ with tab5:
                         key="s5_cd_sel",
                     )
                 with f_s5_c3:
+                    tpv_int_sel = st.selectbox(
+                        "Tipo de Viaje:",
+                        options=["Todos", "Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"],
+                        index=0,
+                        key="s5_int_tpv_sel",
+                    )
+                with f_s5_c4:
                     metrica_int_s5 = st.radio(
                         "Métrica:",
                         options=["Viajes OK (Desglose CD + Viaje + Tiendas)", "Jornadas Diarias (1V vs. 2+ Vueltas)"],
@@ -6302,6 +6300,11 @@ with tab5:
                         sub_t_int = sub_t_int[sub_t_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
                         if not sub_j_int.empty:
                             sub_j_int = sub_j_int[sub_j_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
+                    if tpv_int_sel != "Todos":
+                        sub_t_int = sub_t_int[sub_t_int["Tipo_Viaje"].fillna("Sin dato").astype(str) == tpv_int_sel].copy()
+                        if not sub_j_int.empty and "Detalle_Viajes_Dia" in sub_j_int.columns:
+                            tpv_prefix = tpv_int_sel.split(" ")[0]
+                            sub_j_int = sub_j_int[sub_j_int["Detalle_Viajes_Dia"].str.contains(tpv_prefix, na=False)].copy()
 
                     dom_info = " / ".join(sorted(sub_t_int["Dominio"].dropna().astype(str).unique()))
                     tv_info = " / ".join(sorted(sub_t_int["Tipo_Vehiculo"].dropna().astype(str).unique()))
