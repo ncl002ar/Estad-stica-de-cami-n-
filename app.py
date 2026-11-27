@@ -10,6 +10,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+_ui_fragment = getattr(st, "fragment", getattr(st, "experimental_fragment", lambda f: f))
+
 try:
     import gdown
     HAS_GDOWN = True
