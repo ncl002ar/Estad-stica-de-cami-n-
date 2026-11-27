@@ -4817,21 +4817,64 @@ with tab4:
     )
 
 # =============================================================================
-# SOLAPA 5: VIAJES Y JORNADAS (1 vs 2+ VUELTAS CON LIMPIEZA ESTRICTA DE JORNADA)
+# SOLAPA 5: VIAJES Y JORNADAS (1 vs 2+ VUELTAS CON ESTADIA CD AJUSTABLE)
 # =============================================================================
 with tab5:
     st.subheader("Viajes y Jornadas Diarias (1 Vuelta vs. 2+ Vueltas)")
     st.caption(
-        "Paso 1: Se depura la base de **Viajes OK** (CD Origen OK + 100% Tiendas OK + sin incongruencias de tiempos/odómetro). "
-        "Paso 2: Para armar **Jornadas Camión-Día**, solo se incluyen días donde **el 100% de los viajes del camión en ese día quedaron en la base OK** "
-        "(si un camión hizo 2 viajes y 1 fue excluido por falta de datos, la jornada completa de ese día se excluye para no distorsionar horas ni vueltas)."
+        "Permite evaluar **dos escenarios**: **Solo Datos Reales** (únicamente viajes con entrada/salida real en CD y estadía <= 3 hs) "
+        "o **Base Estimada con Estadía CD Ajustable** (imputando el tiempo estándar de carga por CD cuando falta el dato por interfaz "
+        "o cuando el camión guardó dentro del predio > 3 hs). Todos los gráficos y tablas inferiores responden al interruptor."
     )
 
-    with st.expander("🎛️ Parámetros de Limpieza de Viajes OK y Jornadas (Ajustables)", expanded=False):
+    # Panel de control principal: Interruptor Real vs Ajustado + Tiempos estandar por CD
+    ctrl_s5_top1, ctrl_s5_top2 = st.columns([1.35, 1.65])
+    with ctrl_s5_top1:
+        usar_estadia_cd_ajust = st.toggle(
+            "🔄 Aplicar Estadía CD Ajustable (cuando falta dato o es > 3 hs)",
+            value=False,
+            help=(
+                "APAGADO (Real): usa únicamente los viajes que registraron entrada/salida real en el CD dentro del rango válido. "
+                "ENCENDIDO (Estimado): si un viaje tiene 100% de tiendas OK pero le falta estadía en CD o supera 3 hs (guarda en predio), "
+                "imputa la estadía estándar configurada para ese CD y recalcula inicio de viaje y jornada."
+            ),
+            key="s5_usar_cd_ajust",
+        )
+    with ctrl_s5_top2:
+        if usar_estadia_cd_ajust:
+            st.info("**Modo activo: ESTIMADO TOTAL** — Se imputan las estadías estándar por CD en viajes sin dato CD o con estadía > 3 hs.")
+        else:
+            st.success("**Modo activo: SOLO DATOS REALES** — Únicamente viajes y jornadas con estadía real medida en CD.")
+
+    with st.expander("⏱️ Tiempos Estándar de Estadía en CD por Operación y Parámetros de Limpieza", expanded=False):
+        st.markdown("**1. Estadía Estándar en CD (en minutos) — Se aplica si no hay dato en CD o si supera las 3 hs (180 min):**")
+        cd_col1, cd_col2, cd_col3, cd_col4, cd_col5, cd_col6 = st.columns(6)
+        with cd_col1:
+            est_std_501 = st.number_input("CD 501 (1:15 = 75m):", min_value=15, max_value=240, value=75, step=5, key="s5_std_501")
+        with cd_col2:
+            est_std_503 = st.number_input("CD 503 (1:22 = 82m):", min_value=15, max_value=240, value=82, step=1, key="s5_std_503")
+        with cd_col3:
+            est_std_504 = st.number_input("CD 504 (1:41 = 101m):", min_value=15, max_value=240, value=101, step=1, key="s5_std_504")
+        with cd_col4:
+            est_std_508 = st.number_input("CD 508 (1:50 = 110m):", min_value=15, max_value=240, value=110, step=5, key="s5_std_508")
+        with cd_col5:
+            est_std_509 = st.number_input("CD 509 (1:05 = 65m):", min_value=15, max_value=240, value=65, step=5, key="s5_std_509")
+        with cd_col6:
+            est_std_514 = st.number_input("CD 514 (1:51 = 111m):", min_value=15, max_value=240, value=111, step=1, key="s5_std_514")
+
+        st.markdown("**2. Parámetros Físicos de Limpieza de Viajes y Jornadas:**")
         jc1, jc2, jc3, jc4 = st.columns(4)
         with jc1:
-            min_cd_j = st.number_input("Estadía mín. CD Origen (min):", min_value=0, max_value=60, value=10, step=5, key="s5_min_cd")
-            max_cd_j = st.number_input("Estadía máx. CD Origen (min):", min_value=120, max_value=720, value=360, step=60, key="s5_max_cd")
+            min_cd_j = st.number_input("Estadía mín. CD Real (min):", min_value=0, max_value=60, value=10, step=5, key="s5_min_cd")
+            max_cd_real_j = st.number_input(
+                "Tope máx. CD Real (min):",
+                min_value=60,
+                max_value=720,
+                value=180,
+                step=30,
+                help="Por defecto 180 min (3 hs). Por encima de este valor se considera guarda en predio.",
+                key="s5_max_cd",
+            )
         with jc2:
             min_dur_v = st.number_input("Duración mín. Viaje (hs):", min_value=0.2, max_value=3.0, value=0.5, step=0.1, key="s5_min_dv")
             max_dur_v = st.number_input("Duración máx. Viaje (hs):", min_value=8.0, max_value=24.0, value=16.0, step=1.0, key="s5_max_dv")
@@ -4843,7 +4886,7 @@ with tab5:
             tukey_j = st.checkbox("Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)", value=True, key="s5_tukey")
 
     # -------------------------------------------------------------------------
-    # PASO 1: LIMPIEZA DE VIAJES OK (INDEPENDIENTE DEL RETORNO)
+    # PASO 1: EVALUACION DUAL DE VIAJES (REAL vs. CON ESTADIA CD AJUSTABLE)
     # -------------------------------------------------------------------------
     trips_base_s5 = dq_trips_filt.copy()
     stops_base_s5 = dq_stores_filt.copy()
@@ -4851,6 +4894,7 @@ with tab5:
     st_trip_times = (
         stops_base_s5.groupby("Id Viaje", as_index=False)
         .agg(
+            Ini_Primera_Tienda=("dt_ini_real", "min"),
             Fin_Ultima_Tienda=("dt_fin_real", "max"),
             Suma_Estadia_Tiendas_min=("Tiempo de Estadia", "sum"),
             Min_Estadia_Tienda=("Tiempo de Estadia", "min"),
@@ -4872,11 +4916,97 @@ with tab5:
     trips_eval_s5["dt_ini_cd"] = pd.to_datetime(
         trips_eval_s5["Ini_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
     )
-    trips_eval_s5["Duracion_Viaje_hs"] = (
+    trips_eval_s5["dt_fin_cd"] = pd.to_datetime(
+        trips_eval_s5["Fin_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
+    )
+
+    # Mapa de estadia estandar por CD (en minutos)
+    cd_std_map = {
+        501: float(est_std_501),
+        503: float(est_std_503),
+        504: float(est_std_504),
+        508: float(est_std_508),
+        509: float(est_std_509),
+        514: float(est_std_514),
+    }
+    med_std_fallback = float(np.mean(list(cd_std_map.values())))
+    trips_eval_s5["Estadia_CD_Std_min"] = (
+        trips_eval_s5["Operacion"].map(cd_std_map).fillna(med_std_fallback)
+    )
+
+    # Identificar si el CD real es valido (existe y esta entre min_cd_j y max_cd_real_j)
+    cd_real_ok = (
+        trips_eval_s5["CD_Origen_OK"]
+        & trips_eval_s5["dt_ini_cd"].notna()
+        & (trips_eval_s5["Estadia_CD_Origen"].fillna(-1) >= float(min_cd_j))
+        & (trips_eval_s5["Estadia_CD_Origen"].fillna(9999) <= float(max_cd_real_j))
+    )
+
+    # Identificar casos imputables (sin dato CD o estadia CD > 3 hs, pero con salida de CD o llegada a 1a tienda conocida)
+    # Si tenemos dt_fin_cd (hora real de salida del CD cuando guardo dentro del predio), restamos la estadia estandar a dt_fin_cd.
+    # Si no tenemos dt_fin_cd (activacion tarde sin fila CD), estimamos salida del CD como (Ini_Primera_Tienda - 30 min) y restamos estadia estandar.
+    salida_cd_est = trips_eval_s5["dt_fin_cd"].fillna(
+        trips_eval_s5["Ini_Primera_Tienda"] - pd.Timedelta(minutes=30)
+    )
+    dt_ini_cd_imputado = salida_cd_est - pd.to_timedelta(trips_eval_s5["Estadia_CD_Std_min"], unit="m")
+
+    # Escenario A: SOLO REAL
+    trips_eval_s5["Duracion_Viaje_Real_hs"] = (
         (trips_eval_s5["Fin_Ultima_Tienda"] - trips_eval_s5["dt_ini_cd"]).dt.total_seconds() / 3600.0
     ).round(2)
 
-    trips_eval_s5["Tiempo_CD_hs"] = (trips_eval_s5["Estadia_CD_Origen"].fillna(0) / 60.0).round(2)
+    # Escenario B: CON ESTADIA CD AJUSTABLE
+    trips_eval_s5["CD_Imputado"] = ~cd_real_ok
+    trips_eval_s5["dt_ini_cd_Ajust"] = np.where(cd_real_ok, trips_eval_s5["dt_ini_cd"], dt_ini_cd_imputado)
+    trips_eval_s5["dt_ini_cd_Ajust"] = pd.to_datetime(trips_eval_s5["dt_ini_cd_Ajust"], errors="coerce")
+    trips_eval_s5["Estadia_CD_Ajust_min"] = np.where(
+        cd_real_ok,
+        trips_eval_s5["Estadia_CD_Origen"],
+        trips_eval_s5["Estadia_CD_Std_min"],
+    )
+    trips_eval_s5["Duracion_Viaje_Ajust_hs"] = (
+        (trips_eval_s5["Fin_Ultima_Tienda"] - trips_eval_s5["dt_ini_cd_Ajust"]).dt.total_seconds() / 3600.0
+    ).round(2)
+
+    max_st_trip_lim = np.where(trips_eval_s5["Categoria"] == "Lejana", 360.0, 240.0)
+
+    # Reglas comunes de integridad en Tiendas y Odometro
+    cond_tiendas_y_kms_ok = (
+        trips_eval_s5["Todas_Tiendas_OK"]
+        & (trips_eval_s5["Min_Estadia_Tienda"].fillna(0) >= 5.0)
+        & (trips_eval_s5["Max_Estadia_Tienda"].fillna(9999) <= max_st_trip_lim)
+        & (~trips_eval_s5["Tiene_Solape"].fillna(True))
+        & (trips_eval_s5["KMS_Total"].fillna(0) > 0)
+        & (trips_eval_s5["KMS_Total"].fillna(0) <= 1500)
+    )
+
+    trips_eval_s5["Viaje_OK_Real"] = (
+        cond_tiendas_y_kms_ok
+        & cd_real_ok
+        & (trips_eval_s5["Duracion_Viaje_Real_hs"].fillna(0) >= float(min_dur_v))
+        & (trips_eval_s5["Duracion_Viaje_Real_hs"].fillna(0) <= float(max_dur_v))
+    )
+
+    trips_eval_s5["Viaje_OK_Ajust"] = (
+        cond_tiendas_y_kms_ok
+        & trips_eval_s5["dt_ini_cd_Ajust"].notna()
+        & (trips_eval_s5["Duracion_Viaje_Ajust_hs"].fillna(0) >= float(min_dur_v))
+        & (trips_eval_s5["Duracion_Viaje_Ajust_hs"].fillna(0) <= float(max_dur_v))
+    )
+
+    # Seleccionar columnas activas segun el interruptor del usuario
+    if usar_estadia_cd_ajust:
+        trips_eval_s5["Viaje_OK_Activo"] = trips_eval_s5["Viaje_OK_Ajust"]
+        trips_eval_s5["dt_ini_cd_Activo"] = trips_eval_s5["dt_ini_cd_Ajust"]
+        trips_eval_s5["Estadia_CD_Activa_min"] = trips_eval_s5["Estadia_CD_Ajust_min"]
+        trips_eval_s5["Duracion_Viaje_hs"] = trips_eval_s5["Duracion_Viaje_Ajust_hs"]
+    else:
+        trips_eval_s5["Viaje_OK_Activo"] = trips_eval_s5["Viaje_OK_Real"]
+        trips_eval_s5["dt_ini_cd_Activo"] = trips_eval_s5["dt_ini_cd"]
+        trips_eval_s5["Estadia_CD_Activa_min"] = trips_eval_s5["Estadia_CD_Origen"]
+        trips_eval_s5["Duracion_Viaje_hs"] = trips_eval_s5["Duracion_Viaje_Real_hs"]
+
+    trips_eval_s5["Tiempo_CD_hs"] = (trips_eval_s5["Estadia_CD_Activa_min"].fillna(0) / 60.0).round(2)
     trips_eval_s5["Tiempo_Tiendas_hs"] = (trips_eval_s5["Suma_Estadia_Tiendas_min"].fillna(0) / 60.0).round(2)
     trips_eval_s5["Tiempo_Ruta_hs"] = (
         (trips_eval_s5["Duracion_Viaje_hs"] - trips_eval_s5["Tiempo_CD_hs"] - trips_eval_s5["Tiempo_Tiendas_hs"])
@@ -4884,26 +5014,10 @@ with tab5:
         .round(2)
     )
 
-    max_st_trip_lim = np.where(trips_eval_s5["Categoria"] == "Lejana", 360.0, 240.0)
-
-    cond_viaje_ok = (
-        trips_eval_s5["Viaje_Completo_Base"]
-        & (trips_eval_s5["Estadia_CD_Origen"] >= float(min_cd_j))
-        & (trips_eval_s5["Estadia_CD_Origen"] <= float(max_cd_j))
-        & (trips_eval_s5["Min_Estadia_Tienda"].fillna(0) >= 5.0)
-        & (trips_eval_s5["Max_Estadia_Tienda"].fillna(9999) <= max_st_trip_lim)
-        & (~trips_eval_s5["Tiene_Solape"].fillna(True))
-        & (trips_eval_s5["KMS_Total"].fillna(0) > 0)
-        & (trips_eval_s5["KMS_Total"].fillna(0) <= 1500)
-        & (trips_eval_s5["Duracion_Viaje_hs"].fillna(0) >= float(min_dur_v))
-        & (trips_eval_s5["Duracion_Viaje_hs"].fillna(0) <= float(max_dur_v))
-    )
-
-    trips_eval_s5["Viaje_OK_S5"] = cond_viaje_ok
-    viajes_ok_s5 = trips_eval_s5[trips_eval_s5["Viaje_OK_S5"]].copy()
+    viajes_ok_s5 = trips_eval_s5[trips_eval_s5["Viaje_OK_Activo"]].copy()
 
     # -------------------------------------------------------------------------
-    # PASO 2: LIMPIEZA ESTRICTA DE JORNADAS CAMION-DIA (100% VIAJES DEL DIA OK)
+    # PASO 2: JORNADAS CAMION-DIA (EVALUACION DUAL REAL vs. AJUSTADA)
     # -------------------------------------------------------------------------
     trips_eval_s5["Dominio_Clean"] = (
         trips_eval_s5["Dominio"].fillna("").astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
@@ -4914,67 +5028,89 @@ with tab5:
 
     valid_fleet_all = trips_eval_s5[trips_eval_s5["Dominio_Valido"]].copy()
 
-    jornadas_all = (
-        valid_fleet_all.groupby(["Operacion", "Fecha_Reparto", "Dominio_Clean"], as_index=False)
-        .agg(
-            Dominio=("Dominio", "first"),
-            Interno=("Interno", "first"),
-            Tipo_Vehiculo=("Tipo_Vehiculo", "first"),
-            Transportista=("Transportista", "first"),
-            Viajes_Plan_Dia=("Id Viaje", "nunique"),
-            Viajes_OK_Dia=("Viaje_OK_S5", lambda s: int(s.sum())),
-            Inicio_Jornada=("dt_ini_cd", "min"),
-            Fin_Jornada=("Fin_Ultima_Tienda", "max"),
-            Suma_Horas_Viajes=("Duracion_Viaje_hs", "sum"),
-            KMS_Dia=("KMS_Total", "sum"),
-            Tiendas_Dia=("Tiendas_Plan_Viaje", "sum"),
+    def _build_jornadas_df(df_fleet: pd.DataFrame, ok_col: str, ini_col: str, dur_v_col: str) -> pd.DataFrame:
+        if df_fleet.empty:
+            return pd.DataFrame()
+        j_df = (
+            df_fleet.groupby(["Operacion", "Fecha_Reparto", "Dominio_Clean"], as_index=False)
+            .agg(
+                Dominio=("Dominio", "first"),
+                Interno=("Interno", "first"),
+                Tipo_Vehiculo=("Tipo_Vehiculo", "first"),
+                Transportista=("Transportista", "first"),
+                Viajes_Plan_Dia=("Id Viaje", "nunique"),
+                Viajes_OK_Dia=(ok_col, lambda s: int(s.sum())),
+                Viajes_Imputados_Dia=("CD_Imputado", lambda s: int(s.sum())),
+                Inicio_Jornada=(ini_col, "min"),
+                Fin_Jornada=("Fin_Ultima_Tienda", "max"),
+                Suma_Horas_Viajes=(dur_v_col, "sum"),
+                KMS_Dia=("KMS_Total", "sum"),
+                Tiendas_Dia=("Tiendas_Plan_Viaje", "sum"),
+            )
         )
-    )
+        j_df["Todos_Viajes_OK"] = j_df["Viajes_Plan_Dia"] == j_df["Viajes_OK_Dia"]
+        j_df["Duracion_Jornada_hs"] = (
+            (j_df["Fin_Jornada"] - j_df["Inicio_Jornada"]).dt.total_seconds() / 3600.0
+        ).round(2)
+        j_df["Entre_Vueltas_hs"] = (
+            (j_df["Duracion_Jornada_hs"] - j_df["Suma_Horas_Viajes"]).clip(lower=0.0).round(2)
+        )
+        j_df["Jornada_Limpia"] = (
+            j_df["Todos_Viajes_OK"]
+            & (j_df["Duracion_Jornada_hs"].fillna(0) >= float(min_dur_j))
+            & (j_df["Duracion_Jornada_hs"].fillna(0) <= float(max_dur_j))
+        )
+        return j_df
 
-    jornadas_all["Todos_Viajes_OK"] = jornadas_all["Viajes_Plan_Dia"] == jornadas_all["Viajes_OK_Dia"]
-    jornadas_all["Duracion_Jornada_hs"] = (
-        (jornadas_all["Fin_Jornada"] - jornadas_all["Inicio_Jornada"]).dt.total_seconds() / 3600.0
-    ).round(2)
-    jornadas_all["Entre_Vueltas_hs"] = (
-        (jornadas_all["Duracion_Jornada_hs"] - jornadas_all["Suma_Horas_Viajes"]).clip(lower=0.0).round(2)
-    )
+    jornadas_real_all = _build_jornadas_df(valid_fleet_all, "Viaje_OK_Real", "dt_ini_cd", "Duracion_Viaje_Real_hs")
+    jornadas_ajust_all = _build_jornadas_df(valid_fleet_all, "Viaje_OK_Ajust", "dt_ini_cd_Ajust", "Duracion_Viaje_Ajust_hs")
 
-    cond_jornada_limpia = (
-        jornadas_all["Todos_Viajes_OK"]
-        & (jornadas_all["Duracion_Jornada_hs"].fillna(0) >= float(min_dur_j))
-        & (jornadas_all["Duracion_Jornada_hs"].fillna(0) <= float(max_dur_j))
-    )
-    jornadas_all["Jornada_Limpia"] = cond_jornada_limpia
+    jornadas_all = jornadas_ajust_all if usar_estadia_cd_ajust else jornadas_real_all
 
-    jornadas_clean_s5 = jornadas_all[jornadas_all["Jornada_Limpia"]].copy()
-    jornadas_excl_s5 = jornadas_all[~jornadas_all["Jornada_Limpia"]].copy()
-    jornadas_excl_s5["Motivo_Exclusion_Jornada"] = np.where(
-        ~jornadas_excl_s5["Todos_Viajes_OK"],
-        "Al menos 1 viaje del día excluido por falta de datos/anomalía",
-        "Duración de jornada fuera de rango físico",
-    )
+    if not jornadas_all.empty:
+        jornadas_clean_s5 = jornadas_all[jornadas_all["Jornada_Limpia"]].copy()
+        jornadas_excl_s5 = jornadas_all[~jornadas_all["Jornada_Limpia"]].copy()
+        jornadas_excl_s5["Motivo_Exclusion_Jornada"] = np.where(
+            ~jornadas_excl_s5["Todos_Viajes_OK"],
+            "Al menos 1 viaje del día excluido por falta de datos/anomalía",
+            "Duración de jornada fuera de rango físico",
+        )
+        jornadas_clean_s5["Vueltas_Label"] = np.select(
+            [jornadas_clean_s5["Viajes_Plan_Dia"] == 1, jornadas_clean_s5["Viajes_Plan_Dia"] == 2],
+            ["1 Vuelta", "2 Vueltas"],
+            default="3+ Vueltas",
+        )
+    else:
+        jornadas_clean_s5 = pd.DataFrame()
+        jornadas_excl_s5 = pd.DataFrame()
 
-    jornadas_clean_s5["Vueltas_Label"] = np.select(
-        [jornadas_clean_s5["Viajes_Plan_Dia"] == 1, jornadas_clean_s5["Viajes_Plan_Dia"] == 2],
-        ["1 Vuelta", "2 Vueltas"],
-        default="3+ Vueltas",
-    )
+    # -------------------------------------------------------------------------
+    # TARJETAS KPI SUPERIORES: REALES vs. CON ESTADIA CD AJUSTADA + TOTALES
+    # -------------------------------------------------------------------------
+    tot_v_s5 = int(len(trips_eval_s5))
+    ok_v_real = int(trips_eval_s5["Viaje_OK_Real"].sum())
+    ok_v_ajust = int(trips_eval_s5["Viaje_OK_Ajust"].sum())
+    pct_v_real = (ok_v_real / tot_v_s5 * 100) if tot_v_s5 > 0 else 0.0
+    pct_v_ajust = (ok_v_ajust / tot_v_s5 * 100) if tot_v_s5 > 0 else 0.0
+    gain_v = ok_v_ajust - ok_v_real
 
-    tot_v_s5 = len(trips_eval_s5)
-    ok_v_s5 = len(viajes_ok_s5)
-    pct_v_ok_s5 = (ok_v_s5 / tot_v_s5 * 100) if tot_v_s5 > 0 else 0.0
-    med_dur_v_s5 = float(viajes_ok_s5["Duracion_Viaje_hs"].median()) if ok_v_s5 > 0 else 0.0
+    tot_j_s5 = int(len(jornadas_real_all))
+    ok_j_real = int(jornadas_real_all["Jornada_Limpia"].sum()) if not jornadas_real_all.empty else 0
+    ok_j_ajust = int(jornadas_ajust_all["Jornada_Limpia"].sum()) if not jornadas_ajust_all.empty else 0
+    pct_j_real = (ok_j_real / tot_j_s5 * 100) if tot_j_s5 > 0 else 0.0
+    pct_j_ajust = (ok_j_ajust / tot_j_s5 * 100) if tot_j_s5 > 0 else 0.0
+    gain_j = ok_j_ajust - ok_j_real
 
-    tot_j_s5 = len(jornadas_all)
-    ok_j_s5 = len(jornadas_clean_s5)
-    excl_j_incomp = int((~jornadas_all["Todos_Viajes_OK"]).sum())
-    pct_j_ok_s5 = (ok_j_s5 / tot_j_s5 * 100) if tot_j_s5 > 0 else 0.0
+    ok_v_act = len(viajes_ok_s5)
+    med_dur_v_s5 = float(viajes_ok_s5["Duracion_Viaje_hs"].median()) if ok_v_act > 0 else 0.0
 
-    j_1v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "1 Vuelta"]
-    j_2v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "2 Vueltas"]
-    j_2mas_cnt = int((jornadas_clean_s5["Viajes_Plan_Dia"] >= 2).sum())
-    pct_2mas = (j_2mas_cnt / ok_j_s5 * 100) if ok_j_s5 > 0 else 0.0
+    ok_j_act = len(jornadas_clean_s5)
+    j_1v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "1 Vuelta"] if ok_j_act > 0 else pd.DataFrame()
+    j_2v = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == "2 Vueltas"] if ok_j_act > 0 else pd.DataFrame()
+    j_2mas_cnt = int((jornadas_clean_s5["Viajes_Plan_Dia"] >= 2).sum()) if ok_j_act > 0 else 0
+    pct_2mas = (j_2mas_cnt / ok_j_act * 100) if ok_j_act > 0 else 0.0
 
+    med_j_tot = float(jornadas_clean_s5["Duracion_Jornada_hs"].median()) if ok_j_act > 0 else 0.0
     med_j_1v = float(j_1v["Duracion_Jornada_hs"].median()) if len(j_1v) > 0 else 0.0
     med_j_2v = float(j_2v["Duracion_Jornada_hs"].median()) if len(j_2v) > 0 else 0.0
     med_entre_v_min = float(j_2v["Entre_Vueltas_hs"].median() * 60.0) if len(j_2v) > 0 else 0.0
@@ -4983,31 +5119,32 @@ with tab5:
     with kj1:
         st.markdown(
             _kpi_card_html(
-                "Base Limpia Viajes OK",
-                _fmt_int(ok_v_s5),
-                f"{_fmt_pct(pct_v_ok_s5)} de {_fmt_int(tot_v_s5)} viajes TMS",
+                "Viajes OK (Real vs. Ajustado)",
+                f"{_fmt_int(ok_v_real)} ({_fmt_pct(pct_v_real)})",
+                f"Con CD Ajustable: {_fmt_int(ok_v_ajust)} ({_fmt_pct(pct_v_ajust)}) [+{_fmt_int(gain_v)}]",
                 "#16a34a",
-                f"Duración mediana viaje: <b>{med_dur_v_s5:.1f} hs</b>",
+                f"Total viajes TMS evaluados: <b>{_fmt_int(tot_v_s5)}</b>",
             ),
             unsafe_allow_html=True,
         )
     with kj2:
         st.markdown(
             _kpi_card_html(
-                "Jornadas Camión-Día Limpias",
-                _fmt_int(ok_j_s5),
-                f"{_fmt_pct(pct_j_ok_s5)} de {_fmt_int(tot_j_s5)} jornadas",
+                "Jornadas OK (Real vs. Ajustado)",
+                f"{_fmt_int(ok_j_real)} ({_fmt_pct(pct_j_real)})",
+                f"Con CD Ajustable: {_fmt_int(ok_j_ajust)} ({_fmt_pct(pct_j_ajust)}) [+{_fmt_int(gain_j)}]",
                 "#1d4ed8",
-                f"Excluidas x viaje incompleto: <b>{_fmt_int(excl_j_incomp)}</b>",
+                f"Total jornadas camión-día evaluadas: <b>{_fmt_int(tot_j_s5)}</b>",
             ),
             unsafe_allow_html=True,
         )
     with kj3:
+        modo_lbl_kpi = "Estimado" if usar_estadia_cd_ajust else "Real"
         st.markdown(
             _kpi_card_html(
-                "Jornadas de 2+ Vueltas",
+                f"Jornadas de 2+ Vueltas ({modo_lbl_kpi})",
                 _fmt_int(j_2mas_cnt),
-                f"{_fmt_pct(pct_2mas)} de las jornadas limpias",
+                f"{_fmt_pct(pct_2mas)} de {_fmt_int(ok_j_act)} jornadas limpias",
                 "#d97706",
                 f"Re-carga entre vueltas: <b>{med_entre_v_min:.0f} min</b>",
             ),
@@ -5016,21 +5153,53 @@ with tab5:
     with kj4:
         st.markdown(
             _kpi_card_html(
-                "Mediana Horas de Jornada",
-                f"{float(jornadas_clean_s5['Duracion_Jornada_hs'].median()) if ok_j_s5 > 0 else 0.0:.1f} hs",
+                f"Mediana Horas Jornada ({modo_lbl_kpi})",
+                f"{med_j_tot:.1f} hs",
                 f"1 Vuelta: {med_j_1v:.1f} hs  |  2 Vueltas: {med_j_2v:.1f} hs",
                 "#0f172a",
-                "Desde inicio carga CD a últ. tienda",
+                f"Mediana duración viaje: <b>{med_dur_v_s5:.1f} hs</b>",
             ),
             unsafe_allow_html=True,
         )
 
+    # Tabla resumen de representatividad por CD (Real vs Ajustado)
+    with st.expander("📊 Ver Cobertura por CD: Datos Reales vs. Con Estadía CD Ajustable", expanded=False):
+        cov_rows_s5 = []
+        for op_s5 in sorted(trips_eval_s5["Operacion"].dropna().unique()):
+            sub_t5 = trips_eval_s5[trips_eval_s5["Operacion"] == op_s5]
+            tv_op = len(sub_t5)
+            vr_op = int(sub_t5["Viaje_OK_Real"].sum())
+            va_op = int(sub_t5["Viaje_OK_Ajust"].sum())
+
+            sub_jr = jornadas_real_all[jornadas_real_all["Operacion"] == op_s5] if not jornadas_real_all.empty else pd.DataFrame()
+            sub_ja = jornadas_ajust_all[jornadas_ajust_all["Operacion"] == op_s5] if not jornadas_ajust_all.empty else pd.DataFrame()
+            tj_op = len(sub_jr)
+            jr_op = int(sub_jr["Jornada_Limpia"].sum()) if not sub_jr.empty else 0
+            ja_op = int(sub_ja["Jornada_Limpia"].sum()) if not sub_ja.empty else 0
+
+            cov_rows_s5.append(
+                {
+                    "CD": str(int(op_s5)),
+                    "Estadía Std. CD": f"{int(cd_std_map.get(int(op_s5), med_std_fallback))} min",
+                    "Viajes Totales": tv_op,
+                    "Viajes OK (Real)": f"{vr_op:,} ({(vr_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
+                    "Viajes OK (Ajustado)": f"{va_op:,} ({(va_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
+                    "Jornadas Totales": tj_op,
+                    "Jornadas OK (Real)": f"{jr_op:,} ({(jr_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
+                    "Jornadas OK (Ajustado)": f"{ja_op:,} ({(ja_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
+                }
+            )
+        if cov_rows_s5:
+            st.dataframe(pd.DataFrame(cov_rows_s5), use_container_width=True, hide_index=True)
+
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: ANALISIS DE TIEMPOS DE VIAJE (SOBRE VIAJES OK LIMPIOS)
+    # BLOQUE 1: ANALISIS DE TIEMPOS DE VIAJE (SOBRE BASE ACTIVA: REAL O AJUSTADA)
     # -------------------------------------------------------------------------
-    st.markdown("### 1. Duración de Viajes OK (Inicio Carga CD $\rightarrow$ Salida Última Tienda)")
+    st.markdown(
+        f"### 1. Duración de Viajes OK ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
+    )
 
     v_dim_map = {
         "Tipo de Viaje (Directo / Compartido / Rutas)": "Tipo_Viaje",
@@ -5059,10 +5228,13 @@ with tab5:
     df_v_res = pd.DataFrame()
     if not viajes_ok_s5.empty:
         df_vp_s5 = viajes_ok_s5.copy()
+        df_vt_s5 = trips_eval_s5.copy()
         if v_dim_col == "Operacion":
             df_vp_s5[v_dim_col] = "CD " + df_vp_s5[v_dim_col].astype(str)
+            df_vt_s5[v_dim_col] = "CD " + df_vt_s5[v_dim_col].astype(str)
         else:
             df_vp_s5[v_dim_col] = df_vp_s5[v_dim_col].fillna("Sin dato").astype(str)
+            df_vt_s5[v_dim_col] = df_vt_s5[v_dim_col].fillna("Sin dato").astype(str)
 
         if v_dim_col == "Tipo_Viaje":
             v_ord = [c for c in ["Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"] if c in df_vp_s5[v_dim_col].unique()]
@@ -5093,6 +5265,7 @@ with tab5:
             fig_vbox_s5.update_layout(showlegend=False)
         else:
             df_vp_s5[v_sub_col] = df_vp_s5[v_sub_col].fillna("Sin dato").astype(str)
+            df_vt_s5[v_sub_col] = df_vt_s5[v_sub_col].fillna("Sin dato").astype(str)
             svals = sorted(df_vp_s5[v_sub_col].unique().tolist())
             for idx_s, sv_name in enumerate(svals):
                 sub_d = df_vp_s5[df_vp_s5[v_sub_col] == sv_name]
@@ -5131,15 +5304,22 @@ with tab5:
         st.plotly_chart(fig_vbox_s5, use_container_width=True)
 
         g_cols_v = [v_dim_col] if v_sub_col is None else [v_dim_col, v_sub_col]
+        tot_v_map = df_vt_s5.groupby(g_cols_v).size().to_dict()
         v_rows = []
         for keys, grp in df_vp_s5.groupby(g_cols_v):
             if not isinstance(keys, tuple):
                 keys = (keys,)
+            lk = keys[0] if len(keys) == 1 else keys
+            v_tot_seg = int(tot_v_map.get(lk, len(grp)))
+            v_ok_seg = int(len(grp))
+            pct_rep_v = round((v_ok_seg / v_tot_seg * 100), 1) if v_tot_seg > 0 else 100.0
             sd = grp["Duracion_Viaje_hs"]
             rd = {g_cols_v[i]: keys[i] for i in range(len(g_cols_v))}
             rd.update(
                 {
-                    "Viajes OK": int(len(sd)),
+                    "Viajes Totales": v_tot_seg,
+                    "Viajes OK": v_ok_seg,
+                    "% Represent.": pct_rep_v,
                     "Mediana KMS": round(float(grp["KMS_Total"].median()), 1),
                     "Med. CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
                     "Med. Ruta (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
@@ -5152,21 +5332,30 @@ with tab5:
             )
             v_rows.append(rd)
         df_v_res = pd.DataFrame(v_rows)
-        st.dataframe(df_v_res, use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_v_res,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "% Represent.": st.column_config.NumberColumn("% Represent.", format="%.1f%%"),
+            },
+        )
 
     st.divider()
 
     # -------------------------------------------------------------------------
     # BLOQUE 2: ANALISIS DE JORNADAS DIARIAS (1 VUELTA vs 2+ VUELTAS)
     # -------------------------------------------------------------------------
-    st.markdown("### 2. Análisis de Jornadas Diarias (1 Vuelta vs. 2+ Vueltas)")
+    st.markdown(
+        f"### 2. Análisis de Jornadas Diarias ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
+    )
     st.caption(
-        "Construido exclusivamente sobre días donde **todos** los viajes del camión estuvieron completos y limpios."
+        "Construido exclusivamente sobre días donde **todos** los viajes del camión estuvieron completos y limpios en el modo activo."
     )
 
     df_j_res = pd.DataFrame()
     if not jornadas_clean_s5.empty:
-        j_col1, j_col2 = st.columns([1.2, 1.3])
+        j_col1, j_col2 = st.columns([1.25, 1.25])
         with j_col1:
             j_cut = st.selectbox(
                 "Abrir jornadas por:",
@@ -5177,20 +5366,30 @@ with tab5:
             j_cut_col = "Operacion" if j_cut == "Operación (CD)" else "Tipo_Vehiculo"
 
             df_jp = jornadas_clean_s5.copy()
+            df_jt = jornadas_all.copy()
             if j_cut_col == "Operacion":
                 df_jp[j_cut_col] = "CD " + df_jp[j_cut_col].astype(str)
+                df_jt[j_cut_col] = "CD " + df_jt[j_cut_col].astype(str)
             else:
                 df_jp[j_cut_col] = df_jp[j_cut_col].fillna("Sin dato").astype(str)
+                df_jt[j_cut_col] = df_jt[j_cut_col].fillna("Sin dato").astype(str)
+
+            tot_j_map = df_jt.groupby(j_cut_col).size().to_dict()
 
             j_rows = []
             for k_val, grp in df_jp.groupby(j_cut_col):
+                j_tot_k = int(tot_j_map.get(k_val, len(grp)))
+                j_ok_k = int(len(grp))
+                pct_rep_j = round((j_ok_k / j_tot_k * 100), 1) if j_tot_k > 0 else 100.0
                 g1 = grp[grp["Vueltas_Label"] == "1 Vuelta"]
                 g2 = grp[grp["Vueltas_Label"] == "2 Vueltas"]
                 g3 = grp[grp["Vueltas_Label"] == "3+ Vueltas"]
                 j_rows.append(
                     {
                         j_cut: k_val,
-                        "Jornadas Limpias": int(len(grp)),
+                        "Jornadas Totales": j_tot_k,
+                        "Jornadas Limpias": j_ok_k,
+                        "% Represent.": pct_rep_j,
                         "1 Vuelta": int(len(g1)),
                         "2 Vueltas": int(len(g2)),
                         "3+ Vueltas": int(len(g3)),
@@ -5201,7 +5400,14 @@ with tab5:
                     }
                 )
             df_j_res = pd.DataFrame(j_rows).sort_values("Jornadas Limpias", ascending=False)
-            st.dataframe(df_j_res, use_container_width=True, hide_index=True)
+            st.dataframe(
+                df_j_res,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "% Represent.": st.column_config.NumberColumn("% Represent.", format="%.1f%%"),
+                },
+            )
 
         with j_col2:
             fig_jbox = go.Figure()
