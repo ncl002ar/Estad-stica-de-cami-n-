@@ -815,6 +815,7 @@ def _add_clean_box_traces(
                 q3=[round(q3_v, 1)],
                 upperfence=[round(hi_w, 1)],
                 mean=[round(mean_v, 1)],
+                width=0.58 if not show_legend else 0.34,
                 name=group_name if group_name else "",
                 legendgroup=group_name if group_name else None,
                 showlegend=(show_legend and idx_b == 0),
@@ -3673,7 +3674,9 @@ with tab3:
 
         fig_box.update_layout(
             title=chart_title_s3 if chart_title_s3 else None,
-            height=410,
+            boxgap=0.18,
+            boxgroupgap=0.12,
+            height=420,
             margin=dict(l=20, r=20, t=42 if chart_title_s3 else 30, b=20),
             yaxis_title="Tiempo de Estadía en Tienda (minutos)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -4287,19 +4290,26 @@ with tab4:
             out_m[col_c] = cells
         return out_m.reset_index().rename(columns={"CD_Str": "Operación"})
 
-    tr_st_cat = tr_st[tr_st["Categoria"] == cat_v_sel] if cat_v_sel != "Todas" else tr_st
+    # Base total por tramo = todas las paradas/viajes planificados en UNIGIS (incluyendo los que no marcaron GPS o salieron tarde)
+    all_stores_v = dq_stores_filt.copy()
+    all_stores_v["Tramo_Tipo"] = np.where(
+        all_stores_v["Orden Visita Tienda"] == 1,
+        "Salida Depósito (CD -> 1ª Tienda)",
+        "Entre Paradas (Tienda -> Tienda)",
+    )
+    all_stores_cat = all_stores_v[all_stores_v["Categoria"] == cat_v_sel] if cat_v_sel != "Todas" else all_stores_v
     tr_trips_cat = dq_trips_filt[dq_trips_filt["Categoria"] == cat_v_sel] if cat_v_sel != "Todas" else dq_trips_filt
 
     df_vp_src = tr_clean[tr_clean["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
-    df_vp_tot = tr_st_cat[tr_st_cat["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
+    df_vp_tot = all_stores_cat[all_stores_cat["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
 
     df_vs_src = tr_clean[tr_clean["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
-    df_vs_tot = tr_st_cat[tr_st_cat["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
+    df_vs_tot = all_stores_cat[all_stores_cat["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
 
     mat_vp = _build_vel_matrix(df_vp_src, df_vp_tot, "Vel_Calculada", "median")
     mat_vs = _build_vel_matrix(df_vs_src, df_vs_tot, "Vel_Calculada", "median")
     mat_vr = _build_vel_matrix(tr_ret_clean, tr_trips_cat, "Vel_Retorno", "median")
-    mat_vmax = _build_vel_matrix(tr_clean, tr_st_cat, "Vel_Calculada", "percentile", p_val=95)
+    mat_vmax = _build_vel_matrix(tr_clean, all_stores_cat, "Vel_Calculada", "percentile", p_val=95)
 
     vtab1, vtab2, vtab3, vtab4 = st.tabs(
         [
@@ -4392,7 +4402,9 @@ with tab4:
 
         fig_vbox.update_layout(
             boxmode="group",
-            height=410,
+            boxgap=0.18,
+            boxgroupgap=0.10,
+            height=420,
             margin=dict(l=20, r=20, t=30, b=20),
             xaxis=dict(categoryorder="array", categoryarray=v_cat_order),
             yaxis_title="Velocidad Real (km/h)",
