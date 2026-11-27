@@ -789,12 +789,23 @@ def _add_clean_box_traces(
     group_name: str = "",
     show_legend: bool = False,
 ):
-    """Dibuja cajas limpias (1 traza por serie agrupada para que boxmode='group' no las superponga)
-    con etiquetas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)."""
+    """Dibuja cajas limpias donde al apoyar el mouse sobre la caja se despliegan juntas
+    las 6 medidas exactas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
+    sin repetir el nombre del segmento ni N."""
+    def _build_card_text(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float) -> str:
+        header = f"<b>{group_name}</b><br>" if (show_legend and group_name) else ""
+        return (
+            f"{header}"
+            f"Bigote Máximo: <b>{hi_w:.1f} {unit_suffix}</b><br>"
+            f"Q3: <b>{q3_v:.1f} {unit_suffix}</b><br>"
+            f"Media: <b>{mean_v:.1f} {unit_suffix}</b><br>"
+            f"Mediana: <b>{med_v:.1f} {unit_suffix}</b><br>"
+            f"Q1: <b>{q1_v:.1f} {unit_suffix}</b><br>"
+            f"Bigote Mínimo: <b>{lo_w:.1f} {unit_suffix}</b>"
+        )
+
     if show_legend and group_name:
-        # Caso agrupado (ej. Salida Depósito vs Entre Paradas, o sub-corte por color):
-        # 1 sola traza go.Box con todos los valores de X para que Plotly las ubique lado a lado sin superponerlas
-        x_valid, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
+        x_valid, lf_l, q1_l, med_l, q3_l, uf_l, mean_l, cards_l = [], [], [], [], [], [], [], []
         for x_lbl, vals in zip(x_labels, series_list):
             s = vals.dropna()
             if len(s) == 0:
@@ -815,6 +826,7 @@ def _add_clean_box_traces(
             q3_l.append(round(q3_v, 1))
             uf_l.append(round(hi_w, 1))
             mean_l.append(round(mean_v, 1))
+            cards_l.append(_build_card_text(hi_w, q3_v, mean_v, med_v, q1_v, lo_w))
 
         if not x_valid:
             return
@@ -832,7 +844,9 @@ def _add_clean_box_traces(
                 legendgroup=group_name,
                 showlegend=True,
                 marker_color=col_hex,
-                hovertemplate="%{y:.1f} " + unit_suffix + "<extra>" + group_name + "</extra>",
+                customdata=cards_l,
+                hovertemplate="%{customdata}<extra></extra>",
+                hoveron="boxes",
             )
         )
         return
@@ -853,6 +867,7 @@ def _add_clean_box_traces(
             hi_w = float(s.max())
 
         col_hex = colors[idx_b % len(colors)]
+        card_txt = _build_card_text(hi_w, q3_v, mean_v, med_v, q1_v, lo_w)
         fig.add_trace(
             go.Box(
                 x=[x_lbl],
@@ -866,35 +881,9 @@ def _add_clean_box_traces(
                 name="",
                 showlegend=False,
                 marker_color=col_hex,
-                hoverinfo="skip",
-            )
-        )
-        pts_y = [
-            round(hi_w, 1),
-            round(q3_v, 1),
-            round(mean_v, 1),
-            round(med_v, 1),
-            round(q1_v, 1),
-            round(lo_w, 1),
-        ]
-        pts_lbl = [
-            f"Bigote Máximo: {hi_w:.1f} {unit_suffix}",
-            f"Q3: {q3_v:.1f} {unit_suffix}",
-            f"Media: {mean_v:.1f} {unit_suffix}",
-            f"Mediana: {med_v:.1f} {unit_suffix}",
-            f"Q1: {q1_v:.1f} {unit_suffix}",
-            f"Bigote Mínimo: {lo_w:.1f} {unit_suffix}",
-        ]
-        fig.add_trace(
-            go.Scatter(
-                x=[x_lbl] * 6,
-                y=pts_y,
-                mode="markers",
-                marker=dict(size=10, color=col_hex, opacity=0),
-                name="",
-                showlegend=False,
-                customdata=pts_lbl,
+                customdata=[card_txt],
                 hovertemplate="%{customdata}<extra></extra>",
+                hoveron="boxes",
             )
         )
 
@@ -5053,59 +5042,61 @@ with tab5:
         fig_vbox_s5 = go.Figure()
         pal_s5 = ["#1d4ed8", "#d97706", "#16a34a", "#7c3aed", "#dc2626", "#0891b2"]
 
-        def _tukey_hs(s: pd.Series):
-            q1, q3 = np.percentile(s, [25, 75])
-            iqr = q3 - q1
-            return max(float(s.min()), float(q1 - 1.5 * iqr)), min(float(s.max()), float(q3 + 1.5 * iqr))
-
         if v_sub_col is None:
+            x_v5, ser_v5, col_v5 = [], [], []
             for idx_i, cv in enumerate(v_ord):
                 sv = df_vp_s5[df_vp_s5[v_dim_col] == cv]["Duracion_Viaje_hs"].dropna()
                 if len(sv) == 0:
                     continue
-                if tukey_j:
-                    lo, hi = _tukey_hs(sv)
-                    q1v, medv, q3v = np.percentile(sv, [25, 50, 75])
-                    fig_vbox_s5.add_trace(
-                        go.Box(
-                            x=[f"{cv} (n={len(sv):,})"],
-                            lowerfence=[lo], q1=[q1v], median=[medv], q3=[q3v], upperfence=[hi],
-                            mean=[float(sv.mean())], name=f"{cv} (n={len(sv):,})",
-                            marker_color=pal_s5[idx_i % len(pal_s5)],
-                        )
-                    )
-                else:
-                    fig_vbox_s5.add_trace(
-                        go.Box(y=sv, name=f"{cv} (n={len(sv):,})", boxmean=True, boxpoints=False, marker_color=pal_s5[idx_i % len(pal_s5)])
-                    )
+                x_v5.append(f"{cv} (n={len(sv):,})")
+                ser_v5.append(sv)
+                col_v5.append(pal_s5[idx_i % len(pal_s5)])
+            _add_clean_box_traces(
+                fig_vbox_s5,
+                x_v5,
+                ser_v5,
+                col_v5,
+                unit_suffix="hs",
+                use_tukey=tukey_j,
+                show_legend=False,
+            )
+            fig_vbox_s5.update_layout(showlegend=False)
         else:
             df_vp_s5[v_sub_col] = df_vp_s5[v_sub_col].fillna("Sin dato").astype(str)
             svals = sorted(df_vp_s5[v_sub_col].unique().tolist())
             for idx_s, sv_name in enumerate(svals):
                 sub_d = df_vp_s5[df_vp_s5[v_sub_col] == sv_name]
-                if tukey_j:
-                    xc, lf, q1l, medl, q3l, uf, mnl = [], [], [], [], [], [], []
-                    for cv in v_ord:
-                        s_sub = sub_d[sub_d[v_dim_col] == cv]["Duracion_Viaje_hs"].dropna()
-                        if len(s_sub) == 0:
-                            continue
-                        lo, hi = _tukey_hs(s_sub)
-                        q1v, medv, q3v = np.percentile(s_sub, [25, 50, 75])
-                        xc.append(cv); lf.append(lo); q1l.append(q1v); medl.append(medv); q3l.append(q3v); uf.append(hi); mnl.append(float(s_sub.mean()))
-                    fig_vbox_s5.add_trace(
-                        go.Box(x=xc, lowerfence=lf, q1=q1l, median=medl, q3=q3l, upperfence=uf, mean=mnl, name=sv_name, marker_color=pal_s5[idx_s % len(pal_s5)])
-                    )
-                else:
-                    fig_vbox_s5.add_trace(
-                        go.Box(x=sub_d[v_dim_col], y=sub_d["Duracion_Viaje_hs"], name=sv_name, boxmean=True, boxpoints=False, marker_color=pal_s5[idx_s % len(pal_s5)])
-                    )
-            fig_vbox_s5.update_layout(boxmode="group", xaxis=dict(categoryorder="array", categoryarray=v_ord))
+                xc_s5, ser_sub_s5 = [], []
+                for cv in v_ord:
+                    s_sub = sub_d[sub_d[v_dim_col] == cv]["Duracion_Viaje_hs"].dropna()
+                    if len(s_sub) == 0:
+                        continue
+                    xc_s5.append(cv)
+                    ser_sub_s5.append(s_sub)
+                _add_clean_box_traces(
+                    fig_vbox_s5,
+                    xc_s5,
+                    ser_sub_s5,
+                    [pal_s5[idx_s % len(pal_s5)]],
+                    unit_suffix="hs",
+                    use_tukey=tukey_j,
+                    group_name=sv_name,
+                    show_legend=True,
+                )
+            fig_vbox_s5.update_layout(
+                boxmode="group",
+                xaxis=dict(categoryorder="array", categoryarray=v_ord),
+                showlegend=True,
+            )
 
         fig_vbox_s5.update_layout(
-            height=390,
+            boxgap=0.18,
+            boxgroupgap=0.10,
+            height=410,
             margin=dict(l=20, r=20, t=30, b=20),
             yaxis_title="Duración del Viaje (horas)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="closest",
         )
         st.plotly_chart(fig_vbox_s5, use_container_width=True)
 
@@ -5186,35 +5177,33 @@ with tab5:
             fig_jbox = go.Figure()
             vueltas_ord = ["1 Vuelta", "2 Vueltas", "3+ Vueltas"]
             vueltas_pal = {"1 Vuelta": "#1d4ed8", "2 Vueltas": "#d97706", "3+ Vueltas": "#dc2626"}
+            x_j_lbls, ser_j_list, col_j_list = [], [], []
             for vl in vueltas_ord:
                 sv_j = jornadas_clean_s5[jornadas_clean_s5["Vueltas_Label"] == vl]["Duracion_Jornada_hs"].dropna()
                 if len(sv_j) == 0:
                     continue
-                if tukey_j:
-                    q1, q3 = np.percentile(sv_j, [25, 75])
-                    iqr = q3 - q1
-                    lo = max(float(sv_j.min()), float(q1 - 1.5 * iqr))
-                    hi = min(float(sv_j.max()), float(q3 + 1.5 * iqr))
-                    medv = float(sv_j.median())
-                    fig_jbox.add_trace(
-                        go.Box(
-                            x=[f"{vl} (n={len(sv_j):,})"],
-                            lowerfence=[lo], q1=[q1], median=[medv], q3=[q3], upperfence=[hi],
-                            mean=[float(sv_j.mean())], name=f"{vl} (n={len(sv_j):,})",
-                            marker_color=vueltas_pal[vl],
-                        )
-                    )
-                else:
-                    fig_jbox.add_trace(
-                        go.Box(y=sv_j, name=f"{vl} (n={len(sv_j):,})", boxmean=True, boxpoints=False, marker_color=vueltas_pal[vl])
-                    )
+                x_j_lbls.append(f"{vl} (n={len(sv_j):,})")
+                ser_j_list.append(sv_j)
+                col_j_list.append(vueltas_pal[vl])
+
+            _add_clean_box_traces(
+                fig_jbox,
+                x_j_lbls,
+                ser_j_list,
+                col_j_list,
+                unit_suffix="hs",
+                use_tukey=tukey_j,
+                show_legend=False,
+            )
 
             fig_jbox.update_layout(
                 title="Distribución de Horas de Jornada según Cantidad de Vueltas",
-                height=390,
+                boxgap=0.22,
+                height=400,
                 margin=dict(l=20, r=20, t=40, b=20),
                 yaxis_title="Duración de Jornada (horas)",
                 showlegend=False,
+                hovermode="closest",
             )
             st.plotly_chart(fig_jbox, use_container_width=True)
 
