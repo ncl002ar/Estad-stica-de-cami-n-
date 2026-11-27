@@ -756,6 +756,83 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
     dq_cd_orig = dq_trips[dq_trips["CD_Origen_OK"]].copy()
 
+    # Pre-cálculo inicial de bases limpias por defecto para que el cambio de filtros sea instantáneo (<5 ms)
+    # A. Pre-cálculo Estadías limpias por defecto (Solapa 3)
+    st_vis_def = dq_stores[dq_stores["visita_efectiva"]].copy()
+    if not st_vis_def.empty:
+        min_v_def = np.select(
+            [st_vis_def["Tipo_Viaje"] == "Directo (1 tienda)", st_vis_def["Tipo_Viaje"] == "Compartido (2 tiendas)"],
+            [15.0, 10.0],
+            default=5.0,
+        )
+        is_lej_def = st_vis_def["Categoria"] == "Lejana"
+        max_v_def = np.select(
+            [
+                (st_vis_def["Tipo_Viaje"] == "Directo (1 tienda)") & (~is_lej_def),
+                (st_vis_def["Tipo_Viaje"] == "Directo (1 tienda)") & is_lej_def,
+                (st_vis_def["Tipo_Viaje"] == "Compartido (2 tiendas)") & (~is_lej_def),
+                (st_vis_def["Tipo_Viaje"] == "Compartido (2 tiendas)") & is_lej_def,
+                (st_vis_def["Tipo_Viaje"] == "Rutas (3+ tiendas)") & (~is_lej_def),
+                (st_vis_def["Tipo_Viaje"] == "Rutas (3+ tiendas)") & is_lej_def,
+            ],
+            [240.0, 360.0, 180.0, 300.0, 150.0, 240.0],
+            default=240.0,
+        )
+        b_def = st_vis_def["Total Bultos_num"].fillna(0)
+        m100_def = np.where(b_def > 0, st_vis_def["Tiempo de Estadia"] / (b_def / 100.0), np.nan)
+        sol_def = (
+            st_vis_def["dt_ini_real"].notna()
+            & st_vis_def["prev_dt_fin_real"].notna()
+            & (st_vis_def["dt_ini_real"] < st_vis_def["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+        )
+        ok_st_def = (
+            (~((b_def >= 50) & (m100_def < 3.0)))
+            & (~(st_vis_def["Tiempo de Estadia"].isna() | (st_vis_def["Tiempo de Estadia"] < min_v_def)))
+            & (~(st_vis_def["Tiempo de Estadia"] > max_v_def))
+            & (~sol_def)
+        )
+        st_clean_default = st_vis_def[ok_st_def].copy()
+        st_clean_default["Orden_Parada_Grupo"] = np.select(
+            [
+                st_clean_default["Orden Visita Tienda"] == 1,
+                st_clean_default["Orden Visita Tienda"] == 2,
+                st_clean_default["Orden Visita Tienda"] == 3,
+                st_clean_default["Orden Visita Tienda"] >= 4,
+            ],
+            ["1ª Parada", "2ª Parada", "3ª Parada", "4ª+ Parada"],
+            default="Sin orden",
+        )
+    else:
+        st_clean_default = st_vis_def
+
+    # B. Pre-cálculo Viajes y Jornadas por defecto (Solapa 5)
+    has_sol_s5 = (
+        dq_stores["dt_ini_real"].notna()
+        & dq_stores["prev_dt_fin_real"].notna()
+        & (dq_stores["dt_ini_real"] < dq_stores["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
+    )
+    st_tt_def = (
+        dq_stores.assign(_solape=has_sol_s5)
+        .groupby("Id Viaje", as_index=False)
+        .agg(
+            Ini_Primera_Tienda=("dt_ini_real", "min"),
+            Fin_Ultima_Tienda=("dt_fin_real", "max"),
+            Suma_Estadia_Tiendas_min=("Tiempo de Estadia", "sum"),
+            Min_Estadia_Tienda=("Tiempo de Estadia", "min"),
+            Max_Estadia_Tienda=("Tiempo de Estadia", "max"),
+            Tiene_Solape=("_solape", "any"),
+        )
+    )
+    trips_pre_s5 = dq_trips.merge(st_tt_def, on="Id Viaje", how="left")
+    trips_pre_s5["dt_ini_cd"] = pd.to_datetime(trips_pre_s5["Ini_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    trips_pre_s5["dt_fin_cd"] = pd.to_datetime(trips_pre_s5["Fin_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce")
+    ic_pre = _clean_int_str(trips_pre_s5["Interno"]).fillna(trips_pre_s5["Interno"].fillna("").astype(str).str.strip())
+    dom_pre = trips_pre_s5["Dominio"].fillna("S/D").astype(str).str.strip().str.upper()
+    trips_pre_s5["Interno_Clean"] = np.where(ic_pre.isin(["", "0", "S/D", "NAN", "None"]), "S/D (" + dom_pre + ")", ic_pre)
+    trips_pre_s5["Dominio_Clean"] = trips_pre_s5["Dominio"].fillna("").astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
+    trips_pre_s5["Dominio_Valido"] = (~trips_pre_s5["Dominio_Clean"].isin(["", "SINDOMINIO", "XXX000", "XXXXXX", "NAN"])) & (~trips_pre_s5["Dominio_Clean"].str.startswith("XXX"))
+    trips_pre_s5["_is_lejana"] = (trips_pre_s5["Categoria"] == "Lejana").astype(int)
+
     return {
         "master_trips": master_trips,
         "dup_detail": dup_detail,
@@ -764,6 +841,8 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         "dq_stores": dq_stores,
         "dq_cd_orig": dq_cd_orig,
         "dq_trips": dq_trips,
+        "st_clean_default": st_clean_default,
+        "trips_pre_s5": trips_pre_s5,
     }
 
 
@@ -778,8 +857,9 @@ def _add_clean_box_traces(
     group_name: str = "",
     show_legend: bool = False,
 ):
-    """Dibuja cajas limpias con 1 sola leyenda por medida al apoyar el mouse (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
-    sin repetir el nombre del segmento ni N."""
+    """Dibuja cajas limpias donde al apoyar el mouse en CUALQUIER parte de la caja (simple o agrupada)
+    se despliega 1 sola tarjeta en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
+    sin repetir el segmento ni N."""
     def _build_card(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float) -> str:
         header = f"<b>{group_name}</b><br>" if (show_legend and group_name) else ""
         return (
@@ -828,30 +908,19 @@ def _add_clean_box_traces(
                 q3=q3_l,
                 upperfence=uf_l,
                 mean=mean_l,
+                boxpoints=False,
+                hoveron="boxes",
                 name=group_name,
                 legendgroup=group_name,
                 showlegend=True,
                 marker_color=col_hex,
-                hoverinfo="skip",
-            )
-        )
-        # Puntos invisibles centrados en cada caja agrupada (offsetgroup=group_name) para desplegar 1 sola tarjeta limpia
-        fig.add_trace(
-            go.Scatter(
-                x=x_valid,
-                y=med_l,
-                mode="markers",
-                marker=dict(size=24, color=col_hex, opacity=0),
-                name=group_name,
-                legendgroup=group_name,
-                showlegend=False,
                 customdata=cards_l,
                 hovertemplate="%{customdata}<extra></extra>",
             )
         )
         return
 
-    # Caso sin sub-corte (1 caja por posición X)
+    # Caso sin sub-corte (1 caja por posición X, cada una con su color)
     for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
         s = vals.dropna()
         if len(s) == 0:
@@ -877,31 +946,13 @@ def _add_clean_box_traces(
                 q3=[round(q3_v, 1)],
                 upperfence=[round(hi_w, 1)],
                 mean=[round(mean_v, 1)],
+                boxpoints=False,
+                hoveron="boxes",
                 width=0.52,
                 name="",
                 showlegend=False,
                 marker_color=col_hex,
-                hoverinfo="skip",
-            )
-        )
-        # 5 puntos invisibles distribuidos a lo largo de toda la altura de la caja (de lo_w a hi_w)
-        # para que apoyando el mouse en CUALQUIER parte de la caja salga 1 sola tarjeta con todas las medidas
-        y_anchors = [
-            round(lo_w, 1),
-            round(q1_v, 1),
-            round(med_v, 1),
-            round(q3_v, 1),
-            round(hi_w, 1),
-        ]
-        fig.add_trace(
-            go.Scatter(
-                x=[x_lbl] * 5,
-                y=y_anchors,
-                mode="markers",
-                marker=dict(size=28, color=col_hex, opacity=0),
-                name="",
-                showlegend=False,
-                customdata=[card_txt] * 5,
+                customdata=[card_txt],
                 hovertemplate="%{customdata}<extra></extra>",
             )
         )
@@ -1395,6 +1446,7 @@ def _filter_all_datasets_cached(
         _f_sub(dq_stores),
         _f_sub(dq_cd_orig),
         _f_sub(dq_trips),
+        _f_sub(_data_dict["trips_pre_s5"]),
     )
 
 
@@ -1464,8 +1516,7 @@ def _clean_tramos_s4_cached(
 
 @st.cache_data(show_spinner=False)
 def _eval_viajes_jornadas_s5_cached(
-    dq_trips_filt: pd.DataFrame,
-    dq_stores_filt: pd.DataFrame,
+    trips_pre_filt: pd.DataFrame,
     cd_std_items: tuple,
     min_cd_j: int,
     max_cd_real_j: int,
@@ -1476,33 +1527,7 @@ def _eval_viajes_jornadas_s5_cached(
 ):
     cd_std_map = dict(cd_std_items)
     med_std_fallback = float(np.mean(list(cd_std_map.values()))) if cd_std_map else 90.0
-
-    # Calculo vectorizado sin lambdas lentas
-    has_solape_vec = (
-        dq_stores_filt["dt_ini_real"].notna()
-        & dq_stores_filt["prev_dt_fin_real"].notna()
-        & (dq_stores_filt["dt_ini_real"] < dq_stores_filt["prev_dt_fin_real"] - pd.Timedelta(minutes=1))
-    )
-    stops_tmp = dq_stores_filt.assign(_solape=has_solape_vec)
-    st_trip_times = (
-        stops_tmp.groupby("Id Viaje", as_index=False)
-        .agg(
-            Ini_Primera_Tienda=("dt_ini_real", "min"),
-            Fin_Ultima_Tienda=("dt_fin_real", "max"),
-            Suma_Estadia_Tiendas_min=("Tiempo de Estadia", "sum"),
-            Min_Estadia_Tienda=("Tiempo de Estadia", "min"),
-            Max_Estadia_Tienda=("Tiempo de Estadia", "max"),
-            Tiene_Solape=("_solape", "any"),
-        )
-    )
-
-    trips_eval_s5 = dq_trips_filt.merge(st_trip_times, on="Id Viaje", how="left")
-    trips_eval_s5["dt_ini_cd"] = pd.to_datetime(
-        trips_eval_s5["Ini_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
-    )
-    trips_eval_s5["dt_fin_cd"] = pd.to_datetime(
-        trips_eval_s5["Fin_CD_Origen"], format="%d/%m/%Y %H:%M:%S", errors="coerce"
-    )
+    trips_eval_s5 = trips_pre_filt.copy()
     trips_eval_s5["Estadia_CD_Std_min"] = (
         trips_eval_s5["Operacion"].map(cd_std_map).fillna(med_std_fallback)
     )
@@ -1563,25 +1588,7 @@ def _eval_viajes_jornadas_s5_cached(
         & (trips_eval_s5["Duracion_Viaje_Ajust_hs"].fillna(0) <= float(max_dur_v))
     )
 
-    # Identificador operativo de Interno (limpio)
-    ic = _clean_int_str(trips_eval_s5["Interno"]).fillna(
-        trips_eval_s5["Interno"].fillna("").astype(str).str.strip()
-    )
-    dom_u = trips_eval_s5["Dominio"].fillna("S/D").astype(str).str.strip().str.upper()
-    trips_eval_s5["Interno_Clean"] = np.where(
-        ic.isin(["", "0", "S/D", "NAN", "None"]),
-        "S/D (" + dom_u + ")",
-        ic,
-    )
 
-    trips_eval_s5["Dominio_Clean"] = (
-        trips_eval_s5["Dominio"].fillna("").astype(str).str.strip().str.upper().str.replace(" ", "", regex=False)
-    )
-    trips_eval_s5["Dominio_Valido"] = (
-        ~trips_eval_s5["Dominio_Clean"].isin(["", "SINDOMINIO", "XXX000", "XXXXXX", "NAN"])
-    ) & (~trips_eval_s5["Dominio_Clean"].str.startswith("XXX"))
-
-    trips_eval_s5["_is_lejana"] = (trips_eval_s5["Categoria"] == "Lejana").astype(int)
 
     valid_fleet_all = trips_eval_s5[trips_eval_s5["Dominio_Valido"]].copy()
 
@@ -1765,6 +1772,7 @@ selected_trans = st.sidebar.multiselect(
     dq_stores_filt,
     dq_cd_filt,
     dq_trips_filt,
+    trips_pre_filt,
 ) = _filter_all_datasets_cached(
     data,
     d_start,
@@ -5157,10 +5165,9 @@ with tab5:
     cd_std_map = dict(cd_std_items)
     med_std_fallback = float(np.mean(list(cd_std_map.values())))
 
-    # Evaluacion cacheada ultra-rapida
-    trips_eval_all, jornadas_real_base, jornadas_ajust_base = _eval_viajes_jornadas_s5_cached(
-        dq_trips_filt,
-        dq_stores_filt,
+    # Evaluacion cacheada ultra-rapida sobre la base pre-calculada
+    trips_eval_s5, jornadas_real_all, jornadas_ajust_all = _eval_viajes_jornadas_s5_cached(
+        trips_pre_filt,
         cd_std_items,
         int(min_cd_j),
         int(max_cd_real_j),
@@ -5170,77 +5177,8 @@ with tab5:
         float(max_dur_j),
     )
 
-    # -------------------------------------------------------------------------
-    # FILTROS PUNTUALES DE LA SOLAPA: INTERNO Y CD (ACTUALIZAN KPIs Y GRAFICOS)
-    # -------------------------------------------------------------------------
-    f_s5_c1, f_s5_c2, f_s5_c3 = st.columns([1.2, 0.9, 1.4])
-    internos_opts_s5 = ["Todos"] + (
-        sorted(
-            trips_eval_all["Interno_Clean"].dropna().unique().tolist(),
-            key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
-        )
-        if not trips_eval_all.empty
-        else []
-    )
-    with f_s5_c1:
-        interno_sel_s5 = st.selectbox(
-            "Interno (camión puntual):",
-            options=internos_opts_s5,
-            index=0,
-            key="s5_interno_sel",
-        )
-
-    if interno_sel_s5 != "Todos" and not trips_eval_all.empty:
-        cds_int_s5 = sorted(
-            trips_eval_all[trips_eval_all["Interno_Clean"] == interno_sel_s5]["Operacion"]
-            .dropna()
-            .astype(int)
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-    else:
-        cds_int_s5 = sorted(
-            trips_eval_all["Operacion"].dropna().astype(int).astype(str).unique().tolist()
-        ) if not trips_eval_all.empty else []
-
-    with f_s5_c2:
-        cd_sel_s5 = st.selectbox(
-            "CD:",
-            options=["Todos"] + cds_int_s5,
-            index=0,
-            key="s5_cd_sel",
-        )
-
-    # Aplicar filtros de Interno y CD sobre viajes y jornadas de esta solapa
-    trips_eval_s5 = trips_eval_all.copy()
-    jornadas_real_all = jornadas_real_base.copy()
-    jornadas_ajust_all = jornadas_ajust_base.copy()
-
-    if interno_sel_s5 != "Todos":
-        trips_eval_s5 = trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5].copy()
-        if not jornadas_real_all.empty:
-            jornadas_real_all = jornadas_real_all[jornadas_real_all["Interno_Clean"] == interno_sel_s5].copy()
-        if not jornadas_ajust_all.empty:
-            jornadas_ajust_all = jornadas_ajust_all[jornadas_ajust_all["Interno_Clean"] == interno_sel_s5].copy()
-
-    if cd_sel_s5 != "Todos":
-        trips_eval_s5 = trips_eval_s5[trips_eval_s5["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
-        if not jornadas_real_all.empty:
-            jornadas_real_all = jornadas_real_all[jornadas_real_all["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
-        if not jornadas_ajust_all.empty:
-            jornadas_ajust_all = jornadas_ajust_all[jornadas_ajust_all["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
-
-    with f_s5_c3:
-        if interno_sel_s5 != "Todos" and not trips_eval_s5.empty:
-            dom_info = " / ".join(sorted(trips_eval_s5["Dominio"].dropna().astype(str).unique()))
-            tv_info = " / ".join(sorted(trips_eval_s5["Tipo_Vehiculo"].dropna().astype(str).unique()))
-            cd_info_lbl = f"CD {cd_sel_s5}" if cd_sel_s5 != "Todos" else f"CD {', '.join(cds_int_s5)}"
-            st.caption(f"Unidad activa: **Interno {interno_sel_s5}** ({dom_info}) · **{tv_info}** · **{cd_info_lbl}**")
-        else:
-            st.caption("Mostrando toda la flota del período (seleccioná un **Interno** o **CD** para aislar una unidad).")
-
     # Seleccionar columnas activas segun el interruptor del usuario
+    trips_eval_s5 = trips_eval_s5.copy()
     if usar_estadia_cd_ajust:
         trips_eval_s5["Viaje_OK_Activo"] = trips_eval_s5["Viaje_OK_Ajust"]
         trips_eval_s5["dt_ini_cd_Activo"] = trips_eval_s5["dt_ini_cd_Ajust"]
@@ -5360,7 +5298,7 @@ with tab5:
         )
 
     # Tabla resumen de representatividad y diagnóstico de exclusiones por CD
-    with st.expander("📊 Ver Cobertura y Diagnóstico por CD: ¿Por qué se excluyen viajes? (CD vs. Estadías en Tienda)", expanded=True):
+    with st.expander("📊 Ver Cobertura y Diagnóstico por CD: ¿Por qué se excluyen viajes? (CD vs. Estadías en Tienda)", expanded=False):
         st.caption(
             "Permite ver al instante si las exclusiones de un CD (como el **CD 504**) provienen de **falta de dato/guarda en CD** "
             "(recuperables con el interruptor) o de **estadías/GPS faltantes en las tiendas**."
@@ -5400,7 +5338,7 @@ with tab5:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: ANALISIS DE TIEMPOS DE VIAJE (CON EVOLUCION TEMPORAL Y EJES AJUSTADOS)
+    # BLOQUE 1: DURACION DE VIAJES OK (PREFIJADO: TIPO DE VIAJE x CATEGORIA)
     # -------------------------------------------------------------------------
     st.markdown(
         f"### 1. Duración y Evolución Temporal de Viajes OK ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
@@ -5614,7 +5552,7 @@ with tab5:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 2: ANALISIS DE JORNADAS DIARIAS (1 VUELTA vs 2+ VUELTAS + CATEGORIA + CD + TIEMPO)
+    # BLOQUE 2: ANALISIS DE JORNADAS DIARIAS (PREFIJADO: OPERACION CD x CANTIDAD DE VUELTAS)
     # -------------------------------------------------------------------------
     st.markdown(
         f"### 2. Análisis de Jornadas Diarias ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
@@ -5626,7 +5564,6 @@ with tab5:
 
     df_j_res = pd.DataFrame()
     if not jornadas_clean_s5.empty:
-        # Filtro de Categoría de Jornada (Todas / Cercana / Lejana)
         cat_j_sel = st.radio(
             "Filtrar Categoría de Jornada (Cercana vs. Lejana):",
             options=["Todas", "Cercana", "Lejana"],
@@ -5641,12 +5578,12 @@ with tab5:
             df_jp_base = df_jp_base[df_jp_base["Categoria_Jornada"] == cat_j_sel].copy()
             df_jt_base = df_jt_base[df_jt_base["Categoria_Jornada"] == cat_j_sel].copy()
 
-        # Controles de gráfico de cajas de jornadas (Eje principal + Sub-división por color)
+        # Prefijado: Operación (CD) en eje principal y Cantidad de Vueltas (1 vs. 2+ Vueltas) en color
         jb_c1, jb_c2 = st.columns([1.3, 1.2])
         with jb_c1:
             j_box_dim_map = {
-                "Cantidad de Vueltas (1 vs. 2+ Vueltas)": "Vueltas_Label",
                 "Operación (CD)": "Operacion",
+                "Cantidad de Vueltas (1 vs. 2+ Vueltas)": "Vueltas_Label",
                 "Categoría (Cercana vs. Lejana)": "Categoria_Jornada",
                 "Tipo de Vehículo (Nómina)": "Tipo_Vehiculo",
                 "Evolución por Mes": "Evol_Mes",
@@ -5662,14 +5599,14 @@ with tab5:
         with jb_c2:
             j_box_sub_map = {
                 "Sin sub-corte": None,
-                "Categoría (Cercana vs. Lejana)": "Categoria_Jornada",
                 "Cantidad de Vueltas (1 vs. 2+ Vueltas)": "Vueltas_Label",
+                "Categoría (Cercana vs. Lejana)": "Categoria_Jornada",
                 "Operación (CD)": "Operacion",
             }
             j_box_sub_lbl = st.selectbox(
                 "Sub-dividir cajas de jornadas por color:",
                 options=list(j_box_sub_map.keys()),
-                index=1 if cat_j_sel == "Todas" else 0,
+                index=1,
                 key="s5_j_box_sub",
             )
 
@@ -5725,6 +5662,8 @@ with tab5:
                 j_ord = df_jplot[["Semana_Sort", j_dim_col]].drop_duplicates().sort_values("Semana_Sort")[j_dim_col].tolist()
             elif j_dim_col == "Vueltas_Label":
                 j_ord = [c for c in ["1 Vuelta", "2 Vueltas", "3+ Vueltas"] if c in df_jplot[j_dim_col].unique()]
+            elif j_dim_col == "Operacion":
+                j_ord = sorted(df_jplot[j_dim_col].unique().tolist())
             else:
                 j_ord = df_jplot.groupby(j_dim_col)["Duracion_Jornada_hs"].median().sort_values(ascending=False).index.tolist()
 
@@ -5801,7 +5740,7 @@ with tab5:
             )
             st.plotly_chart(fig_jbox, use_container_width=True)
 
-        # Tabla resumen de jornadas debajo del gráfico (ancho completo, sin columnas cortadas)
+        # Tabla resumen de jornadas debajo del gráfico
         j_cut = st.selectbox(
             "Abrir tabla resumen de jornadas por:",
             options=["Operación (CD)", "Tipo de Vehículo (Nómina)", "Categoría (Cercana vs. Lejana)"],
@@ -5857,6 +5796,145 @@ with tab5:
                 "% Represent.": st.column_config.NumberColumn("% Represent.", format="%.1f%%"),
             },
         )
+
+    st.divider()
+
+    # -------------------------------------------------------------------------
+    # BLOQUE 3: CONSULTA PUNTUAL POR INTERNO Y CD (EVOLUCION TEMPORAL DE LA UNIDAD)
+    # -------------------------------------------------------------------------
+    st.markdown("### 3. Consulta Puntual por Interno y CD (Evolución Temporal de la Unidad)")
+    st.caption(
+        "Seleccioná un **Interno** (y opcionalmente un **CD**) para analizar la evolución temporal "
+        "de sus **Viajes OK** o sus **Jornadas Diarias** a lo largo del período activo."
+    )
+
+    f_s5_c1, f_s5_c2, f_s5_c3, f_s5_c4 = st.columns([1.15, 0.85, 1.15, 1.15])
+    internos_opts_s5 = (
+        sorted(
+            trips_eval_s5["Interno_Clean"].dropna().unique().tolist(),
+            key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+        )
+        if not trips_eval_s5.empty
+        else []
+    )
+    with f_s5_c1:
+        interno_sel_s5 = st.selectbox(
+            "Interno:",
+            options=internos_opts_s5,
+            index=0 if internos_opts_s5 else None,
+            placeholder="Seleccioná un interno",
+            key="s5_interno_sel",
+        )
+
+    if interno_sel_s5 and not trips_eval_s5.empty:
+        cds_int_s5 = sorted(
+            trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5]["Operacion"]
+            .dropna()
+            .astype(int)
+            .astype(str)
+            .unique()
+            .tolist()
+        )
+    else:
+        cds_int_s5 = []
+
+    with f_s5_c2:
+        cd_sel_s5 = st.selectbox(
+            "CD:",
+            options=["Todos"] + cds_int_s5,
+            index=0,
+            key="s5_cd_sel",
+        )
+    with f_s5_c3:
+        metrica_int_s5 = st.radio(
+            "Métrica a visualizar:",
+            options=["Jornadas Diarias (hs)", "Viajes OK (hs)"],
+            index=0,
+            horizontal=True,
+            key="s5_int_metrica",
+        )
+    with f_s5_c4:
+        eje_int_s5 = st.radio(
+            "Eje temporal:",
+            options=["Semana", "Mes", "Fecha (Día)"],
+            index=0,
+            horizontal=True,
+            key="s5_int_eje_t",
+        )
+
+    if interno_sel_s5 and not trips_eval_s5.empty:
+        sub_t_int = trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5].copy()
+        sub_j_int = jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5].copy() if not jornadas_clean_s5.empty else pd.DataFrame()
+        if cd_sel_s5 != "Todos":
+            sub_t_int = sub_t_int[sub_t_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
+            if not sub_j_int.empty:
+                sub_j_int = sub_j_int[sub_j_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
+
+        dom_info = " / ".join(sorted(sub_t_int["Dominio"].dropna().astype(str).unique()))
+        tv_info = " / ".join(sorted(sub_t_int["Tipo_Vehiculo"].dropna().astype(str).unique()))
+        cd_titulo_int = f"CD {cd_sel_s5}" if cd_sel_s5 != "Todos" else f"CD {', '.join(cds_int_s5)}"
+
+        v_ok_int = sub_t_int[sub_t_int["Viaje_OK_Activo"]].copy()
+        st.caption(
+            f"**{cd_titulo_int} · Interno {interno_sel_s5}** ({dom_info} · {tv_info}) — "
+            f"Viajes OK: **{len(v_ok_int)} / {len(sub_t_int)}** | Jornadas limpias: **{len(sub_j_int)}**"
+        )
+
+        df_int_plot = sub_j_int.copy() if metrica_int_s5 == "Jornadas Diarias (hs)" else v_ok_int.copy()
+        val_col_int = "Duracion_Jornada_hs" if metrica_int_s5 == "Jornadas Diarias (hs)" else "Duracion_Viaje_hs"
+        y_lim_int = float(max_dur_j) + 1.0 if metrica_int_s5 == "Jornadas Diarias (hs)" else float(max_dur_v) + 1.0
+
+        if not df_int_plot.empty:
+            if eje_int_s5 == "Mes":
+                df_int_plot["_p_sort"] = df_int_plot["Fecha_Reparto"].dt.to_period("M").dt.start_time
+                df_int_plot["_p_lbl"] = df_int_plot["_p_sort"].dt.strftime("%Y-%m")
+                ord_int_t = df_int_plot[["_p_sort", "_p_lbl"]].drop_duplicates().sort_values("_p_sort")["_p_lbl"].tolist()
+            elif eje_int_s5 == "Fecha (Día)":
+                df_int_plot["_p_sort"] = df_int_plot["Fecha_Reparto"].dt.floor("D")
+                df_int_plot["_p_lbl"] = df_int_plot["_p_sort"].dt.dayofweek.map(dias_es) + " " + df_int_plot["_p_sort"].dt.strftime("%d/%m")
+                ord_int_t = df_int_plot[["_p_sort", "_p_lbl"]].drop_duplicates().sort_values("_p_sort")["_p_lbl"].tolist()
+            else:
+                df_int_plot["_p_lbl"] = df_int_plot["Semana_Label"]
+                ord_int_t = df_int_plot[["Semana_Sort", "_p_lbl"]].drop_duplicates().sort_values("Semana_Sort")["_p_lbl"].tolist()
+
+            x_int_l, ser_int_l, col_int_l = [], [], []
+            for p_l in ord_int_t:
+                sv_i = df_int_plot[df_int_plot["_p_lbl"] == p_l][val_col_int].dropna()
+                if len(sv_i) == 0:
+                    continue
+                x_int_l.append(f"{p_l}<br>(n={len(sv_i)})")
+                ser_int_l.append(sv_i)
+                col_int_l.append("#1d4ed8")
+
+            fig_int_box = go.Figure()
+            _add_clean_box_traces(
+                fig_int_box,
+                x_int_l,
+                ser_int_l,
+                col_int_l,
+                unit_suffix="hs",
+                use_tukey=tukey_j,
+                show_legend=False,
+            )
+            fig_int_box.update_layout(
+                title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Evolución Temporal ({metrica_int_s5})",
+                boxgap=0.22,
+                height=390,
+                margin=dict(l=20, r=20, t=42, b=20),
+                yaxis=dict(
+                    title=metrica_int_s5,
+                    range=[0, y_lim_int],
+                    dtick=2,
+                    zeroline=True,
+                    zerolinecolor="#cbd5e1",
+                ),
+                xaxis=dict(tickangle=-35 if len(ord_int_t) > 10 else 0),
+                showlegend=False,
+                hovermode="closest",
+            )
+            st.plotly_chart(fig_int_box, use_container_width=True)
+        else:
+            st.info(f"El Interno {interno_sel_s5} no tiene registros limpios en el modo activo para esta métrica.")
 
     # Descarga Excel de Viajes y Jornadas
     v_clean_exp = viajes_ok_s5.copy()
