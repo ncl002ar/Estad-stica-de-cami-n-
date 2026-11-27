@@ -850,6 +850,142 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
 
 
 
+def _add_clean_box_traces(
+    fig: go.Figure,
+    x_labels: list,
+    series_list: list[pd.Series],
+    colors: list[str],
+    unit_suffix: str,
+    use_tukey: bool = True,
+    group_name: str = "",
+    show_legend: bool = False,
+):
+    """Dibuja cajas limpias con 1 sola tarjeta en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
+    al apoyar el mouse en cualquier parte de la caja (tanto simple como agrupada por color)."""
+    def _build_card(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float, n_cnt: int) -> str:
+        header = f"<b>{group_name}</b> (n={n_cnt:,})<br>" if (show_legend and group_name) else f"<b>Muestra: n={n_cnt:,}</b><br>"
+        return (
+            f"{header}"
+            f"Bigote Máximo: <b>{hi_w:.1f} {unit_suffix}</b><br>"
+            f"Q3 (75%): <b>{q3_v:.1f} {unit_suffix}</b><br>"
+            f"Media: <b>{mean_v:.1f} {unit_suffix}</b><br>"
+            f"Mediana (50%): <b>{med_v:.1f} {unit_suffix}</b><br>"
+            f"Q1 (25%): <b>{q1_v:.1f} {unit_suffix}</b><br>"
+            f"Bigote Mínimo: <b>{lo_w:.1f} {unit_suffix}</b>"
+        )
+
+    if show_legend and group_name:
+        x_valid, lf_l, q1_l, med_l, q3_l, uf_l, mean_l, spans_l, cards_l = [], [], [], [], [], [], [], [], []
+        for x_lbl, vals in zip(x_labels, series_list):
+            s = vals.dropna()
+            if len(s) == 0:
+                continue
+            q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
+            mean_v = float(s.mean())
+            if use_tukey:
+                iqr = q3_v - q1_v
+                lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
+                hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
+            else:
+                lo_w = float(s.min())
+                hi_w = float(s.max())
+            x_valid.append(x_lbl)
+            lf_l.append(round(lo_w, 1))
+            q1_l.append(round(q1_v, 1))
+            med_l.append(round(med_v, 1))
+            q3_l.append(round(q3_v, 1))
+            uf_l.append(round(hi_w, 1))
+            mean_l.append(round(mean_v, 1))
+            spans_l.append(max(0.2, round(hi_w - lo_w, 1)))
+            cards_l.append(_build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w, len(s)))
+
+        if not x_valid:
+            return
+        col_hex = colors[0]
+        fig.add_trace(
+            go.Box(
+                x=x_valid,
+                lowerfence=lf_l,
+                q1=q1_l,
+                median=med_l,
+                q3=q3_l,
+                upperfence=uf_l,
+                mean=mean_l,
+                boxpoints=False,
+                name=group_name,
+                legendgroup=group_name,
+                offsetgroup=group_name,
+                showlegend=True,
+                marker_color=col_hex,
+                hoverinfo="skip",
+            )
+        )
+        # Barra transparente alineada 1:1 con cada caja agrupada para desplegar tarjeta 100% en español
+        fig.add_trace(
+            go.Bar(
+                x=x_valid,
+                y=spans_l,
+                base=lf_l,
+                name=group_name,
+                legendgroup=group_name,
+                offsetgroup=group_name,
+                showlegend=False,
+                marker=dict(color="rgba(0,0,0,0)", line=dict(width=0)),
+                customdata=cards_l,
+                hovertemplate="%{customdata}<extra></extra>",
+            )
+        )
+        return
+
+    # Caso sin sub-corte (1 caja por posición X, cada una con su color)
+    for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
+        s = vals.dropna()
+        if len(s) == 0:
+            continue
+        q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
+        mean_v = float(s.mean())
+        if use_tukey:
+            iqr = q3_v - q1_v
+            lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
+            hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
+        else:
+            lo_w = float(s.min())
+            hi_w = float(s.max())
+
+        col_hex = colors[idx_b % len(colors)]
+        card_txt = _build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w, len(s))
+        fig.add_trace(
+            go.Box(
+                x=[x_lbl],
+                lowerfence=[round(lo_w, 1)],
+                q1=[round(q1_v, 1)],
+                median=[round(med_v, 1)],
+                q3=[round(q3_v, 1)],
+                upperfence=[round(hi_w, 1)],
+                mean=[round(mean_v, 1)],
+                boxpoints=False,
+                width=0.52,
+                name="",
+                showlegend=False,
+                marker_color=col_hex,
+                hoverinfo="skip",
+            )
+        )
+        fig.add_trace(
+            go.Bar(
+                x=[x_lbl],
+                y=[max(0.2, round(hi_w - lo_w, 1))],
+                base=[round(lo_w, 1)],
+                width=0.52,
+                name="",
+                showlegend=False,
+                marker=dict(color="rgba(0,0,0,0)", line=dict(width=0)),
+                customdata=[card_txt],
+                hovertemplate="%{customdata}<extra></extra>",
+            )
+        )
+
+
 @st.cache_data(show_spinner=False, max_entries=128)
 def _build_grouped_boxplot_cached(
     df_clean: pd.DataFrame,
@@ -911,7 +1047,7 @@ def _build_grouped_boxplot_cached(
             use_tukey=use_tukey,
             show_legend=False,
         )
-        fig.update_layout(showlegend=False)
+        fig.update_layout(barmode="overlay", showlegend=False)
     else:
         if fixed_sub_order is not None:
             sub_vals = [s for s in fixed_sub_order if s in df_clean[sub_col].unique()]
@@ -938,6 +1074,7 @@ def _build_grouped_boxplot_cached(
             )
         fig.update_layout(
             boxmode="group",
+            barmode="group",
             xaxis=dict(categoryorder="array", categoryarray=cat_order),
             showlegend=True,
         )
@@ -954,6 +1091,8 @@ def _build_grouped_boxplot_cached(
         title=chart_title if chart_title else None,
         boxgap=0.18,
         boxgroupgap=0.10,
+        bargap=0.18,
+        bargroupgap=0.10,
         height=420,
         margin=dict(l=20, r=20, t=42 if chart_title else 35, b=20),
         yaxis=yaxis_cfg,
@@ -1023,117 +1162,6 @@ def _build_grouped_boxplot_cached(
             df_res = df_res.sort_values("_ord").drop(columns=["_ord"])
 
     return fig, df_res
-
-
-def _add_clean_box_traces(
-    fig: go.Figure,
-    x_labels: list,
-    series_list: list[pd.Series],
-    colors: list[str],
-    unit_suffix: str,
-    use_tukey: bool = True,
-    group_name: str = "",
-    show_legend: bool = False,
-):
-    """Dibuja cajas limpias donde al apoyar el mouse en CUALQUIER parte de la caja (simple o agrupada)
-    se despliega 1 sola tarjeta en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
-    sin repetir el segmento ni N."""
-    def _build_card(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float) -> str:
-        header = f"<b>{group_name}</b><br>" if (show_legend and group_name) else ""
-        return (
-            f"{header}"
-            f"Bigote Máximo: <b>{hi_w:.1f} {unit_suffix}</b><br>"
-            f"Q3: <b>{q3_v:.1f} {unit_suffix}</b><br>"
-            f"Media: <b>{mean_v:.1f} {unit_suffix}</b><br>"
-            f"Mediana: <b>{med_v:.1f} {unit_suffix}</b><br>"
-            f"Q1: <b>{q1_v:.1f} {unit_suffix}</b><br>"
-            f"Bigote Mínimo: <b>{lo_w:.1f} {unit_suffix}</b>"
-        )
-
-    if show_legend and group_name:
-        x_valid, lf_l, q1_l, med_l, q3_l, uf_l, mean_l, cards_l = [], [], [], [], [], [], [], []
-        for x_lbl, vals in zip(x_labels, series_list):
-            s = vals.dropna()
-            if len(s) == 0:
-                continue
-            q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
-            mean_v = float(s.mean())
-            if use_tukey:
-                iqr = q3_v - q1_v
-                lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
-                hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
-            else:
-                lo_w = float(s.min())
-                hi_w = float(s.max())
-            x_valid.append(x_lbl)
-            lf_l.append(round(lo_w, 1))
-            q1_l.append(round(q1_v, 1))
-            med_l.append(round(med_v, 1))
-            q3_l.append(round(q3_v, 1))
-            uf_l.append(round(hi_w, 1))
-            mean_l.append(round(mean_v, 1))
-            cards_l.append(_build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w))
-
-        if not x_valid:
-            return
-        col_hex = colors[0]
-        fig.add_trace(
-            go.Box(
-                x=x_valid,
-                lowerfence=lf_l,
-                q1=q1_l,
-                median=med_l,
-                q3=q3_l,
-                upperfence=uf_l,
-                mean=mean_l,
-                boxpoints=False,
-                hoveron="boxes",
-                name=group_name,
-                legendgroup=group_name,
-                showlegend=True,
-                marker_color=col_hex,
-                customdata=cards_l,
-                hovertemplate="%{customdata}<extra></extra>",
-            )
-        )
-        return
-
-    # Caso sin sub-corte (1 caja por posición X, cada una con su color)
-    for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
-        s = vals.dropna()
-        if len(s) == 0:
-            continue
-        q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
-        mean_v = float(s.mean())
-        if use_tukey:
-            iqr = q3_v - q1_v
-            lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
-            hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
-        else:
-            lo_w = float(s.min())
-            hi_w = float(s.max())
-
-        col_hex = colors[idx_b % len(colors)]
-        card_txt = _build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w)
-        fig.add_trace(
-            go.Box(
-                x=[x_lbl],
-                lowerfence=[round(lo_w, 1)],
-                q1=[round(q1_v, 1)],
-                median=[round(med_v, 1)],
-                q3=[round(q3_v, 1)],
-                upperfence=[round(hi_w, 1)],
-                mean=[round(mean_v, 1)],
-                boxpoints=False,
-                hoveron="boxes",
-                width=0.52,
-                name="",
-                showlegend=False,
-                marker_color=col_hex,
-                customdata=[card_txt],
-                hovertemplate="%{customdata}<extra></extra>",
-            )
-        )
 
 
 def build_audit_excel(df_gap, df_solo_tms, df_store_diff, df_dup, df_inv) -> bytes:
@@ -5704,144 +5732,379 @@ with tab5:
         @_ui_fragment
         def _render_s5_interno_fragment():
             # -------------------------------------------------------------------------
-            # BLOQUE 3: CONSULTA PUNTUAL POR INTERNO Y CD (EVOLUCION TEMPORAL DE LA UNIDAD)
+            # BLOQUE 3: RANKING DE INTERNOS EN JORNADAS Y EVOLUCION PUNTUAL POR CAMION
             # -------------------------------------------------------------------------
-            st.markdown("### 3. Consulta Puntual por Interno y CD (Evolución Temporal de la Unidad)")
+            st.markdown(
+                f"### 3. Ranking de Internos en Jornadas y Evolución Puntual ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
+            )
             st.caption(
-                "Seleccioná un **Interno** (y opcionalmente un **CD**) para analizar la evolución temporal "
-                "de sus **Viajes OK** o sus **Jornadas Diarias** a lo largo del período activo."
+                "Identifica los **Internos con jornadas más extensas vs. más cortas** (comparados contra la mediana de su **Tipo de Camión**), "
+                "y permite inspeccionar la **evolución día por día** de cualquier unidad puntual."
             )
 
-            f_s5_c1, f_s5_c2, f_s5_c3, f_s5_c4 = st.columns([1.15, 0.85, 1.15, 1.15])
-            internos_opts_s5 = (
-                sorted(
-                    trips_eval_s5["Interno_Clean"].dropna().unique().tolist(),
+            if jornadas_clean_s5.empty:
+                st.info("No hay jornadas limpias para construir el ranking de internos en el modo activo.")
+                return
+
+            cds_j_int_opts = ["Todos"] + sorted(
+                jornadas_clean_s5["Operacion"].dropna().astype(int).astype(str).unique().tolist()
+            )
+            tv_j_int_opts = ["Todos"] + sorted(
+                jornadas_clean_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str).unique().tolist()
+            )
+
+            rkj1, rkj2, rkj3, rkj4 = st.columns([0.9, 0.9, 1.0, 1.3])
+            with rkj1:
+                cd_rk_j = st.selectbox("Filtrar por CD:", options=cds_j_int_opts, index=0, key="s5_rkj_cd")
+            with rkj2:
+                top_n_j = st.selectbox("Cantidad Top:", options=[10, 15, 20, 30], index=1, key="s5_rkj_topn")
+            with rkj3:
+                min_j_int = st.number_input("Mín. jornadas limpias:", min_value=1, max_value=100, value=5, step=1, key="s5_rkj_min")
+            with rkj4:
+                tv_rk_j = st.selectbox("Filtrar por Tipo de Camión:", options=tv_j_int_opts, index=0, key="s5_rkj_tv")
+
+            # Referencia global por Tipo de Camión en el modo activo
+            veh_j_ref = (
+                jornadas_clean_s5.assign(_tv=jornadas_clean_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str))
+                .groupby("_tv", as_index=False)
+                .agg(Mediana_Veh_hs=("Duracion_Jornada_hs", "median"))
+            )
+
+            j_tot_u = jornadas_all.copy()
+            j_ok_u = jornadas_clean_s5.copy()
+            j_ok_u["_tv"] = j_ok_u["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+            if cd_rk_j != "Todos":
+                j_tot_u = j_tot_u[j_tot_u["Operacion"].astype(int).astype(str) == str(cd_rk_j)]
+                j_ok_u = j_ok_u[j_ok_u["Operacion"].astype(int).astype(str) == str(cd_rk_j)]
+            if tv_rk_j != "Todos":
+                j_tot_u = j_tot_u[j_tot_u["Tipo_Vehiculo"].fillna("Sin dato").astype(str) == tv_rk_j]
+                j_ok_u = j_ok_u[j_ok_u["_tv"] == tv_rk_j]
+
+            tot_j_cnt = (
+                j_tot_u.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                .size()
+                .rename(columns={"size": "Jornadas_Totales"})
+            )
+
+            agg_ji = (
+                j_ok_u.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                .agg(
+                    Dominio=("Dominio", lambda s: " / ".join(sorted(s.dropna().astype(str).unique()))),
+                    Tipo_Camion=("_tv", lambda s: s.value_counts().index[0]),
+                    Jornadas_Limpias=("Duracion_Jornada_hs", "count"),
+                    J_1V=("Vueltas_Label", lambda s: int((s == "1 Vuelta").sum())),
+                    J_2V=("Vueltas_Label", lambda s: int((s == "2 Vueltas").sum())),
+                    Med_Jornada_hs=("Duracion_Jornada_hs", "median"),
+                    P90_Jornada_hs=("Duracion_Jornada_hs", lambda s: float(np.percentile(s.dropna(), 90))),
+                    Med_KMS_Dia=("KMS_Dia", "median"),
+                )
+                .merge(tot_j_cnt, on=["Operacion", "Interno_Clean"], how="left")
+                .merge(veh_j_ref, left_on="Tipo_Camion", right_on="_tv", how="left")
+            )
+            agg_ji = agg_ji[agg_ji["Jornadas_Limpias"] >= int(min_j_int)].copy()
+
+            if not agg_ji.empty:
+                agg_ji["CD"] = agg_ji["Operacion"].astype(int).astype(str)
+                agg_ji["Diff_vs_Camion_hs"] = (agg_ji["Med_Jornada_hs"] - agg_ji["Mediana_Veh_hs"]).round(1)
+                agg_ji["Int_Label"] = (
+                    "Int. "
+                    + agg_ji["Interno_Clean"]
+                    + " ("
+                    + agg_ji["Dominio"]
+                    + " | CD "
+                    + agg_ji["CD"]
+                    + " · "
+                    + agg_ji["Tipo_Camion"]
+                    + ")"
+                )
+                agg_ji = agg_ji.sort_values("Med_Jornada_hs", ascending=False).reset_index(drop=True)
+
+                c_jhi, c_jlo = st.columns(2)
+                with c_jhi:
+                    top_j_hi = agg_ji.head(int(top_n_j)).iloc[::-1].copy()
+                    col_jhi = [
+                        "#dc2626" if v >= 10.0 else ("#f59e0b" if v >= 8.5 else "#1d4ed8")
+                        for v in top_j_hi["Med_Jornada_hs"]
+                    ]
+                    fig_jhi = go.Figure(
+                        data=go.Bar(
+                            x=top_j_hi["Med_Jornada_hs"],
+                            y=top_j_hi["Int_Label"],
+                            orientation="h",
+                            marker_color=col_jhi,
+                            text=[f"{v:.1f} hs" for v in top_j_hi["Med_Jornada_hs"]],
+                            textposition="outside",
+                            customdata=np.dstack(
+                                (
+                                    top_j_hi["Med_Jornada_hs"],
+                                    top_j_hi["Mediana_Veh_hs"],
+                                    top_j_hi["Diff_vs_Camion_hs"],
+                                    top_j_hi["Jornadas_Limpias"],
+                                    top_j_hi["Jornadas_Totales"],
+                                    top_j_hi["J_1V"],
+                                    top_j_hi["J_2V"],
+                                    top_j_hi["Med_KMS_Dia"],
+                                )
+                            )[0],
+                            hovertemplate=(
+                                "<b>%{y}</b><br>"
+                                "Mediana Jornada: <b>%{customdata[0]:.1f} hs</b> (Ref. Tipo Camión: %{customdata[1]:.1f} hs | %{customdata[2]:+.1f} hs)<br>"
+                                "Jornadas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales (1V: %{customdata[5]:.0f} | 2V: %{customdata[6]:.0f})<br>"
+                                "Mediana KMS/Día: <b>%{customdata[7]:.0f} km</b><extra></extra>"
+                            ),
+                        )
+                    )
+                    max_jh = float(top_j_hi["Med_Jornada_hs"].max()) if not top_j_hi.empty else 12.0
+                    fig_jhi.update_layout(
+                        title=f"🔴 Top {len(top_j_hi)} Mayor Duración de Jornada (hs)",
+                        height=max(340, len(top_j_hi) * 26 + 90),
+                        margin=dict(l=10, r=55, t=40, b=20),
+                        xaxis_title="Mediana Duración Jornada (hs)",
+                        yaxis_title="",
+                        xaxis=dict(range=[0, max_jh * 1.24]),
+                    )
+                    st.plotly_chart(fig_jhi, use_container_width=True)
+
+                with c_jlo:
+                    top_j_lo = agg_ji.tail(int(top_n_j)).copy().sort_values("Med_Jornada_hs", ascending=False)
+                    col_jlo = [
+                        "#16a34a" if v <= 0 else ("#3b82f6" if v <= 1.0 else "#f59e0b")
+                        for v in top_j_lo["Diff_vs_Camion_hs"]
+                    ]
+                    fig_jlo = go.Figure(
+                        data=go.Bar(
+                            x=top_j_lo["Med_Jornada_hs"],
+                            y=top_j_lo["Int_Label"],
+                            orientation="h",
+                            marker_color=col_jlo,
+                            text=[f"{v:.1f} hs" for v in top_j_lo["Med_Jornada_hs"]],
+                            textposition="outside",
+                            customdata=np.dstack(
+                                (
+                                    top_j_lo["Med_Jornada_hs"],
+                                    top_j_lo["Mediana_Veh_hs"],
+                                    top_j_lo["Diff_vs_Camion_hs"],
+                                    top_j_lo["Jornadas_Limpias"],
+                                    top_j_lo["Jornadas_Totales"],
+                                    top_j_lo["J_1V"],
+                                    top_j_lo["J_2V"],
+                                    top_j_lo["Med_KMS_Dia"],
+                                )
+                            )[0],
+                            hovertemplate=(
+                                "<b>%{y}</b><br>"
+                                "Mediana Jornada: <b>%{customdata[0]:.1f} hs</b> (Ref. Tipo Camión: %{customdata[1]:.1f} hs | %{customdata[2]:+.1f} hs)<br>"
+                                "Jornadas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales (1V: %{customdata[5]:.0f} | 2V: %{customdata[6]:.0f})<br>"
+                                "Mediana KMS/Día: <b>%{customdata[7]:.0f} km</b><extra></extra>"
+                            ),
+                        )
+                    )
+                    max_jl = float(top_j_lo["Med_Jornada_hs"].max()) if not top_j_lo.empty else 12.0
+                    fig_jlo.update_layout(
+                        title=f"🟢 Top {len(top_j_lo)} Jornadas Más Cortas (hs)",
+                        height=max(340, len(top_j_lo) * 26 + 90),
+                        margin=dict(l=10, r=55, t=40, b=20),
+                        xaxis_title="Mediana Duración Jornada (hs)",
+                        yaxis_title="",
+                        xaxis=dict(range=[0, max_jl * 1.24]),
+                    )
+                    st.plotly_chart(fig_jlo, use_container_width=True)
+
+            # -----------------------------------------------------------------
+            # EVOLUCION PUNTUAL DE UN INTERNO (SERIE DIARIA CON PUNTOS + REFERENCIA)
+            # -----------------------------------------------------------------
+            with st.expander("📈 Ver Evolución Día por Día de un Interno Puntual (Serie Temporal)", expanded=True):
+                st.caption(
+                    "Como cada camión realiza **1 jornada por día**, una **línea de evolución diaria con puntos** "
+                    "(diferenciando 1 Vuelta vs. 2+ Vueltas) permite ver su comportamiento mucho mejor que un diagrama de cajas."
+                )
+                f_s5_c1, f_s5_c2, f_s5_c3 = st.columns([1.2, 0.9, 1.3])
+                internos_opts_s5 = sorted(
+                    j_ok_u["Interno_Clean"].dropna().unique().tolist(),
+                    key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
+                ) if not j_ok_u.empty else sorted(
+                    jornadas_clean_s5["Interno_Clean"].dropna().unique().tolist(),
                     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
                 )
-                if not trips_eval_s5.empty
-                else []
-            )
-            with f_s5_c1:
-                interno_sel_s5 = st.selectbox(
-                    "Interno:",
-                    options=internos_opts_s5,
-                    index=0 if internos_opts_s5 else None,
-                    placeholder="Seleccioná un interno",
-                    key="s5_interno_sel",
-                )
+                with f_s5_c1:
+                    interno_sel_s5 = st.selectbox(
+                        "Interno:",
+                        options=internos_opts_s5,
+                        index=0 if internos_opts_s5 else None,
+                        placeholder="Seleccioná un interno",
+                        key="s5_interno_sel",
+                    )
 
-            if interno_sel_s5 and not trips_eval_s5.empty:
-                cds_int_s5 = sorted(
-                    trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5]["Operacion"]
-                    .dropna()
-                    .astype(int)
-                    .astype(str)
-                    .unique()
-                    .tolist()
+                cds_int_s5 = (
+                    sorted(
+                        jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5]["Operacion"]
+                        .dropna()
+                        .astype(int)
+                        .astype(str)
+                        .unique()
+                        .tolist()
+                    )
+                    if interno_sel_s5
+                    else []
                 )
-            else:
-                cds_int_s5 = []
+                with f_s5_c2:
+                    cd_sel_s5 = st.selectbox(
+                        "CD:",
+                        options=["Todos"] + cds_int_s5,
+                        index=0,
+                        key="s5_cd_sel",
+                    )
+                with f_s5_c3:
+                    metrica_int_s5 = st.radio(
+                        "Métrica:",
+                        options=["Jornadas Diarias (hs)", "Viajes OK (hs)"],
+                        index=0,
+                        horizontal=True,
+                        key="s5_int_metrica",
+                    )
 
-            with f_s5_c2:
-                cd_sel_s5 = st.selectbox(
-                    "CD:",
-                    options=["Todos"] + cds_int_s5,
-                    index=0,
-                    key="s5_cd_sel",
-                )
-            with f_s5_c3:
-                metrica_int_s5 = st.radio(
-                    "Métrica a visualizar:",
-                    options=["Jornadas Diarias (hs)", "Viajes OK (hs)"],
-                    index=0,
-                    horizontal=True,
-                    key="s5_int_metrica",
-                )
-            with f_s5_c4:
-                eje_int_s5 = st.radio(
-                    "Eje temporal:",
-                    options=["Semana", "Mes", "Fecha (Día)"],
-                    index=0,
-                    horizontal=True,
-                    key="s5_int_eje_t",
-                )
-
-            if interno_sel_s5 and not trips_eval_s5.empty:
-                sub_t_int = trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5].copy()
-                sub_j_int = jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5].copy() if not jornadas_clean_s5.empty else pd.DataFrame()
-                if cd_sel_s5 != "Todos":
-                    sub_t_int = sub_t_int[sub_t_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
-                    if not sub_j_int.empty:
+                if interno_sel_s5:
+                    sub_t_int = trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5].copy()
+                    sub_j_int = jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5].copy()
+                    if cd_sel_s5 != "Todos":
+                        sub_t_int = sub_t_int[sub_t_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
                         sub_j_int = sub_j_int[sub_j_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
 
-                dom_info = " / ".join(sorted(sub_t_int["Dominio"].dropna().astype(str).unique()))
-                tv_info = " / ".join(sorted(sub_t_int["Tipo_Vehiculo"].dropna().astype(str).unique()))
-                cd_titulo_int = f"CD {cd_sel_s5}" if cd_sel_s5 != "Todos" else f"CD {', '.join(cds_int_s5)}"
+                    dom_info = " / ".join(sorted(sub_t_int["Dominio"].dropna().astype(str).unique()))
+                    tv_info = " / ".join(sorted(sub_t_int["Tipo_Vehiculo"].dropna().astype(str).unique()))
+                    cd_titulo_int = f"CD {cd_sel_s5}" if cd_sel_s5 != "Todos" else f"CD {', '.join(cds_int_s5)}"
+                    v_ok_int = sub_t_int[sub_t_int["Viaje_OK_Activo"]].copy()
 
-                v_ok_int = sub_t_int[sub_t_int["Viaje_OK_Activo"]].copy()
-                st.caption(
-                    f"**{cd_titulo_int} · Interno {interno_sel_s5}** ({dom_info} · {tv_info}) — "
-                    f"Viajes OK: **{len(v_ok_int)} / {len(sub_t_int)}** | Jornadas limpias: **{len(sub_j_int)}**"
-                )
+                    st.caption(
+                        f"**{cd_titulo_int} · Interno {interno_sel_s5}** ({dom_info} · {tv_info}) — "
+                        f"Jornadas limpias: **{len(sub_j_int)}** | Viajes OK: **{len(v_ok_int)} / {len(sub_t_int)}**"
+                    )
 
-                df_int_plot = sub_j_int.copy() if metrica_int_s5 == "Jornadas Diarias (hs)" else v_ok_int.copy()
-                val_col_int = "Duracion_Jornada_hs" if metrica_int_s5 == "Jornadas Diarias (hs)" else "Duracion_Viaje_hs"
-                y_lim_int = float(max_dur_j) + 1.0 if metrica_int_s5 == "Jornadas Diarias (hs)" else float(max_dur_v) + 1.0
-
-                if not df_int_plot.empty:
-                    if eje_int_s5 == "Mes":
-                        df_int_plot["_p_sort"] = df_int_plot["Fecha_Reparto"].dt.to_period("M").dt.start_time
-                        df_int_plot["_p_lbl"] = df_int_plot["_p_sort"].dt.strftime("%Y-%m")
-                        ord_int_t = df_int_plot[["_p_sort", "_p_lbl"]].drop_duplicates().sort_values("_p_sort")["_p_lbl"].tolist()
-                    elif eje_int_s5 == "Fecha (Día)":
-                        df_int_plot["_p_sort"] = df_int_plot["Fecha_Reparto"].dt.floor("D")
-                        df_int_plot["_p_lbl"] = df_int_plot["_p_sort"].dt.dayofweek.map(dias_es) + " " + df_int_plot["_p_sort"].dt.strftime("%d/%m")
-                        ord_int_t = df_int_plot[["_p_sort", "_p_lbl"]].drop_duplicates().sort_values("_p_sort")["_p_lbl"].tolist()
+                    if metrica_int_s5 == "Jornadas Diarias (hs)" and not sub_j_int.empty:
+                        sub_j_int = sub_j_int.sort_values("Fecha_Reparto").copy()
+                        sub_j_int["Fecha_Lbl"] = (
+                            sub_j_int["Fecha_Reparto"].dt.dayofweek.map(dias_es)
+                            + " "
+                            + sub_j_int["Fecha_Reparto"].dt.strftime("%d/%m")
+                        )
+                        med_u = float(sub_j_int["Duracion_Jornada_hs"].median())
+                        fig_line_i = go.Figure()
+                        fig_line_i.add_trace(
+                            go.Scatter(
+                                x=sub_j_int["Fecha_Lbl"],
+                                y=sub_j_int["Duracion_Jornada_hs"],
+                                mode="lines",
+                                line=dict(color="#94a3b8", width=1.8),
+                                name="Tendencia",
+                                showlegend=False,
+                                hoverinfo="skip",
+                            )
+                        )
+                        for vl_i, col_vl in [("1 Vuelta", "#1d4ed8"), ("2 Vueltas", "#d97706"), ("3+ Vueltas", "#dc2626")]:
+                            sub_v_i = sub_j_int[sub_j_int["Vueltas_Label"] == vl_i]
+                            if sub_v_i.empty:
+                                continue
+                            fig_line_i.add_trace(
+                                go.Scatter(
+                                    x=sub_v_i["Fecha_Lbl"],
+                                    y=sub_v_i["Duracion_Jornada_hs"],
+                                    mode="markers",
+                                    name=vl_i,
+                                    marker=dict(size=10, color=col_vl, line=dict(width=1.5, color="#ffffff")),
+                                    customdata=np.dstack(
+                                        (
+                                            sub_v_i["Duracion_Jornada_hs"],
+                                            sub_v_i["Vueltas_Label"],
+                                            sub_v_i["Categoria_Jornada"],
+                                            sub_v_i["KMS_Dia"],
+                                            sub_v_i["Tiendas_Dia"],
+                                        )
+                                    )[0],
+                                    hovertemplate=(
+                                        "<b>%{x}</b><br>"
+                                        "Duración Jornada: <b>%{customdata[0]:.1f} hs</b> (%{customdata[1]})<br>"
+                                        "Categoría: %{customdata[2]} | KMS Día: %{customdata[3]:.0f} km | Tiendas: %{customdata[4]:.0f}"
+                                        "<extra></extra>"
+                                    ),
+                                )
+                            )
+                        fig_line_i.add_hline(
+                            y=med_u,
+                            line_dash="dot",
+                            line_color="#0f172a",
+                            annotation_text=f"Mediana Interno: {med_u:.1f} hs",
+                            annotation_position="top right",
+                        )
+                        fig_line_i.update_layout(
+                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Evolución Diaria de Jornadas (hs)",
+                            height=370,
+                            margin=dict(l=20, r=20, t=42, b=20),
+                            yaxis=dict(title="Duración de Jornada (horas)", range=[0, float(max_dur_j) + 1.0], dtick=2),
+                            xaxis=dict(tickangle=-35 if len(sub_j_int) > 12 else 0),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            hovermode="closest",
+                        )
+                        st.plotly_chart(fig_line_i, use_container_width=True)
+                    elif metrica_int_s5 == "Viajes OK (hs)" and not v_ok_int.empty:
+                        v_ok_int = v_ok_int.sort_values(["Fecha_Reparto", "Hora_Reparto"]).copy()
+                        v_ok_int["Fecha_Lbl"] = (
+                            v_ok_int["Fecha_Reparto"].dt.dayofweek.map(dias_es)
+                            + " "
+                            + v_ok_int["Fecha_Reparto"].dt.strftime("%d/%m")
+                            + " ("
+                            + v_ok_int["Ref_Clean"].astype(str)
+                            + ")"
+                        )
+                        med_uv = float(v_ok_int["Duracion_Viaje_hs"].median())
+                        fig_line_v = go.Figure()
+                        for cat_i, col_ci in [("Cercana", "#1d4ed8"), ("Lejana", "#d97706")]:
+                            sv_c = v_ok_int[v_ok_int["Categoria"] == cat_i]
+                            if sv_c.empty:
+                                continue
+                            fig_line_v.add_trace(
+                                go.Bar(
+                                    x=sv_c["Fecha_Lbl"],
+                                    y=sv_c["Duracion_Viaje_hs"],
+                                    name=cat_i,
+                                    marker_color=col_ci,
+                                    customdata=np.dstack(
+                                        (
+                                            sv_c["Duracion_Viaje_hs"],
+                                            sv_c["Tipo_Viaje"],
+                                            sv_c["KMS_Total"],
+                                            sv_c["Tiempo_CD_hs"],
+                                            sv_c["Tiempo_Ruta_hs"],
+                                            sv_c["Tiempo_Tiendas_hs"],
+                                        )
+                                    )[0],
+                                    hovertemplate=(
+                                        "<b>%{x}</b><br>"
+                                        "Duración Viaje: <b>%{customdata[0]:.1f} hs</b> (%{customdata[1]})<br>"
+                                        "CD: %{customdata[3]:.1f}h | Ruta: %{customdata[4]:.1f}h | Tiendas: %{customdata[5]:.1f}h | KMS: %{customdata[2]:.0f}"
+                                        "<extra></extra>"
+                                    ),
+                                )
+                            )
+                        fig_line_v.add_hline(
+                            y=med_uv,
+                            line_dash="dot",
+                            line_color="#0f172a",
+                            annotation_text=f"Mediana Viajes: {med_uv:.1f} hs",
+                            annotation_position="top right",
+                        )
+                        fig_line_v.update_layout(
+                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Detalle Cronológico de Viajes OK (hs)",
+                            height=370,
+                            margin=dict(l=20, r=20, t=42, b=20),
+                            yaxis=dict(title="Duración del Viaje (horas)", range=[0, float(max_dur_v) + 1.0], dtick=2),
+                            xaxis=dict(tickangle=-35 if len(v_ok_int) > 10 else 0),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            hovermode="closest",
+                        )
+                        st.plotly_chart(fig_line_v, use_container_width=True)
                     else:
-                        df_int_plot["_p_lbl"] = df_int_plot["Semana_Label"]
-                        ord_int_t = df_int_plot[["Semana_Sort", "_p_lbl"]].drop_duplicates().sort_values("Semana_Sort")["_p_lbl"].tolist()
+                        st.info(f"El Interno {interno_sel_s5} no tiene registros limpios en el modo activo para esta métrica.")
 
-                    x_int_l, ser_int_l, col_int_l = [], [], []
-                    for p_l in ord_int_t:
-                        sv_i = df_int_plot[df_int_plot["_p_lbl"] == p_l][val_col_int].dropna()
-                        if len(sv_i) == 0:
-                            continue
-                        x_int_l.append(f"{p_l}<br>(n={len(sv_i)})")
-                        ser_int_l.append(sv_i)
-                        col_int_l.append("#1d4ed8")
-
-                    fig_int_box = go.Figure()
-                    _add_clean_box_traces(
-                        fig_int_box,
-                        x_int_l,
-                        ser_int_l,
-                        col_int_l,
-                        unit_suffix="hs",
-                        use_tukey=tukey_j,
-                        show_legend=False,
-                    )
-                    fig_int_box.update_layout(
-                        title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Evolución Temporal ({metrica_int_s5})",
-                        boxgap=0.22,
-                        height=390,
-                        margin=dict(l=20, r=20, t=42, b=20),
-                        yaxis=dict(
-                            title=metrica_int_s5,
-                            range=[0, y_lim_int],
-                            dtick=2,
-                            zeroline=True,
-                            zerolinecolor="#cbd5e1",
-                        ),
-                        xaxis=dict(tickangle=-35 if len(ord_int_t) > 10 else 0),
-                        showlegend=False,
-                        hovermode="closest",
-                    )
-                    st.plotly_chart(fig_int_box, use_container_width=True)
-                else:
-                    st.info(f"El Interno {interno_sel_s5} no tiene registros limpios en el modo activo para esta métrica.")
-
-
-        _render_s5_interno_fragment()
 
         # Descarga Excel de Viajes y Jornadas
         v_clean_exp = viajes_ok_s5.copy()
