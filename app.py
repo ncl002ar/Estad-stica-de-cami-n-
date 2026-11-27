@@ -778,6 +778,82 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
     }
 
 
+
+def _add_clean_box_traces(
+    fig: go.Figure,
+    x_labels: list,
+    series_list: list[pd.Series],
+    colors: list[str],
+    unit_suffix: str,
+    use_tukey: bool = True,
+    group_name: str = "",
+    show_legend: bool = False,
+):
+    """Dibuja cajas limpias con etiquetas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
+    sin repetir segmento ni N en los globitos."""
+    for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
+        s = vals.dropna()
+        if len(s) == 0:
+            continue
+        q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
+        mean_v = float(s.mean())
+        if use_tukey:
+            iqr = q3_v - q1_v
+            lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
+            hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
+        else:
+            lo_w = float(s.min())
+            hi_w = float(s.max())
+
+        col_hex = colors[idx_b % len(colors)]
+        fig.add_trace(
+            go.Box(
+                x=[x_lbl],
+                lowerfence=[round(lo_w, 1)],
+                q1=[round(q1_v, 1)],
+                median=[round(med_v, 1)],
+                q3=[round(q3_v, 1)],
+                upperfence=[round(hi_w, 1)],
+                mean=[round(mean_v, 1)],
+                name=group_name if group_name else "",
+                legendgroup=group_name if group_name else None,
+                showlegend=(show_legend and idx_b == 0),
+                marker_color=col_hex,
+                hoverinfo="skip",
+            )
+        )
+        # Puntos exactos en cada nivel para que al pasar el mouse marque cada medida en español sin duplicar min/max
+        pts_y = [
+            round(hi_w, 1),
+            round(q3_v, 1),
+            round(mean_v, 1),
+            round(med_v, 1),
+            round(q1_v, 1),
+            round(lo_w, 1),
+        ]
+        pts_lbl = [
+            f"Bigote Máximo: {hi_w:.1f} {unit_suffix}",
+            f"Q3: {q3_v:.1f} {unit_suffix}",
+            f"Media: {mean_v:.1f} {unit_suffix}",
+            f"Mediana: {med_v:.1f} {unit_suffix}",
+            f"Q1: {q1_v:.1f} {unit_suffix}",
+            f"Bigote Mínimo: {lo_w:.1f} {unit_suffix}",
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=[x_lbl] * 6,
+                y=pts_y,
+                mode="markers",
+                marker=dict(size=10, color=col_hex, opacity=0),
+                name=group_name if group_name else "",
+                legendgroup=group_name if group_name else None,
+                showlegend=False,
+                customdata=pts_lbl,
+                hovertemplate="%{customdata}<extra></extra>",
+            )
+        )
+
+
 def build_audit_excel(df_gap, df_solo_tms, df_store_diff, df_dup, df_inv) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -3378,22 +3454,41 @@ with tab3:
         df_plot_s3 = st_clean_s3.copy()
         df_tot_plot_s3 = dq_stores_filt.copy()
 
-        # Caso especial: Analisis de una Tienda puntual (solo desplegable de Tienda; respeta CD del menu lateral)
+        # Caso especial: Analisis de una Tienda puntual -> DOS FILTROS: TIENDA y CD
         chart_title_s3 = None
         if dim_col == "Tienda_Puntual":
             tiendas_unicas_s3 = sorted(
                 df_plot_s3["Tienda_Cod"].dropna().astype(str).unique().tolist(),
                 key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
             )
-            t_c1, t_c2 = st.columns([1.4, 1.2])
+            t_c1, t_c2, t_c3 = st.columns([1.1, 0.9, 1.2])
             with t_c1:
                 t_cod_sel = st.selectbox(
-                    "Seleccionar / buscar Tienda:",
+                    "Tienda:",
                     options=tiendas_unicas_s3,
                     index=0,
                     key="s3_tienda_puntual_sel",
                 )
+            cds_para_tienda = (
+                sorted(
+                    df_plot_s3[df_plot_s3["Tienda_Cod"].astype(str) == str(t_cod_sel)]["Operacion"]
+                    .dropna()
+                    .astype(int)
+                    .astype(str)
+                    .unique()
+                    .tolist()
+                )
+                if t_cod_sel
+                else []
+            )
             with t_c2:
+                cd_t_puntual_sel = st.selectbox(
+                    "CD:",
+                    options=["Todos"] + cds_para_tienda,
+                    index=0,
+                    key="s3_cd_tienda_puntual_sel",
+                )
+            with t_c3:
                 eje_tienda_tiempo = st.radio(
                     "Eje temporal:",
                     options=["Semana", "Mes", "Fecha (Día)"],
@@ -3405,8 +3500,13 @@ with tab3:
             if t_cod_sel:
                 df_plot_s3 = df_plot_s3[df_plot_s3["Tienda_Cod"].astype(str) == str(t_cod_sel)].copy()
                 df_tot_plot_s3 = df_tot_plot_s3[df_tot_plot_s3["Tienda_Cod"].astype(str) == str(t_cod_sel)].copy()
-                cds_de_tienda = sorted(df_plot_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
-                cd_titulo_str = f"CD {', '.join(cds_de_tienda)}" if cds_de_tienda else "Todos los CDs"
+                if cd_t_puntual_sel != "Todos":
+                    df_plot_s3 = df_plot_s3[df_plot_s3["Operacion"].astype(int).astype(str) == str(cd_t_puntual_sel)].copy()
+                    df_tot_plot_s3 = df_tot_plot_s3[df_tot_plot_s3["Operacion"].astype(int).astype(str) == str(cd_t_puntual_sel)].copy()
+                    cd_titulo_str = f"CD {cd_t_puntual_sel}"
+                else:
+                    cds_de_tienda = sorted(df_plot_s3["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+                    cd_titulo_str = f"CD {', '.join(cds_de_tienda)}" if cds_de_tienda else "Todos los CDs"
                 chart_title_s3 = f"{cd_titulo_str} y Tienda {t_cod_sel}"
 
             if eje_tienda_tiempo == "Mes":
@@ -3522,90 +3622,49 @@ with tab3:
             hi = min(float(s.max()), float(q3 + 1.5 * iqr))
             return lo, hi
 
-        # Callouts individuales por punto (q1, q3, media, mediana, big.maximo, big.minimo)
-        # con name="" para que no repita el nombre de la categoría ni el N en cada globito
         if sub_col is None:
+            x_lbls_s3 = []
+            series_s3 = []
+            colors_s3 = []
             for idx_c, cat_val in enumerate(cat_order):
                 vals = df_plot_s3[df_plot_s3[active_dim] == cat_val]["Tiempo de Estadia"].dropna()
                 if len(vals) == 0:
                     continue
-                box_color = "#1d4ed8" if is_temporal_s3 else palette_box[idx_c % len(palette_box)]
-                x_lbl = f"{cat_val}<br>(n={len(vals):,})" if is_temporal_s3 else f"{cat_val} (n={len(vals):,})"
-                if bigotes_tukey_s3:
-                    lo_w, hi_w = _tukey_bounds(vals)
-                    q1_v, med_v, q3_v = np.percentile(vals, [25, 50, 75])
-                    fig_box.add_trace(
-                        go.Box(
-                            x=[x_lbl],
-                            lowerfence=[round(lo_w, 1)],
-                            q1=[round(q1_v, 1)],
-                            median=[round(med_v, 1)],
-                            q3=[round(q3_v, 1)],
-                            upperfence=[round(hi_w, 1)],
-                            mean=[round(float(vals.mean()), 1)],
-                            name="",
-                            showlegend=False,
-                            marker_color=box_color,
-                            hovertemplate="%{y:.1f} min<extra></extra>",
-                        )
-                    )
-                else:
-                    fig_box.add_trace(
-                        go.Box(
-                            x=[x_lbl] * len(vals),
-                            y=vals,
-                            name="",
-                            showlegend=False,
-                            boxmean=True,
-                            boxpoints=False,
-                            marker_color=box_color,
-                            hovertemplate="%{y:.1f} min<extra></extra>",
-                        )
-                    )
+                x_lbls_s3.append(f"{cat_val}<br>(n={len(vals):,})" if is_temporal_s3 else f"{cat_val} (n={len(vals):,})")
+                series_s3.append(vals)
+                colors_s3.append("#1d4ed8" if is_temporal_s3 else palette_box[idx_c % len(palette_box)])
+            _add_clean_box_traces(
+                fig_box,
+                x_lbls_s3,
+                series_s3,
+                colors_s3,
+                unit_suffix="min",
+                use_tukey=bigotes_tukey_s3,
+                show_legend=False,
+            )
             fig_box.update_layout(showlegend=False)
         else:
             sub_vals = sorted(df_plot_s3[sub_col].unique().tolist())
             for idx_s, sv in enumerate(sub_vals):
                 sub_df = df_plot_s3[df_plot_s3[sub_col] == sv]
-                if bigotes_tukey_s3:
-                    x_cats, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
-                    for cv in cat_order:
-                        v_sub = sub_df[sub_df[active_dim] == cv]["Tiempo de Estadia"].dropna()
-                        if len(v_sub) == 0:
-                            continue
-                        lo_w, hi_w = _tukey_bounds(v_sub)
-                        q1_v, med_v, q3_v = np.percentile(v_sub, [25, 50, 75])
-                        x_cats.append(cv)
-                        lf_l.append(round(lo_w, 1))
-                        q1_l.append(round(q1_v, 1))
-                        med_l.append(round(med_v, 1))
-                        q3_l.append(round(q3_v, 1))
-                        uf_l.append(round(hi_w, 1))
-                        mean_l.append(round(float(v_sub.mean()), 1))
-                    fig_box.add_trace(
-                        go.Box(
-                            x=x_cats,
-                            lowerfence=lf_l,
-                            q1=q1_l,
-                            median=med_l,
-                            q3=q3_l,
-                            upperfence=uf_l,
-                            mean=mean_l,
-                            name=sv,
-                            marker_color=palette_box[idx_s % len(palette_box)],
-                        )
-                    )
-                else:
-                    fig_box.add_trace(
-                        go.Box(
-                            x=sub_df[active_dim],
-                            y=sub_df["Tiempo de Estadia"],
-                            name=sv,
-                            boxmean=True,
-                            boxpoints=False,
-                            marker_color=palette_box[idx_s % len(palette_box)],
-                        )
-                    )
+                x_cats_s3 = []
+                ser_sub_s3 = []
+                for cv in cat_order:
+                    v_sub = sub_df[sub_df[active_dim] == cv]["Tiempo de Estadia"].dropna()
+                    if len(v_sub) == 0:
+                        continue
+                    x_cats_s3.append(cv)
+                    ser_sub_s3.append(v_sub)
+                _add_clean_box_traces(
+                    fig_box,
+                    x_cats_s3,
+                    ser_sub_s3,
+                    [palette_box[idx_s % len(palette_box)]],
+                    unit_suffix="min",
+                    use_tukey=bigotes_tukey_s3,
+                    group_name=sv,
+                    show_legend=True,
+                )
             fig_box.update_layout(
                 boxmode="group",
                 xaxis=dict(categoryorder="array", categoryarray=cat_order),
@@ -3686,6 +3745,19 @@ with tab3:
                 "% Represent.": st.column_config.NumberColumn("% Represent.", format="%.1f%%"),
             },
         )
+
+        with st.expander("🚪 Fases de Estadía en Tienda (Sensor Puerta Trasera)", expanded=False):
+            st.markdown(
+                """
+                Cuando UNIGIS active la telemetría de puerta trasera (`Apertura Puerta Trasera` y `Cierre Puerta Trasera`),
+                este bloque abrirá automáticamente cada estadía en sus **3 fases operativas**:
+                1. **Fase 1 — Espera / Recepción en Tienda:** `Apertura Puerta Trasera − Inicio Horario Visita Real` *(demora hasta que abren cortina/reciben)*.
+                2. **Fase 2 — Descarga Efectiva:** `Minutos Apertura y Cierre` *(tiempo real de descarga física de mercadería)*.
+                3. **Fase 3 — Cierre Documental y Egreso:** `Fecha Hora Salida − Cierre Puerta Trasera` *(demora de remito/firma y salida de geocerca)*.
+                """
+            )
+            if puerta_activa_cnt == 0:
+                st.info("Estado actual del archivo UNIGIS: las 3 columnas de puerta trasera vienen en `0` en el 100% de las paradas.")
 
     st.divider()
 
@@ -4132,19 +4204,24 @@ with tab4:
     st.divider()
 
     # -------------------------------------------------------------------------
-    # BLOQUE 1: VELOCIDADES POR OPERACION (CD) Y TIPO DE VEHICULO (NOMINA)
+    # BLOQUE 1: VELOCIDADES (A: COMPARATIVO POR CATEGORIA | B: MATRIZ CD x CAMION)
     # -------------------------------------------------------------------------
-    st.markdown(f"### 1. Velocidades por Operación (CD) y Tipo de Vehículo — Categoría: `{cat_v_sel}`")
+    st.markdown("### 1. Resumen y Matrices de Velocidades")
 
+    st.markdown("**A. Comparativo Global por Categoría de Viaje (Cercana vs. Lejana)**")
     cat_comp_rows = []
     for c_name in ["Cercana", "Lejana"]:
         sub_c = tr_clean_all[tr_clean_all["Categoria"] == c_name]
         sub_r = tr_ret_clean_all[tr_ret_clean_all["Categoria"] == c_name]
+        tot_c_raw = int((tr_st["Categoria"] == c_name).sum())
+        tot_r_raw = int((dq_trips_filt["Categoria"] == c_name).sum())
         if sub_c.empty and sub_r.empty:
             continue
         s_sal = sub_c[sub_c["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]["Vel_Calculada"]
         s_ent = sub_c[sub_c["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]["Vel_Calculada"]
         s_lleg = sub_r["Vel_Retorno"]
+        pct_tr_c = (len(sub_c) / tot_c_raw * 100) if tot_c_raw > 0 else 0.0
+        pct_ret_c = (len(sub_r) / tot_r_raw * 100) if tot_r_raw > 0 else 0.0
         cat_comp_rows.append(
             {
                 "Categoría": c_name,
@@ -4152,17 +4229,29 @@ with tab4:
                 "Vel. Depósito Salida (km/h)": round(float(s_sal.median()), 1) if len(s_sal) > 0 else None,
                 "Vel. Depósito Llegada (km/h)": round(float(s_lleg.median()), 1) if len(s_lleg) > 0 else None,
                 "Vel. Máxima P95 (km/h)": round(float(np.percentile(sub_c["Vel_Calculada"], 95)), 0) if len(sub_c) > 0 else None,
-                "Tramos Limpios": int(len(sub_c)),
-                "Retornos Limpios": int(len(sub_r)),
+                "Tramos Limpios / Totales": f"{len(sub_c):,} / {tot_c_raw:,} ({pct_tr_c:.0f}%)".replace(",", "."),
+                "Retornos Limpios / Totales": f"{len(sub_r):,} / {tot_r_raw:,} ({pct_ret_c:.0f}%)".replace(",", "."),
             }
         )
     if cat_comp_rows:
         st.dataframe(pd.DataFrame(cat_comp_rows), use_container_width=True, hide_index=True)
 
-    def _build_vel_matrix(df_src: pd.DataFrame, val_col: str, agg_fn="median", p_val: int = 95) -> pd.DataFrame:
-        if df_src.empty:
+    st.markdown(f"**B. Matriz por Operación (CD) y Tipo de Camión (Nómina) — Filtro Categoría: `{cat_v_sel}`**")
+    st.caption(
+        "Cada celda muestra: **Mediana** y entre paréntesis **`limpios / totales (% representatividad)`** "
+        "para evaluar de inmediato si la muestra es representativa."
+    )
+
+    def _build_vel_matrix(
+        df_clean_src: pd.DataFrame,
+        df_tot_src: pd.DataFrame,
+        val_col: str,
+        agg_fn="median",
+        p_val: int = 95,
+    ) -> pd.DataFrame:
+        if df_clean_src.empty:
             return pd.DataFrame(columns=["Operación"])
-        d_tmp = df_src.copy()
+        d_tmp = df_clean_src.copy()
         d_tmp["CD_Str"] = "CD " + d_tmp["Operacion"].astype(str)
         if agg_fn == "median":
             piv_v = d_tmp.pivot_table(index="CD_Str", columns="Tipo_Vehiculo", values=val_col, aggfunc="median").round(1)
@@ -4175,23 +4264,42 @@ with tab4:
             )
         piv_n = d_tmp.pivot_table(index="CD_Str", columns="Tipo_Vehiculo", values=val_col, aggfunc="count").fillna(0).astype(int)
 
+        # Totales antes de depuración de velocidad/distancia para calcular % representatividad
+        d_tot = df_tot_src.copy()
+        d_tot["CD_Str"] = "CD " + d_tot["Operacion"].astype(str)
+        piv_tot = d_tot.pivot_table(index="CD_Str", columns="Tipo_Vehiculo", values="Operacion", aggfunc="count").fillna(0).astype(int)
+        piv_tot = piv_tot.reindex(index=piv_v.index, columns=piv_v.columns, fill_value=0)
+
         out_m = pd.DataFrame(index=piv_v.index)
         for col_c in piv_v.columns:
-            out_m[col_c] = [
-                f"{piv_v.loc[r_i, col_c]:.1f} km/h (n={piv_n.loc[r_i, col_c]:,})".replace(",", ".")
-                if pd.notna(piv_v.loc[r_i, col_c]) and piv_n.loc[r_i, col_c] > 0
-                else "—"
-                for r_i in piv_v.index
-            ]
+            cells = []
+            for r_i in piv_v.index:
+                val_num = piv_v.loc[r_i, col_c]
+                n_clean = int(piv_n.loc[r_i, col_c])
+                n_tot = max(n_clean, int(piv_tot.loc[r_i, col_c]))
+                if pd.notna(val_num) and n_clean > 0:
+                    pct_rep = int(round(n_clean / n_tot * 100)) if n_tot > 0 else 100
+                    s_clean = f"{n_clean:,}".replace(",", ".")
+                    s_tot = f"{n_tot:,}".replace(",", ".")
+                    cells.append(f"{val_num:.1f} km/h ({s_clean}/{s_tot} · {pct_rep}%)")
+                else:
+                    cells.append("—")
+            out_m[col_c] = cells
         return out_m.reset_index().rename(columns={"CD_Str": "Operación"})
 
-    df_vp_src = tr_clean[tr_clean["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
-    df_vs_src = tr_clean[tr_clean["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
+    tr_st_cat = tr_st[tr_st["Categoria"] == cat_v_sel] if cat_v_sel != "Todas" else tr_st
+    tr_trips_cat = dq_trips_filt[dq_trips_filt["Categoria"] == cat_v_sel] if cat_v_sel != "Todas" else dq_trips_filt
 
-    mat_vp = _build_vel_matrix(df_vp_src, "Vel_Calculada", "median")
-    mat_vs = _build_vel_matrix(df_vs_src, "Vel_Calculada", "median")
-    mat_vr = _build_vel_matrix(tr_ret_clean, "Vel_Retorno", "median")
-    mat_vmax = _build_vel_matrix(tr_clean, "Vel_Calculada", "percentile", p_val=95)
+    df_vp_src = tr_clean[tr_clean["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
+    df_vp_tot = tr_st_cat[tr_st_cat["Tramo_Tipo"] == "Entre Paradas (Tienda -> Tienda)"]
+
+    df_vs_src = tr_clean[tr_clean["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
+    df_vs_tot = tr_st_cat[tr_st_cat["Tramo_Tipo"] == "Salida Depósito (CD -> 1ª Tienda)"]
+
+    mat_vp = _build_vel_matrix(df_vp_src, df_vp_tot, "Vel_Calculada", "median")
+    mat_vs = _build_vel_matrix(df_vs_src, df_vs_tot, "Vel_Calculada", "median")
+    mat_vr = _build_vel_matrix(tr_ret_clean, tr_trips_cat, "Vel_Retorno", "median")
+    mat_vmax = _build_vel_matrix(tr_clean, tr_st_cat, "Vel_Calculada", "percentile", p_val=95)
 
     vtab1, vtab2, vtab3, vtab4 = st.tabs(
         [
@@ -4203,7 +4311,7 @@ with tab4:
     )
 
     with vtab1:
-        st.caption("Mediana de velocidad real entre paradas consecutivas de entrega.")
+        st.caption("Mediana de velocidad real entre paradas consecutivas de entrega (limpios / totales del tramo).")
         st.dataframe(mat_vp, use_container_width=True, hide_index=True)
 
     with vtab2:
@@ -4211,7 +4319,10 @@ with tab4:
         st.dataframe(mat_vs, use_container_width=True, hide_index=True)
 
     with vtab3:
-        st.caption("Mediana de velocidad real desde la última tienda hasta el regreso al CD (camión descargado).")
+        st.caption(
+            "Mediana de velocidad real desde la última tienda hasta el cierre en el CD, "
+            "calculada a partir de `KMS Retorno / Tiempo Retorno` de cada viaje válido en UNIGIS."
+        )
         st.dataframe(mat_vr, use_container_width=True, hide_index=True)
 
     with vtab4:
@@ -4258,52 +4369,26 @@ with tab4:
             "Entre Paradas (Tienda -> Tienda)": "#16a34a",
         }
 
-        def _tukey_v(s: pd.Series):
-            q1, q3 = np.percentile(s, [25, 75])
-            iqr = q3 - q1
-            return max(float(s.min()), float(q1 - 1.5 * iqr)), min(float(s.max()), float(q3 + 1.5 * iqr))
-
         for t_name, t_col_hex in tramo_colors.items():
             sub_t = df_vplot[df_vplot["Tramo_Tipo"] == t_name]
-            if tukey_v:
-                xc, lf, q1l, medl, q3l, uf, mnl = [], [], [], [], [], [], []
-                for cv in v_cat_order:
-                    sv = sub_t[sub_t[vdim_col] == cv]["Vel_Calculada"].dropna()
-                    if len(sv) == 0:
-                        continue
-                    lo, hi = _tukey_v(sv)
-                    q1v, medv, q3v = np.percentile(sv, [25, 50, 75])
-                    xc.append(cv)
-                    lf.append(round(lo, 1))
-                    q1l.append(round(q1v, 1))
-                    medl.append(round(medv, 1))
-                    q3l.append(round(q3v, 1))
-                    uf.append(round(hi, 1))
-                    mnl.append(round(float(sv.mean()), 1))
-                fig_vbox.add_trace(
-                    go.Box(
-                        x=xc,
-                        lowerfence=lf,
-                        q1=q1l,
-                        median=medl,
-                        q3=q3l,
-                        upperfence=uf,
-                        mean=mnl,
-                        name=t_name,
-                        marker_color=t_col_hex,
-                    )
-                )
-            else:
-                fig_vbox.add_trace(
-                    go.Box(
-                        x=sub_t[vdim_col],
-                        y=sub_t["Vel_Calculada"],
-                        name=t_name,
-                        boxmean=True,
-                        boxpoints=False,
-                        marker_color=t_col_hex,
-                    )
-                )
+            x_v_cats = []
+            ser_v_list = []
+            for cv in v_cat_order:
+                sv = sub_t[sub_t[vdim_col] == cv]["Vel_Calculada"].dropna()
+                if len(sv) == 0:
+                    continue
+                x_v_cats.append(cv)
+                ser_v_list.append(sv)
+            _add_clean_box_traces(
+                fig_vbox,
+                x_v_cats,
+                ser_v_list,
+                [t_col_hex],
+                unit_suffix="km/h",
+                use_tukey=tukey_v,
+                group_name=t_name,
+                show_legend=True,
+            )
 
         fig_vbox.update_layout(
             boxmode="group",
@@ -4312,6 +4397,7 @@ with tab4:
             xaxis=dict(categoryorder="array", categoryarray=v_cat_order),
             yaxis_title="Velocidad Real (km/h)",
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            hovermode="closest",
         )
         st.plotly_chart(fig_vbox, use_container_width=True)
 
@@ -4322,7 +4408,7 @@ with tab4:
     # -------------------------------------------------------------------------
     st.markdown("### 3. Estadías en Tienda por Operación (CD) y Tipo de Camión (Nómina)")
     st.caption(
-        "Mediana de tiempo de descarga en tienda y cantidad de paradas limpias según el porte del vehículo (`Nomina.xlsx`)."
+        "Mediana de tiempo de descarga en tienda y representatividad **`limpios / totales (%)`** según el porte del vehículo (`Nomina.xlsx`)."
     )
 
     mat_display_s4 = pd.DataFrame()
@@ -4348,30 +4434,36 @@ with tab4:
             .fillna(0)
             .astype(int)
         )
+        piv_tot_veh = (
+            dq_stores_filt.assign(CD_Str="CD " + dq_stores_filt["Operacion"].astype(str))
+            .pivot_table(
+                index="CD_Str",
+                columns="Tipo_Vehiculo",
+                values="Operacion",
+                aggfunc="count",
+            )
+            .fillna(0)
+            .astype(int)
+            .reindex(index=piv_med_veh.index, columns=piv_med_veh.columns, fill_value=0)
+        )
 
         mat_display_s4 = pd.DataFrame(index=piv_med_veh.index)
         for col_v in piv_med_veh.columns:
-            mat_display_s4[col_v] = [
-                f"{int(piv_med_veh.loc[idx_r, col_v])} min (n={piv_cnt_veh.loc[idx_r, col_v]:,})".replace(",", ".")
-                if pd.notna(piv_med_veh.loc[idx_r, col_v]) and piv_cnt_veh.loc[idx_r, col_v] > 0
-                else "—"
-                for idx_r in piv_med_veh.index
-            ]
+            cells_est = []
+            for idx_r in piv_med_veh.index:
+                med_v = piv_med_veh.loc[idx_r, col_v]
+                nc = int(piv_cnt_veh.loc[idx_r, col_v])
+                nt = max(nc, int(piv_tot_veh.loc[idx_r, col_v]))
+                if pd.notna(med_v) and nc > 0:
+                    pct_r = int(round(nc / nt * 100)) if nt > 0 else 100
+                    sc = f"{nc:,}".replace(",", ".")
+                    st_str = f"{nt:,}".replace(",", ".")
+                    cells_est.append(f"{int(med_v)} min ({sc}/{st_str} · {pct_r}%)")
+                else:
+                    cells_est.append("—")
+            mat_display_s4[col_v] = cells_est
         mat_display_s4 = mat_display_s4.reset_index().rename(columns={"CD_Str": "Operación"})
         st.dataframe(mat_display_s4, use_container_width=True, hide_index=True)
-
-        with st.expander("🚪 Fases de Estadía en Tienda (Sensor Puerta Trasera)", expanded=False):
-            st.markdown(
-                """
-                Cuando UNIGIS active la telemetría de puerta trasera (`Apertura Puerta Trasera` y `Cierre Puerta Trasera`),
-                este bloque abrirá automáticamente cada estadía en sus **3 fases operativas**:
-                1. **Fase 1 — Espera / Recepción en Tienda:** `Apertura Puerta Trasera − Inicio Horario Visita Real` *(demora hasta que abren cortina/reciben)*.
-                2. **Fase 2 — Descarga Efectiva:** `Minutos Apertura y Cierre` *(tiempo real de descarga física de mercadería)*.
-                3. **Fase 3 — Cierre Documental y Egreso:** `Fecha Hora Salida − Cierre Puerta Trasera` *(demora de remito/firma y salida de geocerca)*.
-                """
-            )
-            if puerta_activa_cnt == 0:
-                st.info("Estado actual del archivo UNIGIS: las 3 columnas de puerta trasera vienen en `0` en el 100% de las paradas.")
 
     st.divider()
 
