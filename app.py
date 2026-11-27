@@ -789,8 +789,55 @@ def _add_clean_box_traces(
     group_name: str = "",
     show_legend: bool = False,
 ):
-    """Dibuja cajas limpias con etiquetas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
-    sin repetir segmento ni N en los globitos."""
+    """Dibuja cajas limpias (1 traza por serie agrupada para que boxmode='group' no las superponga)
+    con etiquetas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)."""
+    if show_legend and group_name:
+        # Caso agrupado (ej. Salida Depósito vs Entre Paradas, o sub-corte por color):
+        # 1 sola traza go.Box con todos los valores de X para que Plotly las ubique lado a lado sin superponerlas
+        x_valid, lf_l, q1_l, med_l, q3_l, uf_l, mean_l = [], [], [], [], [], [], []
+        for x_lbl, vals in zip(x_labels, series_list):
+            s = vals.dropna()
+            if len(s) == 0:
+                continue
+            q1_v, med_v, q3_v = np.percentile(s, [25, 50, 75])
+            mean_v = float(s.mean())
+            if use_tukey:
+                iqr = q3_v - q1_v
+                lo_w = max(float(s.min()), float(q1_v - 1.5 * iqr))
+                hi_w = min(float(s.max()), float(q3_v + 1.5 * iqr))
+            else:
+                lo_w = float(s.min())
+                hi_w = float(s.max())
+            x_valid.append(x_lbl)
+            lf_l.append(round(lo_w, 1))
+            q1_l.append(round(q1_v, 1))
+            med_l.append(round(med_v, 1))
+            q3_l.append(round(q3_v, 1))
+            uf_l.append(round(hi_w, 1))
+            mean_l.append(round(mean_v, 1))
+
+        if not x_valid:
+            return
+        col_hex = colors[0]
+        fig.add_trace(
+            go.Box(
+                x=x_valid,
+                lowerfence=lf_l,
+                q1=q1_l,
+                median=med_l,
+                q3=q3_l,
+                upperfence=uf_l,
+                mean=mean_l,
+                name=group_name,
+                legendgroup=group_name,
+                showlegend=True,
+                marker_color=col_hex,
+                hovertemplate="%{y:.1f} " + unit_suffix + "<extra>" + group_name + "</extra>",
+            )
+        )
+        return
+
+    # Caso sin sub-corte (1 caja por posición X, cada una con su color)
     for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
         s = vals.dropna()
         if len(s) == 0:
@@ -815,15 +862,13 @@ def _add_clean_box_traces(
                 q3=[round(q3_v, 1)],
                 upperfence=[round(hi_w, 1)],
                 mean=[round(mean_v, 1)],
-                width=0.58 if not show_legend else 0.34,
-                name=group_name if group_name else "",
-                legendgroup=group_name if group_name else None,
-                showlegend=(show_legend and idx_b == 0),
+                width=0.52,
+                name="",
+                showlegend=False,
                 marker_color=col_hex,
                 hoverinfo="skip",
             )
         )
-        # Puntos exactos en cada nivel para que al pasar el mouse marque cada medida en español sin duplicar min/max
         pts_y = [
             round(hi_w, 1),
             round(q3_v, 1),
@@ -846,8 +891,7 @@ def _add_clean_box_traces(
                 y=pts_y,
                 mode="markers",
                 marker=dict(size=10, color=col_hex, opacity=0),
-                name=group_name if group_name else "",
-                legendgroup=group_name if group_name else None,
+                name="",
                 showlegend=False,
                 customdata=pts_lbl,
                 hovertemplate="%{customdata}<extra></extra>",
