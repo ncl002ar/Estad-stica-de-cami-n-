@@ -11,6 +11,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 _ui_fragment = getattr(st, "fragment", getattr(st, "experimental_fragment", lambda f: f))
+dias_es = {0: "Lun", 1: "Mar", 2: "Mié", 3: "Jue", 4: "Vie", 5: "Sáb", 6: "Dom"}
 
 try:
     import gdown
@@ -847,6 +848,181 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         "trips_pre_s5": trips_pre_s5,
     }
 
+
+
+@st.cache_data(show_spinner=False, max_entries=128)
+def _build_grouped_boxplot_cached(
+    df_clean: pd.DataFrame,
+    df_tot: pd.DataFrame | None,
+    val_col: str,
+    dim_col: str,
+    sub_col: str | None,
+    unit_suffix: str,
+    y_title: str,
+    use_tukey: bool,
+    chart_title: str | None = None,
+    y_range: tuple | None = None,
+    y_dtick: float | None = None,
+    fixed_dim_order: tuple | None = None,
+    fixed_sub_order: tuple | None = None,
+    compute_summary_table: bool = False,
+    nice_dim_name: str = "",
+    summary_mode: str = "estadias",
+):
+    """Construye y cachea en RAM (hasta 128 combinaciones) la figura Plotly y su tabla resumen."""
+    if df_clean.empty:
+        return go.Figure(), pd.DataFrame()
+
+    is_temp = dim_col in {"Evol_Mes", "Evol_Semana", "Evol_Dia"}
+    if fixed_dim_order is not None:
+        cat_order = [c for c in fixed_dim_order if c in df_clean[dim_col].unique()]
+    elif dim_col in {"Evol_Mes", "Evol_Dia"} and "_p_sort" in df_clean.columns:
+        cat_order = df_clean[["_p_sort", dim_col]].drop_duplicates().sort_values("_p_sort")[dim_col].tolist()
+    elif dim_col == "Evol_Semana" and "Semana_Sort" in df_clean.columns:
+        cat_order = df_clean[["Semana_Sort", dim_col]].drop_duplicates().sort_values("Semana_Sort")[dim_col].tolist()
+    elif dim_col == "Operacion":
+        cat_order = sorted(df_clean[dim_col].unique().tolist())
+    else:
+        cat_order = (
+            df_clean.groupby(dim_col)[val_col]
+            .median()
+            .sort_values(ascending=False)
+            .index.tolist()
+        )
+
+    fig = go.Figure()
+    palette = ["#1d4ed8", "#d97706", "#16a34a", "#7c3aed", "#dc2626", "#0891b2", "#475569"]
+
+    if sub_col is None:
+        x_lbls, s_list, c_list = [], [], []
+        for idx_c, cv in enumerate(cat_order):
+            vals = df_clean[df_clean[dim_col] == cv][val_col].dropna()
+            if len(vals) == 0:
+                continue
+            x_lbls.append(f"{cv}<br>(n={len(vals):,})" if is_temp else f"{cv} (n={len(vals):,})")
+            s_list.append(vals)
+            c_list.append("#1d4ed8" if is_temp else palette[idx_c % len(palette)])
+        _add_clean_box_traces(
+            fig,
+            x_lbls,
+            s_list,
+            c_list,
+            unit_suffix=unit_suffix,
+            use_tukey=use_tukey,
+            show_legend=False,
+        )
+        fig.update_layout(showlegend=False)
+    else:
+        if fixed_sub_order is not None:
+            sub_vals = [s for s in fixed_sub_order if s in df_clean[sub_col].unique()]
+        else:
+            sub_vals = sorted(df_clean[sub_col].unique().tolist())
+        for idx_s, sv in enumerate(sub_vals):
+            sub_df = df_clean[df_clean[sub_col] == sv]
+            xc, ser_sub = [], []
+            for cv in cat_order:
+                v_sub = sub_df[sub_df[dim_col] == cv][val_col].dropna()
+                if len(v_sub) == 0:
+                    continue
+                xc.append(cv)
+                ser_sub.append(v_sub)
+            _add_clean_box_traces(
+                fig,
+                xc,
+                ser_sub,
+                [palette[idx_s % len(palette)]],
+                unit_suffix=unit_suffix,
+                use_tukey=use_tukey,
+                group_name=sv,
+                show_legend=True,
+            )
+        fig.update_layout(
+            boxmode="group",
+            xaxis=dict(categoryorder="array", categoryarray=cat_order),
+            showlegend=True,
+        )
+
+    yaxis_cfg = dict(title=y_title)
+    if y_range is not None:
+        yaxis_cfg["range"] = list(y_range)
+        yaxis_cfg["zeroline"] = True
+        yaxis_cfg["zerolinecolor"] = "#cbd5e1"
+    if y_dtick is not None:
+        yaxis_cfg["dtick"] = y_dtick
+
+    fig.update_layout(
+        title=chart_title if chart_title else None,
+        boxgap=0.18,
+        boxgroupgap=0.10,
+        height=420,
+        margin=dict(l=20, r=20, t=42 if chart_title else 35, b=20),
+        yaxis=yaxis_cfg,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(tickangle=-35 if len(cat_order) > 12 else 0),
+        hovermode="closest",
+    )
+
+    df_res = pd.DataFrame()
+    if compute_summary_table:
+        grp_cols = [dim_col] if sub_col is None else [dim_col, sub_col]
+        tot_map = df_tot.groupby(grp_cols).size().to_dict() if df_tot is not None else {}
+        rows = []
+        for keys, grp in df_clean.groupby(grp_cols):
+            if not isinstance(keys, tuple):
+                keys = (keys,)
+            lk = keys[0] if len(keys) == 1 else keys
+            n_tot = int(tot_map.get(lk, len(grp)))
+            n_ok = int(len(grp))
+            pct_rep = round((n_ok / n_tot * 100), 1) if n_tot > 0 else 100.0
+            s_val = grp[val_col]
+            rd = {nice_dim_name: keys[0]}
+            if sub_col is not None:
+                rd[sub_col] = keys[1]
+
+            if summary_mode == "estadias":
+                g_prod = grp[grp["Total Bultos_num"].fillna(0) >= 20]
+                m100 = (
+                    float((g_prod["Tiempo de Estadia"] / (g_prod["Total Bultos_num"] / 100.0)).median())
+                    if len(g_prod) > 0
+                    else np.nan
+                )
+                rd.update(
+                    {
+                        "Paradas Totales": n_tot,
+                        "Paradas Limpias": n_ok,
+                        "% Represent.": pct_rep,
+                        "Mediana Bultos": round(float(grp["Total Bultos_num"].median()), 0),
+                        "P25 (min)": round(float(np.percentile(s_val, 25)), 0),
+                        "Mediana (min)": round(float(s_val.median()), 0),
+                        "P75 (min)": round(float(np.percentile(s_val, 75)), 0),
+                        "P90 (min)": round(float(np.percentile(s_val, 90)), 0),
+                        "Media (min)": round(float(s_val.mean()), 1),
+                        "Min / 100 Bultos": round(m100, 1) if pd.notna(m100) else None,
+                    }
+                )
+            elif summary_mode == "viajes":
+                rd.update(
+                    {
+                        "Viajes Totales": n_tot,
+                        "Viajes OK": n_ok,
+                        "% Represent.": pct_rep,
+                        "Mediana KMS": round(float(grp["KMS_Total"].median()), 1),
+                        "Med. CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
+                        "Med. Ruta (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
+                        "Med. Tiendas (hs)": round(float(grp["Tiempo_Tiendas_hs"].median()), 2),
+                        "P25 Viaje (hs)": round(float(np.percentile(s_val, 25)), 2),
+                        "Mediana Viaje (hs)": round(float(s_val.median()), 2),
+                        "P75 Viaje (hs)": round(float(np.percentile(s_val, 75)), 2),
+                        "P90 Viaje (hs)": round(float(np.percentile(s_val, 90)), 2),
+                    }
+                )
+            rows.append(rd)
+        df_res = pd.DataFrame(rows)
+        if not df_res.empty and nice_dim_name in df_res.columns:
+            df_res["_ord"] = df_res[nice_dim_name].map({v: i for i, v in enumerate(cat_order)})
+            df_res = df_res.sort_values("_ord").drop(columns=["_ord"])
+
+    return fig, df_res
 
 
 def _add_clean_box_traces(
@@ -3647,6 +3823,15 @@ with tab3:
             int(max_est_lej),
             bool(excl_solape_s3),
         )
+        st.session_state["_s3_clean_params"] = (
+            int(min_est_directo),
+            int(min_est_comp),
+            int(min_est_rutas),
+            float(min_min100b_phys),
+            int(max_est_cerc),
+            int(max_est_lej),
+            bool(excl_solape_s3),
+        )
 
         # KPIs de Limpieza + Estadía + Productividad + Fases de Puerta
         tot_vis_s3 = clean_stats_s3["tot"]
@@ -4310,6 +4495,8 @@ with tab4:
             bool(excl_solape_v),
             bool(solo_consecutivos_v),
         )
+        _p_s3 = st.session_state.get("_s3_clean_params", (15, 10, 5, 3.0, 240, 360, True))
+        st_clean_s3, _ = _clean_estadias_cached(dq_stores_filt, *_p_s3)
 
         # Aplicar filtro de Categoria elegido (Todas / Cercana / Lejana)
         if cat_v_sel != "Todas":
