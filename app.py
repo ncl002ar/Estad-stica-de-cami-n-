@@ -1726,6 +1726,7 @@ def _eval_viajes_jornadas_s5_cached(
     cd_std_items: tuple,
     min_cd_j: int,
     max_cd_real_j: int,
+    max_dist_act_km: float,
     min_dur_v: float,
     max_dur_v: float,
     min_dur_j: float,
@@ -1745,10 +1746,10 @@ def _eval_viajes_jornadas_s5_cached(
         & (trips_eval_s5["Estadia_CD_Origen"].fillna(9999) <= float(max_cd_real_j))
     )
 
-    salida_cd_est = trips_eval_s5["dt_fin_cd"].fillna(
-        trips_eval_s5["Ini_Primera_Tienda"] - pd.Timedelta(minutes=30)
+    # Sin suposiciones arbitrarias: requiere hora real de salida de la geozona del CD (dt_fin_cd)
+    dt_ini_cd_imputado = trips_eval_s5["dt_fin_cd"] - pd.to_timedelta(
+        trips_eval_s5["Estadia_CD_Std_min"], unit="m"
     )
-    dt_ini_cd_imputado = salida_cd_est - pd.to_timedelta(trips_eval_s5["Estadia_CD_Std_min"], unit="m")
 
     trips_eval_s5["Duracion_Viaje_Real_hs"] = (
         (trips_eval_s5["Fin_Ultima_Tienda"] - trips_eval_s5["dt_ini_cd"]).dt.total_seconds() / 3600.0
@@ -1778,8 +1779,16 @@ def _eval_viajes_jornadas_s5_cached(
         & (trips_eval_s5["KMS_Total"].fillna(0) <= 1500)
     )
 
+    # Control de distancia de activacion desde el CD para viajes con estadia imputada
+    act_dist_ok = (
+        (trips_eval_s5["Dist_Activacion_km"].fillna(0.0) <= float(max_dist_act_km))
+        if float(max_dist_act_km) < 900.0
+        else pd.Series(True, index=trips_eval_s5.index)
+    )
+
     trips_eval_s5["CD_Real_OK_Flag"] = cd_real_ok
     trips_eval_s5["Tiendas_y_KMS_OK_Flag"] = cond_tiendas_y_kms_ok
+    trips_eval_s5["Act_Dist_OK_Flag"] = act_dist_ok
 
     trips_eval_s5["Viaje_OK_Real"] = (
         cond_tiendas_y_kms_ok
@@ -1790,6 +1799,7 @@ def _eval_viajes_jornadas_s5_cached(
     trips_eval_s5["Viaje_OK_Ajust"] = (
         cond_tiendas_y_kms_ok
         & trips_eval_s5["dt_ini_cd_Ajust"].notna()
+        & (cd_real_ok | act_dist_ok)
         & (trips_eval_s5["Duracion_Viaje_Ajust_hs"].fillna(0) >= float(min_dur_v))
         & (trips_eval_s5["Duracion_Viaje_Ajust_hs"].fillna(0) <= float(max_dur_v))
     )
@@ -5228,7 +5238,15 @@ with tab5:
                     min_dur_j = st.number_input("Duración mín. Jornada (hs):", min_value=0.5, max_value=4.0, value=1.0, step=0.5, key="s5_min_dj")
                     max_dur_j = st.number_input("Duración máx. Jornada (hs):", min_value=10.0, max_value=24.0, value=18.0, step=1.0, key="s5_max_dj")
                 with jc4:
-                    st.write("")
+                    max_dist_act_km = st.number_input(
+                        "Dist. máx. Activación CD (km):",
+                        min_value=0.5,
+                        max_value=999.0,
+                        value=5.0,
+                        step=0.5,
+                        help="Al imputar estadía CD, exige que el viaje se haya activado dentro de este radio del CD (default 5,0 km) para no truncar el tramo de ruta. Poné 999 para desactivar el tope.",
+                        key="s5_max_act_km",
+                    )
                     tukey_j = st.checkbox("Bigotes estadísticos Tukey (Q1/Q3 ± 1.5·IQR)", value=True, key="s5_tukey")
                 st.form_submit_button("✅ Aplicar tiempos estándar y parámetros")
 
@@ -5249,6 +5267,7 @@ with tab5:
             cd_std_items,
             int(min_cd_j),
             int(max_cd_real_j),
+            float(max_dist_act_km),
             float(min_dur_v),
             float(max_dur_v),
             float(min_dur_j),
@@ -5375,20 +5394,32 @@ with tab5:
                 unsafe_allow_html=True,
             )
 
-        # Tabla resumen de representatividad y diagnóstico de exclusiones por CD
-        with st.expander("📊 Ver Cobertura y Diagnóstico por CD: ¿Por qué se excluyen viajes? (CD vs. Estadías en Tienda)", expanded=False):
+        # Tabla resumen de representatividad, embudo de recuperación y diagnóstico por CD
+        with st.expander("📊 Ver Cobertura, Embudo de Recuperación y Diagnóstico por CD", expanded=False):
+            act_lbl = f"<= {max_dist_act_km:.1f} km" if max_dist_act_km < 900 else "Sin límite km"
             st.caption(
-                "Permite ver al instante si las exclusiones de un CD (como el **CD 504**) provienen de **falta de dato/guarda en CD** "
-                "(recuperables con el interruptor) o de **estadías/GPS faltantes en las tiendas**."
+                f"Dimensiona cuántos viajes son **100% Reales**, cuántos se recuperan limpiamente con **CD Ajustable ({act_lbl})**, "
+                f"y cuántos quedan fuera por **Activación Tardía (> {max_dist_act_km:.1f} km)** o por **falta de salida CD / GPS en tiendas**."
             )
             cov_rows_s5 = []
             for op_s5 in sorted(trips_eval_s5["Operacion"].dropna().unique()):
                 sub_t5 = trips_eval_s5[trips_eval_s5["Operacion"] == op_s5]
                 tv_op = len(sub_t5)
-                cd_ok_op = int(sub_t5["CD_Real_OK_Flag"].sum())
-                st_ok_op = int(sub_t5["Tiendas_y_KMS_OK_Flag"].sum())
                 vr_op = int(sub_t5["Viaje_OK_Real"].sum())
                 va_op = int(sub_t5["Viaje_OK_Ajust"].sum())
+                recup_op = max(0, va_op - vr_op)
+
+                # Viajes que tienen tiendas/KMS OK y salida real de CD, pero quedaron fuera por activacion tardia (> max_dist_act_km)
+                excl_act_op = int(
+                    (
+                        sub_t5["Tiendas_y_KMS_OK_Flag"]
+                        & (~sub_t5["Viaje_OK_Real"])
+                        & sub_t5["dt_fin_cd"].notna()
+                        & (~sub_t5["Act_Dist_OK_Flag"])
+                    ).sum()
+                )
+                # Resto de excluidos (sin dt_fin_cd o sin GPS/estadías válidas en tiendas)
+                excl_faltante_op = max(0, tv_op - va_op - excl_act_op)
 
                 sub_jr = jornadas_real_all[jornadas_real_all["Operacion"] == op_s5] if not jornadas_real_all.empty else pd.DataFrame()
                 sub_ja = jornadas_ajust_all[jornadas_ajust_all["Operacion"] == op_s5] if not jornadas_ajust_all.empty else pd.DataFrame()
@@ -5401,11 +5432,11 @@ with tab5:
                         "CD": str(int(op_s5)),
                         "Std. CD": f"{int(cd_std_map.get(int(op_s5), med_std_fallback))}m",
                         "Viajes Totales": tv_op,
-                        "CD Real OK": f"{cd_ok_op:,} ({(cd_ok_op/tv_op*100 if tv_op else 0):.0f}%)".replace(",", "."),
-                        "Tiendas/Estadías OK": f"{st_ok_op:,} ({(st_ok_op/tv_op*100 if tv_op else 0):.0f}%)".replace(",", "."),
                         "Viajes OK (Real)": f"{vr_op:,} ({(vr_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
+                        f"+Recup. CD ({act_lbl})": f"+{recup_op:,} ({(recup_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
                         "Viajes OK (Ajustado)": f"{va_op:,} ({(va_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
-                        "Jornadas Totales": tj_op,
+                        f"Excl. Activ. >{max_dist_act_km:.0f}km": f"{excl_act_op:,} ({(excl_act_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
+                        "Excl. Faltante GPS/CD": f"{excl_faltante_op:,} ({(excl_faltante_op/tv_op*100 if tv_op else 0):.1f}%)".replace(",", "."),
                         "Jornadas OK (Real)": f"{jr_op:,} ({(jr_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
                         "Jornadas OK (Ajustado)": f"{ja_op:,} ({(ja_op/tj_op*100 if tj_op else 0):.1f}%)".replace(",", "."),
                     }
