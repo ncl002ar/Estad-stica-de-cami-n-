@@ -1146,13 +1146,13 @@ def _build_grouped_boxplot_cached(
                         "Viajes OK": n_ok,
                         "% Represent.": pct_rep,
                         "Mediana KMS": round(float(grp["KMS_Total"].median()), 1),
-                        "Med. CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
-                        "Med. Ruta (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
-                        "Med. Tiendas (hs)": round(float(grp["Tiempo_Tiendas_hs"].median()), 2),
-                        "P25 Viaje (hs)": round(float(np.percentile(s_val, 25)), 2),
-                        "Mediana Viaje (hs)": round(float(s_val.median()), 2),
-                        "P75 Viaje (hs)": round(float(np.percentile(s_val, 75)), 2),
-                        "P90 Viaje (hs)": round(float(np.percentile(s_val, 90)), 2),
+                        "Med. Estadía CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
+                        "Med. Tiempo Conducción (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
+                        "Med. Estadía Tiendas (hs)": round(float(grp["Tiempo_Tiendas_hs"].median()), 2),
+                        "P25 Duración Total (hs)": round(float(np.percentile(s_val, 25)), 2),
+                        "Mediana Duración Total (hs)": round(float(s_val.median()), 2),
+                        "P75 Duración Total (hs)": round(float(np.percentile(s_val, 75)), 2),
+                        "P90 Duración Total (hs)": round(float(np.percentile(s_val, 90)), 2),
                     }
                 )
             rows.append(rd)
