@@ -1147,7 +1147,7 @@ def _build_grouped_boxplot_cached(
                         "% Represent.": pct_rep,
                         "Mediana KMS": round(float(grp["KMS_Total"].median()), 1),
                         "Med. Estadía CD (hs)": round(float(grp["Tiempo_CD_hs"].median()), 2),
-                        "Med. Tiempo Conducción (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
+                        "Med. Tiempo en Viaje (hs)": round(float(grp["Tiempo_Ruta_hs"].median()), 2),
                         "Med. Estadía Tiendas (hs)": round(float(grp["Tiempo_Tiendas_hs"].median()), 2),
                         "P25 Duración Total (hs)": round(float(np.percentile(s_val, 25)), 2),
                         "Mediana Duración Total (hs)": round(float(s_val.median()), 2),
@@ -6105,6 +6105,8 @@ with tab5:
                     else:
                         st.info(f"El Interno {interno_sel_s5} no tiene registros limpios en el modo activo para esta métrica.")
 
+
+        _render_s5_interno_fragment()
 
         # Descarga Excel de Viajes y Jornadas
         v_clean_exp = viajes_ok_s5.copy()
