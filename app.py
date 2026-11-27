@@ -3,6 +3,7 @@ import inspect
 import io
 import os
 import re
+import gc
 import tempfile
 import numpy as np
 import pandas as pd
@@ -230,7 +231,7 @@ def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner="Procesando y conciliando bases AMREPA, UNIGIS y Nómina...")
+@st.cache_data(max_entries=1, show_spinner="Procesando y conciliando bases AMREPA, UNIGIS y Nómina...")
 def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None):
     # 1. Lectura de archivos Excel
     df_a_raw = pd.read_excel(io.BytesIO(amrepa_bytes), sheet_name=0)
@@ -836,6 +837,24 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
     trips_pre_s5["Dominio_Valido"] = (~trips_pre_s5["Dominio_Clean"].isin(["", "SINDOMINIO", "XXX000", "XXXXXX", "NAN"])) & (~trips_pre_s5["Dominio_Clean"].str.startswith("XXX"))
     trips_pre_s5["_is_lejana"] = (trips_pre_s5["Categoria"] == "Lejana").astype(int)
 
+    def _compact_df(df_x: pd.DataFrame) -> pd.DataFrame:
+        for c in df_x.columns:
+            if pd.api.types.is_float_dtype(df_x[c]):
+                df_x[c] = df_x[c].astype("float32")
+            elif df_x[c].dtype == "int64":
+                df_x[c] = df_x[c].astype("int32")
+        return df_x
+
+    master_trips = _compact_df(master_trips)
+    stores_gps = _compact_df(stores_gps)
+    dq_stores = _compact_df(dq_stores)
+    dq_cd_orig = _compact_df(dq_cd_orig)
+    dq_trips = _compact_df(dq_trips)
+    trips_pre_s5 = _compact_df(trips_pre_s5)
+
+    del df_a_raw, df_u_raw, df_a, df_u, u_valid, u_invalid, u_clean_num, st_clean_default
+    gc.collect()
+
     return {
         "master_trips": master_trips,
         "dup_detail": dup_detail,
@@ -844,7 +863,6 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         "dq_stores": dq_stores,
         "dq_cd_orig": dq_cd_orig,
         "dq_trips": dq_trips,
-        "st_clean_default": st_clean_default,
         "trips_pre_s5": trips_pre_s5,
     }
 
@@ -986,7 +1004,7 @@ def _add_clean_box_traces(
         )
 
 
-@st.cache_data(show_spinner=False, max_entries=128)
+@st.cache_data(show_spinner=False, max_entries=10, ttl=600)
 def _build_grouped_boxplot_cached(
     df_clean: pd.DataFrame,
     df_tot: pd.DataFrame | None,
@@ -1221,7 +1239,7 @@ def build_viajes_jornadas_excel(df_v_res, df_j_res, df_v_clean, df_j_clean, df_j
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2, ttl=600)
 def _clean_estadias_cached(
     df_in: pd.DataFrame,
     min_est_directo: int,
@@ -1307,7 +1325,7 @@ def _clean_estadias_cached(
     return st_clean, stats
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
 def _rank_tiendas_s3_cached(
     df_all_s3: pd.DataFrame,
     st_clean_s3: pd.DataFrame,
@@ -1429,7 +1447,7 @@ def _rank_tiendas_s3_cached(
 
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=4, ttl=600)
 def _rank_internos_s4_cached(
     df_all_s3: pd.DataFrame,
     st_clean_s3: pd.DataFrame,
@@ -1577,7 +1595,7 @@ def _rank_internos_s4_cached(
     return agg_u[cols_out].sort_values("Demora Extra (min)", ascending=False).reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2, ttl=600)
 def _filter_all_datasets_cached(
     _data_dict: dict,
     d_start: pd.Timestamp,
@@ -1656,7 +1674,7 @@ def _filter_all_datasets_cached(
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2, ttl=600)
 def _clean_tramos_s4_cached(
     dq_stores_filt: pd.DataFrame,
     dq_trips_filt: pd.DataFrame,
@@ -1720,7 +1738,7 @@ def _clean_tramos_s4_cached(
     return tr_st, tr_clean_all, tr_ret_clean_all
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=2, ttl=600)
 def _eval_viajes_jornadas_s5_cached(
     trips_pre_filt: pd.DataFrame,
     cd_std_items: tuple,
@@ -1811,8 +1829,14 @@ def _eval_viajes_jornadas_s5_cached(
     def _build_j(df_fleet: pd.DataFrame, ok_col: str, ini_col: str, dur_v_col: str) -> pd.DataFrame:
         if df_fleet.empty:
             return pd.DataFrame()
+        df_f2 = df_fleet.copy()
+        df_f2["_seg_corto"] = (
+            df_f2["Tipo_Viaje"].astype(str).str.split(" ").str[0]
+            + " "
+            + df_f2["Categoria"].astype(str)
+        )
         j_df = (
-            df_fleet.groupby(["Operacion", "Fecha_Reparto", "Dominio_Clean"], as_index=False)
+            df_f2.groupby(["Operacion", "Fecha_Reparto", "Dominio_Clean"], as_index=False)
             .agg(
                 Dominio=("Dominio", "first"),
                 Interno=("Interno", "first"),
@@ -1831,6 +1855,7 @@ def _eval_viajes_jornadas_s5_cached(
                 Suma_Horas_Viajes=(dur_v_col, "sum"),
                 KMS_Dia=("KMS_Total", "sum"),
                 Tiendas_Dia=("Tiendas_Plan_Viaje", "sum"),
+                Detalle_Viajes_Dia=("_seg_corto", lambda s: " + ".join(s.tolist())),
             )
         )
         j_df["Categoria_Jornada"] = np.where(j_df["Tiene_Lejana"] == 1, "Lejana", "Cercana")
@@ -2648,15 +2673,18 @@ with tab1:
         }
     )
 
-    excel_bytes = build_audit_excel(
-        df_gap_export, df_solo_tms_export, df_store_diff_export, dup_display, inv_display
-    )
-    st.download_button(
-        label="📥 Descargar Auditoría Completa en Excel (.xlsx)",
-        data=excel_bytes,
-        file_name="Auditoria_Conciliacion_WMS_TMS.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+    if st.button("⚙️ Preparar Auditoría Completa en Excel (.xlsx)", key="prep_xl_t1"):
+        st.session_state["_xl_t1_bytes"] = build_audit_excel(
+            df_gap_export, df_solo_tms_export, df_store_diff_export, dup_display, inv_display
+        )
+    if st.session_state.get("_xl_t1_bytes"):
+        st.download_button(
+            label="📥 Descargar Auditoría Completa en Excel (.xlsx)",
+            data=st.session_state["_xl_t1_bytes"],
+            file_name="Auditoria_Conciliacion_WMS_TMS.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key="dl_xl_t1",
+        )
 
     sub_t1, sub_t_solo_tms, sub_t2, sub_t3 = st.tabs(
         [
@@ -3416,15 +3444,18 @@ with tab2:
             }
         )
 
-        gps_excel_bytes = build_gps_audit_excel(
-            st_rank_all, dom_rank_all, sin_coord_tbl, raw_fails_export, cd_sin_dato_export
-        )
-        st.download_button(
-            label="📥 Descargar Auditoría GPS, Geocercas y CD Origen en Excel (.xlsx)",
-            data=gps_excel_bytes,
-            file_name="Auditoria_GPS_y_Geocercas.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        if st.button("⚙️ Preparar Auditoría GPS y Geocercas en Excel (.xlsx)", key="prep_xl_t2"):
+            st.session_state["_xl_t2_bytes"] = build_gps_audit_excel(
+                st_rank_all, dom_rank_all, sin_coord_tbl, raw_fails_export, cd_sin_dato_export
+            )
+        if st.session_state.get("_xl_t2_bytes"):
+            st.download_button(
+                label="📥 Descargar Auditoría GPS, Geocercas y CD Origen en Excel (.xlsx)",
+                data=st.session_state["_xl_t2_bytes"],
+                file_name="Auditoria_GPS_y_Geocercas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_xl_t2",
+            )
 
         cant_geo_rec_pairs = int((st_rank_all["Falla Geozona (Activ. OK)"] >= 2).sum())
         cant_dom_ciegos = int((dom_rank_all["Viajes Ciegos"] > 0).sum())
@@ -4399,20 +4430,23 @@ with tab3:
         df_rk_tiendas = st.session_state.get("_s3_rk_tiendas", pd.DataFrame())
 
         with st.expander("📥 Descargar Excel de Estadías y Productividad (.xlsx)", expanded=False):
-            clean_s3_export = st_clean_s3.copy()
-            if not clean_s3_export.empty:
-                clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-            estadias_excel_bytes = build_estadias_excel(
-                df_seg_summary,
-                df_rk_tiendas,
-                clean_s3_export,
-            )
-            st.download_button(
-                label="📥 Descargar Análisis Completo de Estadías en Tienda (.xlsx)",
-                data=estadias_excel_bytes,
-                file_name="Analisis_Estadias_y_Productividad_Tienda.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if st.button("⚙️ Generar archivo Excel de Estadías", key="prep_xl_t3"):
+                clean_s3_export = st_clean_s3.copy()
+                if not clean_s3_export.empty:
+                    clean_s3_export["Fecha Reparto"] = clean_s3_export["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+                st.session_state["_xl_t3_bytes"] = build_estadias_excel(
+                    df_seg_summary,
+                    df_rk_tiendas,
+                    clean_s3_export,
+                )
+            if st.session_state.get("_xl_t3_bytes"):
+                st.download_button(
+                    label="📥 Descargar Análisis Completo de Estadías en Tienda (.xlsx)",
+                    data=st.session_state["_xl_t3_bytes"],
+                    file_name="Analisis_Estadias_y_Productividad_Tienda.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_xl_t3",
+                )
 
         st.dataframe(
             df_rk_tiendas,
@@ -5121,24 +5155,27 @@ with tab4:
         df_rk_internos = st.session_state.get("_s4_rk_internos", pd.DataFrame())
 
         with st.expander("📥 Descargar Excel Completo de Camiones (.xlsx)", expanded=False):
-            tr_clean_exp = tr_clean.copy()
-            if not tr_clean_exp.empty:
-                tr_clean_exp["Fecha Reparto"] = tr_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-            vel_excel_bytes = build_camiones_excel(
-                mat_vp,
-                mat_vs,
-                mat_vr,
-                mat_vmax,
-                mat_display_s4,
-                df_rk_internos,
-                tr_clean_exp,
-            )
-            st.download_button(
-                label="📥 Descargar Reporte de Camiones (Velocidades, Estadías y Ranking Internos) (.xlsx)",
-                data=vel_excel_bytes,
-                file_name="Analisis_Camiones_Velocidades_y_Estadias.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+            if st.button("⚙️ Generar archivo Excel de Camiones", key="prep_xl_t4"):
+                tr_clean_exp = tr_clean.copy()
+                if not tr_clean_exp.empty:
+                    tr_clean_exp["Fecha Reparto"] = tr_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+                st.session_state["_xl_t4_bytes"] = build_camiones_excel(
+                    mat_vp,
+                    mat_vs,
+                    mat_vr,
+                    mat_vmax,
+                    mat_display_s4,
+                    df_rk_internos,
+                    tr_clean_exp,
+                )
+            if st.session_state.get("_xl_t4_bytes"):
+                st.download_button(
+                    label="📥 Descargar Reporte de Camiones (Velocidades, Estadías y Ranking Internos) (.xlsx)",
+                    data=st.session_state["_xl_t4_bytes"],
+                    file_name="Analisis_Camiones_Velocidades_y_Estadias.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="dl_xl_t4",
+                )
 
         st.dataframe(
             df_rk_internos,
@@ -5763,198 +5800,462 @@ with tab5:
         @_ui_fragment
         def _render_s5_interno_fragment():
             # -------------------------------------------------------------------------
-            # BLOQUE 3: RANKING DE INTERNOS EN JORNADAS Y EVOLUCION PUNTUAL POR CAMION
+            # BLOQUE 3: RANKING COMPARABLE DE INTERNOS Y EVOLUCION DETALLADA POR UNIDAD
             # -------------------------------------------------------------------------
-            st.markdown(
-                f"### 3. Ranking de Internos en Jornadas y Evolución Puntual ({'Base Estimada con CD Ajustable' if usar_estadia_cd_ajust else 'Base Solo Datos Reales'})"
-            )
+            modo_str_s5 = "Base Estimada con CD Ajustable" if usar_estadia_cd_ajust else "Base Solo Datos Reales"
+            st.markdown(f"### 3. Ranking Comparable de Internos y Evolución Puntual ({modo_str_s5})")
             st.caption(
-                "Identifica los **Internos con jornadas más extensas vs. más cortas** (comparados contra la mediana de su **Tipo de Camión**), "
-                "y permite inspeccionar la **evolución día por día** de cualquier unidad puntual."
+                "Compara cada unidad contra la **mediana exacta de su segmento** sin mezclar operaciones distintas: "
+                "en **Viajes OK** cruza `Tipo Camión × Categoría × Tipo de Viaje`; en **Jornadas Diarias** cruza `Tipo Camión × Categoría × Vueltas`."
             )
 
-            if jornadas_clean_s5.empty:
-                st.info("No hay jornadas limpias para construir el ranking de internos en el modo activo.")
-                return
-
-            cds_j_int_opts = ["Todos"] + sorted(
-                jornadas_clean_s5["Operacion"].dropna().astype(int).astype(str).unique().tolist()
-            )
-            tv_j_int_opts = ["Todos"] + sorted(
-                jornadas_clean_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str).unique().tolist()
+            modo_rk_s5 = st.radio(
+                "Analizar Ranking de Internos por:",
+                options=["Viajes OK (Eficiencia por Recorrido)", "Jornadas Diarias (Carga Horaria por Día)"],
+                index=0,
+                horizontal=True,
+                key="s5_rk_modo_sel",
             )
 
-            rkj1, rkj2, rkj3, rkj4 = st.columns([0.9, 0.9, 1.0, 1.3])
-            with rkj1:
-                cd_rk_j = st.selectbox("Filtrar por CD:", options=cds_j_int_opts, index=0, key="s5_rkj_cd")
-            with rkj2:
-                top_n_j = st.selectbox("Cantidad Top:", options=[10, 15, 20, 30], index=1, key="s5_rkj_topn")
-            with rkj3:
-                min_j_int = st.number_input("Mín. jornadas limpias:", min_value=1, max_value=100, value=5, step=1, key="s5_rkj_min")
-            with rkj4:
-                tv_rk_j = st.selectbox("Filtrar por Tipo de Camión:", options=tv_j_int_opts, index=0, key="s5_rkj_tv")
+            if modo_rk_s5 == "Viajes OK (Eficiencia por Recorrido)":
+                if viajes_ok_s5.empty:
+                    st.info("No hay viajes OK en el modo activo para construir el ranking de internos.")
+                else:
+                    v_ok_rk = viajes_ok_s5.copy()
+                    v_ok_rk["_tv"] = v_ok_rk["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+                    v_ok_rk["_cat"] = v_ok_rk["Categoria"].fillna("Sin dato").astype(str)
+                    v_ok_rk["_tpv"] = v_ok_rk["Tipo_Viaje"].fillna("Sin dato").astype(str)
 
-            # Referencia global por Tipo de Camión en el modo activo
-            veh_j_ref = (
-                jornadas_clean_s5.assign(_tv=jornadas_clean_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str))
-                .groupby("_tv", as_index=False)
-                .agg(Mediana_Veh_hs=("Duracion_Jornada_hs", "median"))
-            )
-
-            j_tot_u = jornadas_all.copy()
-            j_ok_u = jornadas_clean_s5.copy()
-            j_ok_u["_tv"] = j_ok_u["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
-            if cd_rk_j != "Todos":
-                j_tot_u = j_tot_u[j_tot_u["Operacion"].astype(int).astype(str) == str(cd_rk_j)]
-                j_ok_u = j_ok_u[j_ok_u["Operacion"].astype(int).astype(str) == str(cd_rk_j)]
-            if tv_rk_j != "Todos":
-                j_tot_u = j_tot_u[j_tot_u["Tipo_Vehiculo"].fillna("Sin dato").astype(str) == tv_rk_j]
-                j_ok_u = j_ok_u[j_ok_u["_tv"] == tv_rk_j]
-
-            tot_j_cnt = (
-                j_tot_u.groupby(["Operacion", "Interno_Clean"], as_index=False)
-                .size()
-                .rename(columns={"size": "Jornadas_Totales"})
-            )
-
-            agg_ji = (
-                j_ok_u.groupby(["Operacion", "Interno_Clean"], as_index=False)
-                .agg(
-                    Dominio=("Dominio", lambda s: " / ".join(sorted(s.dropna().astype(str).unique()))),
-                    Tipo_Camion=("_tv", lambda s: s.value_counts().index[0]),
-                    Jornadas_Limpias=("Duracion_Jornada_hs", "count"),
-                    J_1V=("Vueltas_Label", lambda s: int((s == "1 Vuelta").sum())),
-                    J_2V=("Vueltas_Label", lambda s: int((s == "2 Vueltas").sum())),
-                    Med_Jornada_hs=("Duracion_Jornada_hs", "median"),
-                    P90_Jornada_hs=("Duracion_Jornada_hs", lambda s: float(np.percentile(s.dropna(), 90))),
-                    Med_KMS_Dia=("KMS_Dia", "median"),
-                )
-                .merge(tot_j_cnt, on=["Operacion", "Interno_Clean"], how="left")
-                .merge(veh_j_ref, left_on="Tipo_Camion", right_on="_tv", how="left")
-            )
-            agg_ji = agg_ji[agg_ji["Jornadas_Limpias"] >= int(min_j_int)].copy()
-
-            if not agg_ji.empty:
-                agg_ji["CD"] = agg_ji["Operacion"].astype(int).astype(str)
-                agg_ji["Diff_vs_Camion_hs"] = (agg_ji["Med_Jornada_hs"] - agg_ji["Mediana_Veh_hs"]).round(1)
-                agg_ji["Int_Label"] = (
-                    "Int. "
-                    + agg_ji["Interno_Clean"]
-                    + " ("
-                    + agg_ji["Dominio"]
-                    + " | CD "
-                    + agg_ji["CD"]
-                    + " · "
-                    + agg_ji["Tipo_Camion"]
-                    + ")"
-                )
-                agg_ji = agg_ji.sort_values("Med_Jornada_hs", ascending=False).reset_index(drop=True)
-
-                c_jhi, c_jlo = st.columns(2)
-                with c_jhi:
-                    top_j_hi = agg_ji.head(int(top_n_j)).iloc[::-1].copy()
-                    col_jhi = [
-                        "#dc2626" if v >= 10.0 else ("#f59e0b" if v >= 8.5 else "#1d4ed8")
-                        for v in top_j_hi["Med_Jornada_hs"]
-                    ]
-                    fig_jhi = go.Figure(
-                        data=go.Bar(
-                            x=top_j_hi["Med_Jornada_hs"],
-                            y=top_j_hi["Int_Label"],
-                            orientation="h",
-                            marker_color=col_jhi,
-                            text=[f"{v:.1f} hs" for v in top_j_hi["Med_Jornada_hs"]],
-                            textposition="outside",
-                            customdata=np.dstack(
-                                (
-                                    top_j_hi["Med_Jornada_hs"],
-                                    top_j_hi["Mediana_Veh_hs"],
-                                    top_j_hi["Diff_vs_Camion_hs"],
-                                    top_j_hi["Jornadas_Limpias"],
-                                    top_j_hi["Jornadas_Totales"],
-                                    top_j_hi["J_1V"],
-                                    top_j_hi["J_2V"],
-                                    top_j_hi["Med_KMS_Dia"],
-                                )
-                            )[0],
-                            hovertemplate=(
-                                "<b>%{y}</b><br>"
-                                "Mediana Jornada: <b>%{customdata[0]:.1f} hs</b> (Ref. Tipo Camión: %{customdata[1]:.1f} hs | %{customdata[2]:+.1f} hs)<br>"
-                                "Jornadas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales (1V: %{customdata[5]:.0f} | 2V: %{customdata[6]:.0f})<br>"
-                                "Mediana KMS/Día: <b>%{customdata[7]:.0f} km</b><extra></extra>"
-                            ),
+                    # Referencia global por segmento exacto: Tipo Camión + Categoría + Tipo de Viaje
+                    seg_v_ref = (
+                        v_ok_rk.groupby(["_tv", "_cat", "_tpv"], as_index=False)
+                        .agg(
+                            Med_Seg_hs=("Duracion_Viaje_hs", "median"),
+                            N_Seg=("Duracion_Viaje_hs", "count"),
                         )
                     )
-                    max_jh = float(top_j_hi["Med_Jornada_hs"].max()) if not top_j_hi.empty else 12.0
-                    fig_jhi.update_layout(
-                        title=f"🔴 Top {len(top_j_hi)} Mayor Duración de Jornada (hs)",
-                        height=max(340, len(top_j_hi) * 26 + 90),
-                        margin=dict(l=10, r=55, t=40, b=20),
-                        xaxis_title="Mediana Duración Jornada (hs)",
-                        yaxis_title="",
-                        xaxis=dict(range=[0, max_jh * 1.24]),
-                    )
-                    st.plotly_chart(fig_jhi, use_container_width=True)
 
-                with c_jlo:
-                    top_j_lo = agg_ji.tail(int(top_n_j)).copy().sort_values("Med_Jornada_hs", ascending=False)
-                    col_jlo = [
-                        "#16a34a" if v <= 0 else ("#3b82f6" if v <= 1.0 else "#f59e0b")
-                        for v in top_j_lo["Diff_vs_Camion_hs"]
-                    ]
-                    fig_jlo = go.Figure(
-                        data=go.Bar(
-                            x=top_j_lo["Med_Jornada_hs"],
-                            y=top_j_lo["Int_Label"],
-                            orientation="h",
-                            marker_color=col_jlo,
-                            text=[f"{v:.1f} hs" for v in top_j_lo["Med_Jornada_hs"]],
-                            textposition="outside",
-                            customdata=np.dstack(
-                                (
-                                    top_j_lo["Med_Jornada_hs"],
-                                    top_j_lo["Mediana_Veh_hs"],
-                                    top_j_lo["Diff_vs_Camion_hs"],
-                                    top_j_lo["Jornadas_Limpias"],
-                                    top_j_lo["Jornadas_Totales"],
-                                    top_j_lo["J_1V"],
-                                    top_j_lo["J_2V"],
-                                    top_j_lo["Med_KMS_Dia"],
+                    cds_v_opts = ["Todos"] + sorted(v_ok_rk["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+                    tv_v_opts = ["Todos"] + sorted(v_ok_rk["_tv"].unique().tolist())
+                    tpv_v_opts = ["Todos", "Directo (1 tienda)", "Compartido (2 tiendas)", "Rutas (3+ tiendas)"]
+
+                    f1, f2, f3, f4, f5, f6 = st.columns([0.85, 0.75, 0.85, 1.15, 0.95, 1.15])
+                    with f1:
+                        cd_v_sel = st.selectbox("CD:", options=cds_v_opts, index=0, key="s5_rkv_cd")
+                    with f2:
+                        top_n_v = st.selectbox("Top:", options=[10, 15, 20, 30], index=1, key="s5_rkv_top")
+                    with f3:
+                        min_v_int = st.number_input("Mín. viajes:", min_value=1, max_value=200, value=5, step=1, key="s5_rkv_min")
+                    with f4:
+                        tv_v_sel = st.selectbox("Tipo Camión:", options=tv_v_opts, index=0, key="s5_rkv_tv")
+                    with f5:
+                        cat_v_rk = st.selectbox("Categoría:", options=["Todas", "Cercana", "Lejana"], index=0, key="s5_rkv_cat")
+                    with f6:
+                        tpv_v_rk = st.selectbox("Tipo de Viaje:", options=tpv_v_opts, index=0, key="s5_rkv_tpv")
+
+                    ord_v_rk = st.radio(
+                        "Ordenar ranking de viajes por:",
+                        options=["Demora Extra vs. Segmento (+hs)", "Duración Mediana Absoluta (hs)"],
+                        index=0,
+                        horizontal=True,
+                        key="s5_rkv_ord",
+                    )
+
+                    v_tot_sub = trips_eval_s5.copy()
+                    v_sub = v_ok_rk.merge(seg_v_ref, on=["_tv", "_cat", "_tpv"], how="left")
+                    if cd_v_sel != "Todos":
+                        v_tot_sub = v_tot_sub[v_tot_sub["Operacion"].astype(int).astype(str) == str(cd_v_sel)]
+                        v_sub = v_sub[v_sub["Operacion"].astype(int).astype(str) == str(cd_v_sel)]
+                    if tv_v_sel != "Todos":
+                        v_tot_sub = v_tot_sub[v_tot_sub["Tipo_Vehiculo"].fillna("Sin dato").astype(str) == tv_v_sel]
+                        v_sub = v_sub[v_sub["_tv"] == tv_v_sel]
+                    if cat_v_rk != "Todas":
+                        v_tot_sub = v_tot_sub[v_tot_sub["Categoria"].fillna("Sin dato").astype(str) == cat_v_rk]
+                        v_sub = v_sub[v_sub["_cat"] == cat_v_rk]
+                    if tpv_v_rk != "Todos":
+                        v_tot_sub = v_tot_sub[v_tot_sub["Tipo_Viaje"].fillna("Sin dato").astype(str) == tpv_v_rk]
+                        v_sub = v_sub[v_sub["_tpv"] == tpv_v_rk]
+
+                    tot_v_cnt = (
+                        v_tot_sub.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "Viajes_Totales"})
+                    )
+
+                    if not v_sub.empty:
+                        v_sub["_diff_v"] = v_sub["Duracion_Viaje_hs"] - v_sub["Med_Seg_hs"]
+                        v_sub["_seg_lbl"] = v_sub["_tpv"].str.split(" ").str[0] + " · " + v_sub["_cat"]
+                        agg_vi = (
+                            v_sub.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                            .agg(
+                                Dominio=("Dominio", lambda s: " / ".join(sorted(s.dropna().astype(str).unique()))),
+                                Tipo_Camion=("_tv", lambda s: s.value_counts().index[0]),
+                                Seg_Ppal=("_seg_lbl", lambda s: s.value_counts().index[0]),
+                                Viajes_OK=("Duracion_Viaje_hs", "count"),
+                                Med_Viaje_hs=("Duracion_Viaje_hs", "median"),
+                                Med_Ref_hs=("Med_Seg_hs", "median"),
+                                Demora_Extra_hs=("_diff_v", "median"),
+                                Med_CD_hs=("Tiempo_CD_hs", "median"),
+                                Med_Ruta_hs=("Tiempo_Ruta_hs", "median"),
+                                Med_Tiendas_hs=("Tiempo_Tiendas_hs", "median"),
+                                Med_KMS=("KMS_Total", "median"),
+                            )
+                            .merge(tot_v_cnt, on=["Operacion", "Interno_Clean"], how="left")
+                        )
+                        agg_vi = agg_vi[agg_vi["Viajes_OK"] >= int(min_v_int)].copy()
+
+                        if not agg_vi.empty:
+                            agg_vi["CD"] = agg_vi["Operacion"].astype(int).astype(str)
+                            agg_vi["Demora_Extra_hs"] = agg_vi["Demora_Extra_hs"].round(2)
+                            agg_vi["Med_Viaje_hs"] = agg_vi["Med_Viaje_hs"].round(2)
+                            agg_vi["Med_Ref_hs"] = agg_vi["Med_Ref_hs"].round(2)
+                            agg_vi["Int_Label"] = (
+                                "Int. "
+                                + agg_vi["Interno_Clean"]
+                                + " ("
+                                + agg_vi["Dominio"]
+                                + " | CD "
+                                + agg_vi["CD"]
+                                + " · "
+                                + agg_vi["Tipo_Camion"]
+                                + ")"
+                            )
+                            m_col_v = "Demora_Extra_hs" if ord_v_rk == "Demora Extra vs. Segmento (+hs)" else "Med_Viaje_hs"
+                            m_lbl_v = "Demora Extra vs. Segmento (hs)" if m_col_v == "Demora_Extra_hs" else "Mediana Duración Viaje (hs)"
+                            agg_vi = agg_vi.sort_values(m_col_v, ascending=False).reset_index(drop=True)
+
+                            cv_hi, cv_lo = st.columns(2)
+                            with cv_hi:
+                                top_v_hi = agg_vi.head(int(top_n_v)).iloc[::-1].copy()
+                                col_vhi = [
+                                    "#dc2626" if v >= 1.0 else ("#f59e0b" if v > 0 else "#16a34a")
+                                    for v in top_v_hi["Demora_Extra_hs"]
+                                ]
+                                fig_vhi = go.Figure(
+                                    data=go.Bar(
+                                        x=top_v_hi[m_col_v],
+                                        y=top_v_hi["Int_Label"],
+                                        orientation="h",
+                                        marker_color=col_vhi,
+                                        text=[
+                                            f"{v:+.2f}h" if m_col_v == "Demora_Extra_hs" else f"{v:.2f}h"
+                                            for v in top_v_hi[m_col_v]
+                                        ],
+                                        textposition="outside",
+                                        customdata=np.dstack(
+                                            (
+                                                top_v_hi["Med_Viaje_hs"],
+                                                top_v_hi["Med_Ref_hs"],
+                                                top_v_hi["Demora_Extra_hs"],
+                                                top_v_hi["Seg_Ppal"],
+                                                top_v_hi["Viajes_OK"],
+                                                top_v_hi["Viajes_Totales"],
+                                                top_v_hi["Med_CD_hs"],
+                                                top_v_hi["Med_Ruta_hs"],
+                                                top_v_hi["Med_Tiendas_hs"],
+                                                top_v_hi["Med_KMS"],
+                                            )
+                                        )[0],
+                                        hovertemplate=(
+                                            "<b>%{y}</b><br>"
+                                            "Segmento Ppal: <b>%{customdata[3]}</b><br>"
+                                            "Mediana Viaje: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)<br>"
+                                            "Desglose Mediano: CD %{customdata[6]:.2f}h + Viaje %{customdata[7]:.2f}h + Tiendas %{customdata[8]:.2f}h | KMS: %{customdata[9]:.0f}<br>"
+                                            "Muestra: <b>%{customdata[4]:.0f} viajes OK</b> de %{customdata[5]:.0f} totales<extra></extra>"
+                                        ),
+                                    )
                                 )
-                            )[0],
-                            hovertemplate=(
-                                "<b>%{y}</b><br>"
-                                "Mediana Jornada: <b>%{customdata[0]:.1f} hs</b> (Ref. Tipo Camión: %{customdata[1]:.1f} hs | %{customdata[2]:+.1f} hs)<br>"
-                                "Jornadas: <b>%{customdata[3]:.0f} limpias</b> de %{customdata[4]:.0f} totales (1V: %{customdata[5]:.0f} | 2V: %{customdata[6]:.0f})<br>"
-                                "Mediana KMS/Día: <b>%{customdata[7]:.0f} km</b><extra></extra>"
-                            ),
+                                max_vh = float(top_v_hi[m_col_v].max()) if not top_v_hi.empty else 5.0
+                                fig_vhi.update_layout(
+                                    title=f"🔴 Top {len(top_v_hi)} Mayor Demora — {m_lbl_v}",
+                                    height=max(340, len(top_v_hi) * 26 + 90),
+                                    margin=dict(l=10, r=55, t=40, b=20),
+                                    xaxis_title=m_lbl_v,
+                                    yaxis_title="",
+                                    xaxis=dict(range=[min(0.0, float(top_v_hi[m_col_v].min())), max(0.5, max_vh * 1.25)]),
+                                )
+                                st.plotly_chart(fig_vhi, use_container_width=True)
+
+                            with cv_lo:
+                                top_v_lo = agg_vi.tail(int(top_n_v)).copy().sort_values(m_col_v, ascending=False)
+                                col_vlo = [
+                                    "#16a34a" if v <= 0 else ("#3b82f6" if v <= 0.5 else "#f59e0b")
+                                    for v in top_v_lo["Demora_Extra_hs"]
+                                ]
+                                fig_vlo = go.Figure(
+                                    data=go.Bar(
+                                        x=top_v_lo[m_col_v],
+                                        y=top_v_lo["Int_Label"],
+                                        orientation="h",
+                                        marker_color=col_vlo,
+                                        text=[
+                                            f"{v:+.2f}h" if m_col_v == "Demora_Extra_hs" else f"{v:.2f}h"
+                                            for v in top_v_lo[m_col_v]
+                                        ],
+                                        textposition="outside",
+                                        customdata=np.dstack(
+                                            (
+                                                top_v_lo["Med_Viaje_hs"],
+                                                top_v_lo["Med_Ref_hs"],
+                                                top_v_lo["Demora_Extra_hs"],
+                                                top_v_lo["Seg_Ppal"],
+                                                top_v_lo["Viajes_OK"],
+                                                top_v_lo["Viajes_Totales"],
+                                                top_v_lo["Med_CD_hs"],
+                                                top_v_lo["Med_Ruta_hs"],
+                                                top_v_lo["Med_Tiendas_hs"],
+                                                top_v_lo["Med_KMS"],
+                                            )
+                                        )[0],
+                                        hovertemplate=(
+                                            "<b>%{y}</b><br>"
+                                            "Segmento Ppal: <b>%{customdata[3]}</b><br>"
+                                            "Mediana Viaje: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)<br>"
+                                            "Desglose Mediano: CD %{customdata[6]:.2f}h + Viaje %{customdata[7]:.2f}h + Tiendas %{customdata[8]:.2f}h | KMS: %{customdata[9]:.0f}<br>"
+                                            "Muestra: <b>%{customdata[4]:.0f} viajes OK</b> de %{customdata[5]:.0f} totales<extra></extra>"
+                                        ),
+                                    )
+                                )
+                                min_vl = float(top_v_lo[m_col_v].min()) if not top_v_lo.empty else -2.0
+                                max_vl = float(top_v_lo[m_col_v].max()) if not top_v_lo.empty else 2.0
+                                fig_vlo.update_layout(
+                                    title=f"🟢 Top {len(top_v_lo)} Más Ágiles — {m_lbl_v}",
+                                    height=max(340, len(top_v_lo) * 26 + 90),
+                                    margin=dict(l=10, r=55, t=40, b=20),
+                                    xaxis_title=m_lbl_v,
+                                    yaxis_title="",
+                                    xaxis=dict(range=[min_vl * 1.28 if min_vl < 0 else 0.0, max(0.5, max_vl * 1.25)]),
+                                )
+                                st.plotly_chart(fig_vlo, use_container_width=True)
+                        else:
+                            st.info("Ningún interno alcanza el mínimo de viajes OK con los filtros seleccionados.")
+            else:
+                if jornadas_clean_s5.empty:
+                    st.info("No hay jornadas limpias en el modo activo para construir el ranking.")
+                else:
+                    j_ok_rk = jornadas_clean_s5.copy()
+                    j_ok_rk["_tv"] = j_ok_rk["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+                    j_ok_rk["_cat"] = j_ok_rk["Categoria_Jornada"].fillna("Sin dato").astype(str)
+                    j_ok_rk["_vlt"] = j_ok_rk["Vueltas_Label"].fillna("Sin dato").astype(str)
+
+                    # Referencia global por segmento exacto: Tipo Camión + Categoría + Cantidad de Vueltas
+                    seg_j_ref = (
+                        j_ok_rk.groupby(["_tv", "_cat", "_vlt"], as_index=False)
+                        .agg(
+                            Med_Seg_hs=("Duracion_Jornada_hs", "median"),
+                            N_Seg=("Duracion_Jornada_hs", "count"),
                         )
                     )
-                    max_jl = float(top_j_lo["Med_Jornada_hs"].max()) if not top_j_lo.empty else 12.0
-                    fig_jlo.update_layout(
-                        title=f"🟢 Top {len(top_j_lo)} Jornadas Más Cortas (hs)",
-                        height=max(340, len(top_j_lo) * 26 + 90),
-                        margin=dict(l=10, r=55, t=40, b=20),
-                        xaxis_title="Mediana Duración Jornada (hs)",
-                        yaxis_title="",
-                        xaxis=dict(range=[0, max_jl * 1.24]),
+
+                    cds_j_opts = ["Todos"] + sorted(j_ok_rk["Operacion"].dropna().astype(int).astype(str).unique().tolist())
+                    tv_j_opts = ["Todos"] + sorted(j_ok_rk["_tv"].unique().tolist())
+                    vlt_j_opts = ["Todas", "1 Vuelta", "2 Vueltas", "3+ Vueltas"]
+
+                    fj1, fj2, fj3, fj4, fj5, fj6 = st.columns([0.85, 0.75, 0.90, 1.15, 0.95, 1.05])
+                    with fj1:
+                        cd_j_sel = st.selectbox("CD:", options=cds_j_opts, index=0, key="s5_rkj_cd")
+                    with fj2:
+                        top_n_j = st.selectbox("Top:", options=[10, 15, 20, 30], index=1, key="s5_rkj_topn")
+                    with fj3:
+                        min_j_int = st.number_input("Mín. jornadas:", min_value=1, max_value=100, value=5, step=1, key="s5_rkj_min")
+                    with fj4:
+                        tv_j_sel = st.selectbox("Tipo Camión:", options=tv_j_opts, index=0, key="s5_rkj_tv")
+                    with fj5:
+                        cat_j_rk = st.selectbox("Categoría:", options=["Todas", "Cercana", "Lejana"], index=0, key="s5_rkj_cat")
+                    with fj6:
+                        vlt_j_rk = st.selectbox("Vueltas:", options=vlt_j_opts, index=0, key="s5_rkj_vlt")
+
+                    ord_j_rk = st.radio(
+                        "Ordenar ranking de jornadas por:",
+                        options=["Demora Extra vs. Segmento (+hs)", "Duración Mediana Absoluta (hs)"],
+                        index=0,
+                        horizontal=True,
+                        key="s5_rkj_ord",
                     )
-                    st.plotly_chart(fig_jlo, use_container_width=True)
+
+                    j_tot_sub = jornadas_all.copy()
+                    j_tot_sub["_vlt_t"] = np.select(
+                        [j_tot_sub["Viajes_Plan_Dia"] == 1, j_tot_sub["Viajes_Plan_Dia"] == 2],
+                        ["1 Vuelta", "2 Vueltas"],
+                        default="3+ Vueltas",
+                    )
+                    j_sub = j_ok_rk.merge(seg_j_ref, on=["_tv", "_cat", "_vlt"], how="left")
+
+                    if cd_j_sel != "Todos":
+                        j_tot_sub = j_tot_sub[j_tot_sub["Operacion"].astype(int).astype(str) == str(cd_j_sel)]
+                        j_sub = j_sub[j_sub["Operacion"].astype(int).astype(str) == str(cd_j_sel)]
+                    if tv_j_sel != "Todos":
+                        j_tot_sub = j_tot_sub[j_tot_sub["Tipo_Vehiculo"].fillna("Sin dato").astype(str) == tv_j_sel]
+                        j_sub = j_sub[j_sub["_tv"] == tv_j_sel]
+                    if cat_j_rk != "Todas":
+                        j_tot_sub = j_tot_sub[j_tot_sub["Categoria_Jornada"].fillna("Sin dato").astype(str) == cat_j_rk]
+                        j_sub = j_sub[j_sub["_cat"] == cat_j_rk]
+                    if vlt_j_rk != "Todas":
+                        j_tot_sub = j_tot_sub[j_tot_sub["_vlt_t"] == vlt_j_rk]
+                        j_sub = j_sub[j_sub["_vlt"] == vlt_j_rk]
+
+                    tot_j_cnt = (
+                        j_tot_sub.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                        .size()
+                        .rename(columns={"size": "Jornadas_Totales"})
+                    )
+
+                    if not j_sub.empty:
+                        j_sub["_diff_j"] = j_sub["Duracion_Jornada_hs"] - j_sub["Med_Seg_hs"]
+                        j_sub["_seg_j_lbl"] = j_sub["_vlt"] + " · " + j_sub["_cat"]
+                        agg_ji = (
+                            j_sub.groupby(["Operacion", "Interno_Clean"], as_index=False)
+                            .agg(
+                                Dominio=("Dominio", lambda s: " / ".join(sorted(s.dropna().astype(str).unique()))),
+                                Tipo_Camion=("_tv", lambda s: s.value_counts().index[0]),
+                                Seg_Ppal=("_seg_j_lbl", lambda s: s.value_counts().index[0]),
+                                Jornadas_Limpias=("Duracion_Jornada_hs", "count"),
+                                J_1V=("_vlt", lambda s: int((s == "1 Vuelta").sum())),
+                                J_2V=("_vlt", lambda s: int((s == "2 Vueltas").sum())),
+                                Med_Jornada_hs=("Duracion_Jornada_hs", "median"),
+                                Med_Ref_hs=("Med_Seg_hs", "median"),
+                                Demora_Extra_hs=("_diff_j", "median"),
+                                Med_KMS_Dia=("KMS_Dia", "median"),
+                            )
+                            .merge(tot_j_cnt, on=["Operacion", "Interno_Clean"], how="left")
+                        )
+                        agg_ji = agg_ji[agg_ji["Jornadas_Limpias"] >= int(min_j_int)].copy()
+
+                        if not agg_ji.empty:
+                            agg_ji["CD"] = agg_ji["Operacion"].astype(int).astype(str)
+                            agg_ji["Demora_Extra_hs"] = agg_ji["Demora_Extra_hs"].round(2)
+                            agg_ji["Med_Jornada_hs"] = agg_ji["Med_Jornada_hs"].round(2)
+                            agg_ji["Med_Ref_hs"] = agg_ji["Med_Ref_hs"].round(2)
+                            agg_ji["Int_Label"] = (
+                                "Int. "
+                                + agg_ji["Interno_Clean"]
+                                + " ("
+                                + agg_ji["Dominio"]
+                                + " | CD "
+                                + agg_ji["CD"]
+                                + " · "
+                                + agg_ji["Tipo_Camion"]
+                                + ")"
+                            )
+                            m_col_j = "Demora_Extra_hs" if ord_j_rk == "Demora Extra vs. Segmento (+hs)" else "Med_Jornada_hs"
+                            m_lbl_j = "Demora Extra vs. Segmento (hs)" if m_col_j == "Demora_Extra_hs" else "Mediana Duración Jornada (hs)"
+                            agg_ji = agg_ji.sort_values(m_col_j, ascending=False).reset_index(drop=True)
+
+                            c_jhi, c_jlo = st.columns(2)
+                            with c_jhi:
+                                top_j_hi = agg_ji.head(int(top_n_j)).iloc[::-1].copy()
+                                col_jhi = [
+                                    "#dc2626" if v >= 1.2 else ("#f59e0b" if v > 0 else "#16a34a")
+                                    for v in top_j_hi["Demora_Extra_hs"]
+                                ]
+                                fig_jhi = go.Figure(
+                                    data=go.Bar(
+                                        x=top_j_hi[m_col_j],
+                                        y=top_j_hi["Int_Label"],
+                                        orientation="h",
+                                        marker_color=col_jhi,
+                                        text=[
+                                            f"{v:+.2f}h" if m_col_j == "Demora_Extra_hs" else f"{v:.1f}h"
+                                            for v in top_j_hi[m_col_j]
+                                        ],
+                                        textposition="outside",
+                                        customdata=np.dstack(
+                                            (
+                                                top_j_hi["Med_Jornada_hs"],
+                                                top_j_hi["Med_Ref_hs"],
+                                                top_j_hi["Demora_Extra_hs"],
+                                                top_j_hi["Seg_Ppal"],
+                                                top_j_hi["Jornadas_Limpias"],
+                                                top_j_hi["Jornadas_Totales"],
+                                                top_j_hi["J_1V"],
+                                                top_j_hi["J_2V"],
+                                                top_j_hi["Med_KMS_Dia"],
+                                            )
+                                        )[0],
+                                        hovertemplate=(
+                                            "<b>%{y}</b><br>"
+                                            "Segmento Ppal: <b>%{customdata[3]}</b><br>"
+                                            "Mediana Jornada: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)<br>"
+                                            "Jornadas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales (1V: %{customdata[6]:.0f} | 2V: %{customdata[7]:.0f})<br>"
+                                            "Mediana KMS/Día: <b>%{customdata[8]:.0f} km</b><extra></extra>"
+                                        ),
+                                    )
+                                )
+                                max_jh = float(top_j_hi[m_col_j].max()) if not top_j_hi.empty else 10.0
+                                fig_jhi.update_layout(
+                                    title=f"🔴 Top {len(top_j_hi)} Mayor Demora — {m_lbl_j}",
+                                    height=max(340, len(top_j_hi) * 26 + 90),
+                                    margin=dict(l=10, r=55, t=40, b=20),
+                                    xaxis_title=m_lbl_j,
+                                    yaxis_title="",
+                                    xaxis=dict(range=[min(0.0, float(top_j_hi[m_col_j].min())), max(0.5, max_jh * 1.25)]),
+                                )
+                                st.plotly_chart(fig_jhi, use_container_width=True)
+
+                            with c_jlo:
+                                top_j_lo = agg_ji.tail(int(top_n_j)).copy().sort_values(m_col_j, ascending=False)
+                                col_jlo = [
+                                    "#16a34a" if v <= 0 else ("#3b82f6" if v <= 0.5 else "#f59e0b")
+                                    for v in top_j_lo["Demora_Extra_hs"]
+                                ]
+                                fig_jlo = go.Figure(
+                                    data=go.Bar(
+                                        x=top_j_lo[m_col_j],
+                                        y=top_j_lo["Int_Label"],
+                                        orientation="h",
+                                        marker_color=col_jlo,
+                                        text=[
+                                            f"{v:+.2f}h" if m_col_j == "Demora_Extra_hs" else f"{v:.1f}h"
+                                            for v in top_j_lo[m_col_j]
+                                        ],
+                                        textposition="outside",
+                                        customdata=np.dstack(
+                                            (
+                                                top_j_lo["Med_Jornada_hs"],
+                                                top_j_lo["Med_Ref_hs"],
+                                                top_j_lo["Demora_Extra_hs"],
+                                                top_j_lo["Seg_Ppal"],
+                                                top_j_lo["Jornadas_Limpias"],
+                                                top_j_lo["Jornadas_Totales"],
+                                                top_j_lo["J_1V"],
+                                                top_j_lo["J_2V"],
+                                                top_j_lo["Med_KMS_Dia"],
+                                            )
+                                        )[0],
+                                        hovertemplate=(
+                                            "<b>%{y}</b><br>"
+                                            "Segmento Ppal: <b>%{customdata[3]}</b><br>"
+                                            "Mediana Jornada: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)<br>"
+                                            "Jornadas: <b>%{customdata[4]:.0f} limpias</b> de %{customdata[5]:.0f} totales (1V: %{customdata[6]:.0f} | 2V: %{customdata[7]:.0f})<br>"
+                                            "Mediana KMS/Día: <b>%{customdata[8]:.0f} km</b><extra></extra>"
+                                        ),
+                                    )
+                                )
+                                min_jl = float(top_j_lo[m_col_j].min()) if not top_j_lo.empty else -2.0
+                                max_jl = float(top_j_lo[m_col_j].max()) if not top_j_lo.empty else 2.0
+                                fig_jlo.update_layout(
+                                    title=f"🟢 Top {len(top_j_lo)} Más Ágiles — {m_lbl_j}",
+                                    height=max(340, len(top_j_lo) * 26 + 90),
+                                    margin=dict(l=10, r=55, t=40, b=20),
+                                    xaxis_title=m_lbl_j,
+                                    yaxis_title="",
+                                    xaxis=dict(range=[min_jl * 1.28 if min_jl < 0 else 0.0, max(0.5, max_jl * 1.25)]),
+                                )
+                                st.plotly_chart(fig_jlo, use_container_width=True)
+                        else:
+                            st.info("Ningún interno alcanza el mínimo de jornadas limpias con los filtros seleccionados.")
 
             # -----------------------------------------------------------------
-            # EVOLUCION PUNTUAL DE UN INTERNO (SERIE DIARIA CON PUNTOS + REFERENCIA)
+            # EVOLUCION PUNTUAL DE UN INTERNO (DETALLE DIA POR DIA Y VIAJE POR VIAJE)
             # -----------------------------------------------------------------
-            with st.expander("📈 Ver Evolución Día por Día de un Interno Puntual (Serie Temporal)", expanded=True):
+            with st.expander("📈 Ver Evolución Día por Día de un Interno Puntual (Serie Temporal + Detalle Operativo)", expanded=True):
                 st.caption(
-                    "Como cada camión realiza **1 jornada por día**, una **línea de evolución diaria con puntos** "
-                    "(diferenciando 1 Vuelta vs. 2+ Vueltas) permite ver su comportamiento mucho mejor que un diagrama de cajas."
+                    "Muestra la evolución cronológica de una unidad puntual comparada contra la **mediana esperada de su segmento exacto** "
+                    "e incluye el desglose completo de cada día/recorrido al pie."
                 )
                 f_s5_c1, f_s5_c2, f_s5_c3 = st.columns([1.2, 0.9, 1.3])
                 internos_opts_s5 = sorted(
-                    j_ok_u["Interno_Clean"].dropna().unique().tolist(),
-                    key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
-                ) if not j_ok_u.empty else sorted(
-                    jornadas_clean_s5["Interno_Clean"].dropna().unique().tolist(),
+                    trips_eval_s5["Interno_Clean"].dropna().unique().tolist(),
                     key=lambda x: (0, int(x)) if x.isdigit() else (1, x),
                 )
                 with f_s5_c1:
@@ -5968,7 +6269,7 @@ with tab5:
 
                 cds_int_s5 = (
                     sorted(
-                        jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5]["Operacion"]
+                        trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5]["Operacion"]
                         .dropna()
                         .astype(int)
                         .astype(str)
@@ -5988,7 +6289,7 @@ with tab5:
                 with f_s5_c3:
                     metrica_int_s5 = st.radio(
                         "Métrica:",
-                        options=["Jornadas Diarias (hs)", "Viajes OK (hs)"],
+                        options=["Viajes OK (Desglose CD + Viaje + Tiendas)", "Jornadas Diarias (1V vs. 2+ Vueltas)"],
                         index=0,
                         horizontal=True,
                         key="s5_int_metrica",
@@ -5996,10 +6297,11 @@ with tab5:
 
                 if interno_sel_s5:
                     sub_t_int = trips_eval_s5[trips_eval_s5["Interno_Clean"] == interno_sel_s5].copy()
-                    sub_j_int = jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5].copy()
+                    sub_j_int = jornadas_clean_s5[jornadas_clean_s5["Interno_Clean"] == interno_sel_s5].copy() if not jornadas_clean_s5.empty else pd.DataFrame()
                     if cd_sel_s5 != "Todos":
                         sub_t_int = sub_t_int[sub_t_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
-                        sub_j_int = sub_j_int[sub_j_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
+                        if not sub_j_int.empty:
+                            sub_j_int = sub_j_int[sub_j_int["Operacion"].astype(int).astype(str) == str(cd_sel_s5)].copy()
 
                     dom_info = " / ".join(sorted(sub_t_int["Dominio"].dropna().astype(str).unique()))
                     tv_info = " / ".join(sorted(sub_t_int["Tipo_Vehiculo"].dropna().astype(str).unique()))
@@ -6008,17 +6310,182 @@ with tab5:
 
                     st.caption(
                         f"**{cd_titulo_int} · Interno {interno_sel_s5}** ({dom_info} · {tv_info}) — "
-                        f"Jornadas limpias: **{len(sub_j_int)}** | Viajes OK: **{len(v_ok_int)} / {len(sub_t_int)}**"
+                        f"Viajes OK: **{len(v_ok_int)} / {len(sub_t_int)}** | Jornadas limpias: **{len(sub_j_int)}**"
                     )
 
-                    if metrica_int_s5 == "Jornadas Diarias (hs)" and not sub_j_int.empty:
+                    if metrica_int_s5.startswith("Viajes OK") and not v_ok_int.empty and not viajes_ok_s5.empty:
+                        # Referencia por Tipo Camión + Categoría + Tipo Viaje
+                        ref_v_all = (
+                            viajes_ok_s5.assign(
+                                _tv=viajes_ok_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str),
+                                _cat=viajes_ok_s5["Categoria"].fillna("Sin dato").astype(str),
+                                _tpv=viajes_ok_s5["Tipo_Viaje"].fillna("Sin dato").astype(str),
+                            )
+                            .groupby(["_tv", "_cat", "_tpv"], as_index=False)["Duracion_Viaje_hs"]
+                            .median()
+                            .rename(columns={"Duracion_Viaje_hs": "Ref_Seg_hs"})
+                        )
+                        v_ok_int["_tv"] = v_ok_int["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+                        v_ok_int["_cat"] = v_ok_int["Categoria"].fillna("Sin dato").astype(str)
+                        v_ok_int["_tpv"] = v_ok_int["Tipo_Viaje"].fillna("Sin dato").astype(str)
+                        v_ok_int = v_ok_int.merge(ref_v_all, on=["_tv", "_cat", "_tpv"], how="left")
+                        v_ok_int["Desvio_hs"] = (v_ok_int["Duracion_Viaje_hs"] - v_ok_int["Ref_Seg_hs"]).round(2)
+                        v_ok_int = v_ok_int.sort_values(["Fecha_Reparto", "Hora_Reparto"]).copy()
+                        v_ok_int["Fecha_Lbl"] = (
+                            v_ok_int["Fecha_Reparto"].dt.dayofweek.map(dias_es)
+                            + " "
+                            + v_ok_int["Fecha_Reparto"].dt.strftime("%d/%m")
+                            + " ("
+                            + v_ok_int["Ref_Clean"].astype(str)
+                            + ")"
+                        )
+
+                        fig_line_v = go.Figure()
+                        fig_line_v.add_trace(
+                            go.Bar(
+                                x=v_ok_int["Fecha_Lbl"],
+                                y=v_ok_int["Tiempo_CD_hs"],
+                                name="Estadía CD (hs)",
+                                marker_color="#64748b",
+                                hovertemplate="<b>%{x}</b><br>Estadía CD: <b>%{y:.2f} hs</b><extra></extra>",
+                            )
+                        )
+                        fig_line_v.add_trace(
+                            go.Bar(
+                                x=v_ok_int["Fecha_Lbl"],
+                                y=v_ok_int["Tiempo_Ruta_hs"],
+                                name="Tiempo en Viaje (hs)",
+                                marker_color="#1d4ed8",
+                                hovertemplate="<b>%{x}</b><br>Tiempo en Viaje: <b>%{y:.2f} hs</b><extra></extra>",
+                            )
+                        )
+                        fig_line_v.add_trace(
+                            go.Bar(
+                                x=v_ok_int["Fecha_Lbl"],
+                                y=v_ok_int["Tiempo_Tiendas_hs"],
+                                name="Estadía Tiendas (hs)",
+                                marker_color="#d97706",
+                                hovertemplate="<b>%{x}</b><br>Estadía Tiendas: <b>%{y:.2f} hs</b><extra></extra>",
+                            )
+                        )
+                        fig_line_v.add_trace(
+                            go.Scatter(
+                                x=v_ok_int["Fecha_Lbl"],
+                                y=v_ok_int["Ref_Seg_hs"],
+                                mode="lines+markers",
+                                name="Ref. Esperada Segmento (hs)",
+                                line=dict(color="#dc2626", width=2.2, dash="dot"),
+                                marker=dict(size=7, color="#dc2626"),
+                                customdata=np.dstack(
+                                    (
+                                        v_ok_int["Duracion_Viaje_hs"],
+                                        v_ok_int["Ref_Seg_hs"],
+                                        v_ok_int["Desvio_hs"],
+                                        v_ok_int["Tipo_Viaje"],
+                                        v_ok_int["Categoria"],
+                                        v_ok_int["KMS_Total"],
+                                    )
+                                )[0],
+                                hovertemplate=(
+                                    "<b>%{x}</b><br>"
+                                    "Segmento: <b>%{customdata[3]} · %{customdata[4]}</b> (%{customdata[5]:.0f} km)<br>"
+                                    "Duración Total: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)"
+                                    "<extra></extra>"
+                                ),
+                            )
+                        )
+                        fig_line_v.update_layout(
+                            barmode="stack",
+                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Desglose Cronológico de Viajes OK vs. Referencia del Segmento",
+                            height=380,
+                            margin=dict(l=20, r=20, t=42, b=20),
+                            yaxis=dict(title="Horas", range=[0, float(max_dur_v) + 1.0], dtick=2),
+                            xaxis=dict(tickangle=-35 if len(v_ok_int) > 10 else 0),
+                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                            hovermode="closest",
+                        )
+                        st.plotly_chart(fig_line_v, use_container_width=True)
+
+                        # Tabla cronológica detallada viaje por viaje
+                        tbl_v_int = v_ok_int[
+                            [
+                                "Fecha_Reparto",
+                                "Ref_Clean",
+                                "Tipo_Viaje",
+                                "Categoria",
+                                "Tiendas_Plan_Viaje",
+                                "KMS_Total",
+                                "Tiempo_CD_hs",
+                                "Tiempo_Ruta_hs",
+                                "Tiempo_Tiendas_hs",
+                                "Duracion_Viaje_hs",
+                                "Ref_Seg_hs",
+                                "Desvio_hs",
+                            ]
+                        ].copy()
+                        tbl_v_int["Fecha"] = tbl_v_int["Fecha_Reparto"].dt.strftime("%d/%m/%Y")
+                        tbl_v_int = tbl_v_int[
+                            [
+                                "Fecha",
+                                "Ref_Clean",
+                                "Tipo_Viaje",
+                                "Categoria",
+                                "Tiendas_Plan_Viaje",
+                                "KMS_Total",
+                                "Tiempo_CD_hs",
+                                "Tiempo_Ruta_hs",
+                                "Tiempo_Tiendas_hs",
+                                "Duracion_Viaje_hs",
+                                "Ref_Seg_hs",
+                                "Desvio_hs",
+                            ]
+                        ].rename(
+                            columns={
+                                "Ref_Clean": "Viaje",
+                                "Tipo_Viaje": "Tipo de Viaje",
+                                "Categoria": "Categoría",
+                                "Tiendas_Plan_Viaje": "Tiendas",
+                                "KMS_Total": "KMS",
+                                "Tiempo_CD_hs": "Estadía CD (hs)",
+                                "Tiempo_Ruta_hs": "Tiempo en Viaje (hs)",
+                                "Tiempo_Tiendas_hs": "Estadía Tiendas (hs)",
+                                "Duracion_Viaje_hs": "Total Viaje (hs)",
+                                "Ref_Seg_hs": "Ref. Segmento (hs)",
+                                "Desvio_hs": "Desvío (+/- hs)",
+                            }
+                        )
+                        st.dataframe(
+                            tbl_v_int,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Desvío (+/- hs)": st.column_config.NumberColumn("Desvío (+/- hs)", format="%+.2f hs"),
+                            },
+                        )
+
+                    elif metrica_int_s5.startswith("Jornadas Diarias") and not sub_j_int.empty and not jornadas_clean_s5.empty:
+                        ref_j_all = (
+                            jornadas_clean_s5.assign(
+                                _tv=jornadas_clean_s5["Tipo_Vehiculo"].fillna("Sin dato").astype(str),
+                                _cat=jornadas_clean_s5["Categoria_Jornada"].fillna("Sin dato").astype(str),
+                                _vlt=jornadas_clean_s5["Vueltas_Label"].fillna("Sin dato").astype(str),
+                            )
+                            .groupby(["_tv", "_cat", "_vlt"], as_index=False)["Duracion_Jornada_hs"]
+                            .median()
+                            .rename(columns={"Duracion_Jornada_hs": "Ref_Seg_hs"})
+                        )
+                        sub_j_int["_tv"] = sub_j_int["Tipo_Vehiculo"].fillna("Sin dato").astype(str)
+                        sub_j_int["_cat"] = sub_j_int["Categoria_Jornada"].fillna("Sin dato").astype(str)
+                        sub_j_int["_vlt"] = sub_j_int["Vueltas_Label"].fillna("Sin dato").astype(str)
+                        sub_j_int = sub_j_int.merge(ref_j_all, on=["_tv", "_cat", "_vlt"], how="left")
+                        sub_j_int["Desvio_hs"] = (sub_j_int["Duracion_Jornada_hs"] - sub_j_int["Ref_Seg_hs"]).round(2)
                         sub_j_int = sub_j_int.sort_values("Fecha_Reparto").copy()
                         sub_j_int["Fecha_Lbl"] = (
                             sub_j_int["Fecha_Reparto"].dt.dayofweek.map(dias_es)
                             + " "
                             + sub_j_int["Fecha_Reparto"].dt.strftime("%d/%m")
                         )
-                        med_u = float(sub_j_int["Duracion_Jornada_hs"].median())
+
                         fig_line_i = go.Figure()
                         fig_line_i.add_trace(
                             go.Scatter(
@@ -6029,6 +6496,17 @@ with tab5:
                                 name="Tendencia",
                                 showlegend=False,
                                 hoverinfo="skip",
+                            )
+                        )
+                        fig_line_i.add_trace(
+                            go.Scatter(
+                                x=sub_j_int["Fecha_Lbl"],
+                                y=sub_j_int["Ref_Seg_hs"],
+                                mode="lines+markers",
+                                name="Ref. Esperada Segmento (hs)",
+                                line=dict(color="#64748b", width=2.0, dash="dot"),
+                                marker=dict(size=6, color="#64748b"),
+                                hovertemplate="<b>%{x}</b><br>Ref. Segmento (Camión × Cat. × Vueltas): <b>%{y:.2f} hs</b><extra></extra>",
                             )
                         )
                         for vl_i, col_vl in [("1 Vuelta", "#1d4ed8"), ("2 Vueltas", "#d97706"), ("3+ Vueltas", "#dc2626")]:
@@ -6045,6 +6523,8 @@ with tab5:
                                     customdata=np.dstack(
                                         (
                                             sub_v_i["Duracion_Jornada_hs"],
+                                            sub_v_i["Ref_Seg_hs"],
+                                            sub_v_i["Desvio_hs"],
                                             sub_v_i["Vueltas_Label"],
                                             sub_v_i["Categoria_Jornada"],
                                             sub_v_i["KMS_Dia"],
@@ -6053,22 +6533,15 @@ with tab5:
                                     )[0],
                                     hovertemplate=(
                                         "<b>%{x}</b><br>"
-                                        "Duración Jornada: <b>%{customdata[0]:.1f} hs</b> (%{customdata[1]})<br>"
-                                        "Categoría: %{customdata[2]} | KMS Día: %{customdata[3]:.0f} km | Tiendas: %{customdata[4]:.0f}"
+                                        "Duración Jornada: <b>%{customdata[0]:.2f} hs</b> | Ref. Segmento: <b>%{customdata[1]:.2f} hs</b> (%{customdata[2]:+.2f} hs)<br>"
+                                        "Esquema: <b>%{customdata[3]} · %{customdata[4]}</b> | KMS Día: %{customdata[5]:.0f} km | Tiendas: %{customdata[6]:.0f}"
                                         "<extra></extra>"
                                     ),
                                 )
                             )
-                        fig_line_i.add_hline(
-                            y=med_u,
-                            line_dash="dot",
-                            line_color="#0f172a",
-                            annotation_text=f"Mediana Interno: {med_u:.1f} hs",
-                            annotation_position="top right",
-                        )
                         fig_line_i.update_layout(
-                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Evolución Diaria de Jornadas (hs)",
-                            height=370,
+                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Evolución Diaria de Jornadas vs. Referencia del Segmento",
+                            height=380,
                             margin=dict(l=20, r=20, t=42, b=20),
                             yaxis=dict(title="Duración de Jornada (horas)", range=[0, float(max_dur_j) + 1.0], dtick=2),
                             xaxis=dict(tickangle=-35 if len(sub_j_int) > 12 else 0),
@@ -6076,83 +6549,68 @@ with tab5:
                             hovermode="closest",
                         )
                         st.plotly_chart(fig_line_i, use_container_width=True)
-                    elif metrica_int_s5 == "Viajes OK (hs)" and not v_ok_int.empty:
-                        v_ok_int = v_ok_int.sort_values(["Fecha_Reparto", "Hora_Reparto"]).copy()
-                        v_ok_int["Fecha_Lbl"] = (
-                            v_ok_int["Fecha_Reparto"].dt.dayofweek.map(dias_es)
-                            + " "
-                            + v_ok_int["Fecha_Reparto"].dt.strftime("%d/%m")
-                            + " ("
-                            + v_ok_int["Ref_Clean"].astype(str)
-                            + ")"
+
+                        # Tabla cronológica detallada día por día
+                        tbl_j_int = sub_j_int.copy()
+                        tbl_j_int["Fecha"] = tbl_j_int["Fecha_Reparto"].dt.strftime("%d/%m/%Y")
+                        tbl_j_int["Inicio CD"] = pd.to_datetime(tbl_j_int["Inicio_Jornada"], errors="coerce").dt.strftime("%H:%M").fillna("")
+                        tbl_j_int["Fin Últ. Tienda"] = pd.to_datetime(tbl_j_int["Fin_Jornada"], errors="coerce").dt.strftime("%H:%M").fillna("")
+                        cols_j_tbl = [
+                            "Fecha",
+                            "Vueltas_Label",
+                            "Categoria_Jornada",
+                            "Inicio CD",
+                            "Fin Últ. Tienda",
+                            "Tiendas_Dia",
+                            "KMS_Dia",
+                            "Duracion_Jornada_hs",
+                            "Ref_Seg_hs",
+                            "Desvio_hs",
+                        ]
+                        if "Detalle_Viajes_Dia" in tbl_j_int.columns:
+                            cols_j_tbl.insert(3, "Detalle_Viajes_Dia")
+                        tbl_j_view = tbl_j_int[cols_j_tbl].rename(
+                            columns={
+                                "Vueltas_Label": "Vueltas",
+                                "Categoria_Jornada": "Categoría",
+                                "Detalle_Viajes_Dia": "Composición del Día",
+                                "Tiendas_Dia": "Tiendas",
+                                "KMS_Dia": "KMS Día",
+                                "Duracion_Jornada_hs": "Jornada (hs)",
+                                "Ref_Seg_hs": "Ref. Segmento (hs)",
+                                "Desvio_hs": "Desvío (+/- hs)",
+                            }
                         )
-                        med_uv = float(v_ok_int["Duracion_Viaje_hs"].median())
-                        fig_line_v = go.Figure()
-                        for cat_i, col_ci in [("Cercana", "#1d4ed8"), ("Lejana", "#d97706")]:
-                            sv_c = v_ok_int[v_ok_int["Categoria"] == cat_i]
-                            if sv_c.empty:
-                                continue
-                            fig_line_v.add_trace(
-                                go.Bar(
-                                    x=sv_c["Fecha_Lbl"],
-                                    y=sv_c["Duracion_Viaje_hs"],
-                                    name=cat_i,
-                                    marker_color=col_ci,
-                                    customdata=np.dstack(
-                                        (
-                                            sv_c["Duracion_Viaje_hs"],
-                                            sv_c["Tipo_Viaje"],
-                                            sv_c["KMS_Total"],
-                                            sv_c["Tiempo_CD_hs"],
-                                            sv_c["Tiempo_Ruta_hs"],
-                                            sv_c["Tiempo_Tiendas_hs"],
-                                        )
-                                    )[0],
-                                    hovertemplate=(
-                                        "<b>%{x}</b><br>"
-                                        "Duración Viaje: <b>%{customdata[0]:.1f} hs</b> (%{customdata[1]})<br>"
-                                        "CD: %{customdata[3]:.1f}h | Ruta: %{customdata[4]:.1f}h | Tiendas: %{customdata[5]:.1f}h | KMS: %{customdata[2]:.0f}"
-                                        "<extra></extra>"
-                                    ),
-                                )
-                            )
-                        fig_line_v.add_hline(
-                            y=med_uv,
-                            line_dash="dot",
-                            line_color="#0f172a",
-                            annotation_text=f"Mediana Viajes: {med_uv:.1f} hs",
-                            annotation_position="top right",
+                        st.dataframe(
+                            tbl_j_view,
+                            use_container_width=True,
+                            hide_index=True,
+                            column_config={
+                                "Desvío (+/- hs)": st.column_config.NumberColumn("Desvío (+/- hs)", format="%+.2f hs"),
+                            },
                         )
-                        fig_line_v.update_layout(
-                            title=f"{cd_titulo_int} · Interno {interno_sel_s5} — Detalle Cronológico de Viajes OK (hs)",
-                            height=370,
-                            margin=dict(l=20, r=20, t=42, b=20),
-                            yaxis=dict(title="Duración del Viaje (horas)", range=[0, float(max_dur_v) + 1.0], dtick=2),
-                            xaxis=dict(tickangle=-35 if len(v_ok_int) > 10 else 0),
-                            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                            hovermode="closest",
-                        )
-                        st.plotly_chart(fig_line_v, use_container_width=True)
                     else:
                         st.info(f"El Interno {interno_sel_s5} no tiene registros limpios en el modo activo para esta métrica.")
 
 
         _render_s5_interno_fragment()
 
-        # Descarga Excel de Viajes y Jornadas
-        v_clean_exp = viajes_ok_s5.copy()
-        v_clean_exp["Fecha Reparto"] = v_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-        j_clean_exp = jornadas_clean_s5.copy()
-        j_clean_exp["Fecha Reparto"] = j_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-        j_excl_exp = jornadas_excl_s5.copy()
-        j_excl_exp["Fecha Reparto"] = j_excl_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
-
-        vj_excel_bytes = build_viajes_jornadas_excel(df_v_res, df_j_res, v_clean_exp, j_clean_exp, j_excl_exp)
-        st.download_button(
-            label="📥 Descargar Análisis de Viajes y Jornadas (.xlsx)",
-            data=vj_excel_bytes,
-            file_name="Analisis_Viajes_y_Jornadas.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        # Descarga Excel de Viajes y Jornadas (bajo demanda para ahorrar RAM)
+        if st.button("⚙️ Preparar Excel de Viajes y Jornadas (.xlsx)", key="prep_xl_t5"):
+            v_clean_exp = viajes_ok_s5.copy()
+            v_clean_exp["Fecha Reparto"] = v_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+            j_clean_exp = jornadas_clean_s5.copy()
+            j_clean_exp["Fecha Reparto"] = j_clean_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+            j_excl_exp = jornadas_excl_s5.copy()
+            j_excl_exp["Fecha Reparto"] = j_excl_exp["Fecha_Reparto"].dt.strftime("%d/%m/%Y").fillna("")
+            st.session_state["_xl_t5_bytes"] = build_viajes_jornadas_excel(df_v_res, df_j_res, v_clean_exp, j_clean_exp, j_excl_exp)
+        if st.session_state.get("_xl_t5_bytes"):
+            st.download_button(
+                label="📥 Descargar Análisis de Viajes y Jornadas (.xlsx)",
+                data=st.session_state["_xl_t5_bytes"],
+                file_name="Analisis_Viajes_y_Jornadas.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                key="dl_xl_t5",
+            )
 
     _render_tab5_fragment()
