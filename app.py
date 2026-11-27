@@ -232,7 +232,7 @@ def _build_nomina_lookup(nomina_bytes: bytes | None) -> pd.DataFrame:
 
 
 @st.cache_data(max_entries=1, show_spinner="Procesando y conciliando bases AMREPA, UNIGIS y Nómina...")
-def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None, _schema_v: int = 3):
+def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes: bytes | None = None, _schema_v: int = 4):
     # 1. Lectura de archivos Excel
     df_a_raw = pd.read_excel(io.BytesIO(amrepa_bytes), sheet_name=0)
     xls_u = pd.ExcelFile(io.BytesIO(unigis_bytes))
@@ -862,6 +862,19 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
     del df_a_raw, df_u_raw, df_a, df_u, u_valid, u_invalid, u_clean_num, st_clean_default
     gc.collect()
 
+    meta_filters = {
+        "all_months": sorted([m for m in master_trips["Mes_Label"].unique() if m != "Sin fecha"]),
+        "weeks_map": (
+            master_trips[master_trips["Semana_Label"] != "Sin semana"][["Mes_Label", "Semana_Sort", "Semana_Label"]]
+            .drop_duplicates()
+            .sort_values("Semana_Sort")
+        ),
+        "min_date": master_trips["Fecha_Base"].dropna().min().date(),
+        "max_date": master_trips["Fecha_Base"].dropna().max().date(),
+        "all_ops": sorted(master_trips["Operacion"].dropna().unique().tolist()),
+        "all_trans": sorted(master_trips["Transportista"].dropna().unique().tolist()),
+    }
+
     return {
         "master_trips": master_trips,
         "dup_detail": dup_detail,
@@ -871,6 +884,7 @@ def load_and_process_data(amrepa_bytes: bytes, unigis_bytes: bytes, nomina_bytes
         "dq_cd_orig": dq_cd_orig,
         "dq_trips": dq_trips,
         "trips_pre_s5": trips_pre_s5,
+        "meta_filters": meta_filters,
     }
 
 
@@ -1602,7 +1616,7 @@ def _rank_internos_s4_cached(
     return agg_u[cols_out].sort_values("Demora Extra (min)", ascending=False).reset_index(drop=True)
 
 
-@st.cache_data(show_spinner=False, max_entries=2, ttl=600)
+@st.cache_data(show_spinner=False, max_entries=3, ttl=600)
 def _filter_all_datasets_cached(
     _data_dict: dict,
     d_start: pd.Timestamp,
@@ -1611,6 +1625,7 @@ def _filter_all_datasets_cached(
     selected_months_t: tuple,
     selected_weeks_t: tuple,
     selected_trans_t: tuple,
+    filter_ops_active: bool = True,
 ):
     master = _data_dict["master_trips"]
     dup_detail = _data_dict["dup_detail"]
@@ -1620,54 +1635,51 @@ def _filter_all_datasets_cached(
     dq_cd_orig = _data_dict["dq_cd_orig"]
     dq_trips = _data_dict["dq_trips"]
 
-    ops_list = list(selected_ops_t)
-    mask_base = (
-        (master["Fecha_Base"] >= d_start)
-        & (master["Fecha_Base"] <= d_end)
-        & (master["Operacion"].isin(ops_list))
-    )
+    ops_set = set(selected_ops_t)
+    mask_base = (master["Fecha_Base"] >= d_start) & (master["Fecha_Base"] <= d_end)
+    if filter_ops_active:
+        mask_base = mask_base & (master["Operacion"].isin(ops_set))
     if selected_months_t:
-        mask_base = mask_base & (master["Mes_Label"].isin(selected_months_t))
+        mask_base = mask_base & (master["Mes_Label"].isin(set(selected_months_t)))
     if selected_weeks_t:
-        mask_base = mask_base & (master["Semana_Label"].isin(selected_weeks_t))
-    df_filt = master[mask_base].copy()
+        mask_base = mask_base & (master["Semana_Label"].isin(set(selected_weeks_t)))
     if selected_trans_t:
-        df_filt = df_filt[df_filt["Transportista"].isin(selected_trans_t)].copy()
+        mask_base = mask_base & (master["Transportista"].isin(set(selected_trans_t)))
+    df_filt = master[mask_base]
 
-    mask_dup = (
-        (dup_detail["Fecha_Reparto"] >= d_start)
-        & (dup_detail["Fecha_Reparto"] <= d_end)
-        & (dup_detail["Operacion"].isin(ops_list))
-    )
-    mask_inv = (
-        (invalid_detail["Fecha_Reparto"] >= d_start)
-        & (invalid_detail["Fecha_Reparto"] <= d_end)
-        & (invalid_detail["Operacion"].isin(ops_list))
-    )
+    mask_dup = (dup_detail["Fecha_Reparto"] >= d_start) & (dup_detail["Fecha_Reparto"] <= d_end)
+    mask_inv = (invalid_detail["Fecha_Reparto"] >= d_start) & (invalid_detail["Fecha_Reparto"] <= d_end)
+    if filter_ops_active:
+        mask_dup = mask_dup & (dup_detail["Operacion"].isin(ops_set))
+        mask_inv = mask_inv & (invalid_detail["Operacion"].isin(ops_set))
     if selected_months_t:
-        mask_dup = mask_dup & (dup_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(selected_months_t))
-        mask_inv = mask_inv & (invalid_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(selected_months_t))
+        m_set = set(selected_months_t)
+        mask_dup = mask_dup & (dup_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(m_set))
+        mask_inv = mask_inv & (invalid_detail["Fecha_Reparto"].dt.strftime("%Y-%m").isin(m_set))
     if selected_weeks_t:
+        w_set = set(selected_weeks_t)
         dup_sem = "Sem " + dup_detail["Fecha_Reparto"].dt.to_period("W").dt.start_time.dt.strftime("%d/%m")
         inv_sem = "Sem " + invalid_detail["Fecha_Reparto"].dt.to_period("W").dt.start_time.dt.strftime("%d/%m")
-        mask_dup = mask_dup & (dup_sem.isin(selected_weeks_t))
-        mask_inv = mask_inv & (inv_sem.isin(selected_weeks_t))
-    dup_filt = dup_detail[mask_dup].copy()
-    inv_filt = invalid_detail[mask_inv].copy()
+        mask_dup = mask_dup & (dup_sem.isin(w_set))
+        mask_inv = mask_inv & (inv_sem.isin(w_set))
+    dup_filt = dup_detail[mask_dup]
+    inv_filt = invalid_detail[mask_inv]
+
+    m_set_sub = set(selected_months_t) if selected_months_t else None
+    w_set_sub = set(selected_weeks_t) if selected_weeks_t else None
+    t_set_sub = set(selected_trans_t) if selected_trans_t else None
 
     def _f_sub(df_in: pd.DataFrame) -> pd.DataFrame:
-        m = (
-            (df_in["Fecha_Reparto"] >= d_start)
-            & (df_in["Fecha_Reparto"] <= d_end)
-            & (df_in["Operacion"].isin(ops_list))
-        )
-        if selected_months_t:
-            m = m & (df_in["Mes_Label"].isin(selected_months_t))
-        if selected_weeks_t:
-            m = m & (df_in["Semana_Label"].isin(selected_weeks_t))
-        if selected_trans_t:
-            m = m & (df_in["Transportista"].isin(selected_trans_t))
-        return df_in[m].copy()
+        m = (df_in["Fecha_Reparto"] >= d_start) & (df_in["Fecha_Reparto"] <= d_end)
+        if filter_ops_active:
+            m = m & (df_in["Operacion"].isin(ops_set))
+        if m_set_sub is not None:
+            m = m & (df_in["Mes_Label"].isin(m_set_sub))
+        if w_set_sub is not None:
+            m = m & (df_in["Semana_Label"].isin(w_set_sub))
+        if t_set_sub is not None:
+            m = m & (df_in["Transportista"].isin(t_set_sub))
+        return df_in[m]
 
     return (
         df_filt,
@@ -1957,68 +1969,72 @@ data = load_and_process_data(amrepa_bytes, unigis_bytes, nomina_bytes)
 master = data["master_trips"]
 
 # -----------------------------------------------------------------------------
-# SIDEBAR: FILTROS GLOBALES ARRIBA (ACTUALIZAN TODAS LAS TABLAS Y GRAFICOS)
+# SIDEBAR: FILTROS GLOBALES EN FORMULARIO POR LOTE (CERO RECARGAS INTERMEDIAS)
 # -----------------------------------------------------------------------------
 st.sidebar.header("🔎 Filtros Globales")
 
-# 1. Filtro por Mes
-all_months = sorted([m for m in master["Mes_Label"].unique() if m != "Sin fecha"])
-selected_months = st.sidebar.multiselect(
-    "Mes",
-    options=all_months,
-    default=[],
-    placeholder="Todos los meses",
-)
+meta_f = data.get("meta_filters")
+if meta_f is not None:
+    all_months = meta_f["all_months"]
+    weeks_map_df = meta_f["weeks_map"]
+    min_date = meta_f["min_date"]
+    max_date = meta_f["max_date"]
+    all_ops = meta_f["all_ops"]
+    all_trans = meta_f["all_trans"]
+else:
+    all_months = sorted([m for m in master["Mes_Label"].unique() if m != "Sin fecha"])
+    weeks_map_df = (
+        master[master["Semana_Label"] != "Sin semana"][["Mes_Label", "Semana_Sort", "Semana_Label"]]
+        .drop_duplicates()
+        .sort_values("Semana_Sort")
+    )
+    min_date = master["Fecha_Base"].dropna().min().date()
+    max_date = master["Fecha_Base"].dropna().max().date()
+    all_ops = sorted(master["Operacion"].dropna().unique().tolist())
+    all_trans = sorted(master["Transportista"].dropna().unique().tolist())
 
-# 2. Filtro por Semana (dinamico segun mes seleccionado)
-df_for_weeks = master[master["Mes_Label"].isin(selected_months)] if selected_months else master
-weeks_df = (
-    df_for_weeks[df_for_weeks["Semana_Label"] != "Sin semana"][["Semana_Sort", "Semana_Label"]]
-    .drop_duplicates()
-    .sort_values("Semana_Sort")
-)
-all_weeks = weeks_df["Semana_Label"].tolist()
-selected_weeks = st.sidebar.multiselect(
-    "Semana",
-    options=all_weeks,
-    default=[],
-    placeholder="Todas las semanas",
-)
+all_weeks = weeks_map_df["Semana_Label"].drop_duplicates().tolist()
 
-# 3. Filtro por Rango de Fechas
-min_date = master["Fecha_Base"].dropna().min().date()
-max_date = master["Fecha_Base"].dropna().max().date()
-
-date_range = st.sidebar.date_input(
-    "Rango Fecha Reparto",
-    value=(min_date, max_date),
-    min_value=min_date,
-    max_value=max_date,
-)
+with st.sidebar.form("form_filtros_globales", border=False):
+    selected_months = st.multiselect(
+        "Mes",
+        options=all_months,
+        default=[],
+        placeholder="Todos los meses",
+    )
+    selected_weeks = st.multiselect(
+        "Semana",
+        options=all_weeks,
+        default=[],
+        placeholder="Todas las semanas",
+    )
+    date_range = st.date_input(
+        "Rango Fecha Reparto",
+        value=(min_date, max_date),
+        min_value=min_date,
+        max_value=max_date,
+    )
+    selected_ops_raw = st.multiselect(
+        "Operación (CD)",
+        options=all_ops,
+        default=[],
+        placeholder="Todos los CDs",
+    )
+    selected_trans = st.multiselect(
+        "Transportista (opcional)",
+        options=all_trans,
+        default=[],
+        placeholder="Todos los transportistas",
+    )
+    st.form_submit_button("✅ Aplicar Filtros", use_container_width=True)
 
 if isinstance(date_range, tuple) and len(date_range) == 2:
     d_start, d_end = pd.to_datetime(date_range[0]), pd.to_datetime(date_range[1])
 else:
     d_start = d_end = pd.to_datetime(date_range)
 
-# 4. Filtro por Operacion (CD) — vacio = todos los CDs (permite elegir 1 puntual rapido)
-all_ops = sorted(master["Operacion"].dropna().unique().tolist())
-selected_ops_raw = st.sidebar.multiselect(
-    "Operación (CD)",
-    options=all_ops,
-    default=[],
-    placeholder="Todos los CDs",
-)
-selected_ops = selected_ops_raw if selected_ops_raw else all_ops
-
-# 5. Filtro por Transportista
-all_trans = sorted(master["Transportista"].dropna().unique().tolist())
-selected_trans = st.sidebar.multiselect(
-    "Transportista (opcional)",
-    options=all_trans,
-    default=[],
-    placeholder="Todos los transportistas",
-)
+filter_ops_active = bool(selected_ops_raw) and (len(selected_ops_raw) < len(all_ops))
+selected_ops = selected_ops_raw if filter_ops_active else all_ops
 
 (
     df_filt,
@@ -2037,6 +2053,7 @@ selected_trans = st.sidebar.multiselect(
     tuple(selected_months),
     tuple(selected_weeks),
     tuple(selected_trans),
+    filter_ops_active=filter_ops_active,
 )
 
 # Seccion colapsada al final del sidebar para carga manual / info de base
@@ -4340,7 +4357,12 @@ with tab3:
                 col_top_hi, col_top_lo = st.columns(2)
 
                 with col_top_hi:
-                    top_hi = valid_metric_df.head(int(top_n_rk)).iloc[::-1].copy()
+                    src_hi_t3 = (
+                        valid_metric_df[valid_metric_df["Demora Extra (min)"] > 0]
+                        if metric_col == "Demora Extra (min)"
+                        else valid_metric_df
+                    )
+                    top_hi = src_hi_t3.head(int(top_n_rk)).iloc[::-1].copy()
                     colors_hi = [
                         "#dc2626" if v >= 30 else ("#f59e0b" if v > 0 else "#16a34a")
                         for v in top_hi["Demora Extra (min)"]
@@ -4389,7 +4411,12 @@ with tab3:
                     st.plotly_chart(fig_hi, use_container_width=True)
 
                 with col_top_lo:
-                    top_lo = valid_metric_df.tail(int(top_n_rk)).copy()
+                    src_lo_t3 = (
+                        valid_metric_df[valid_metric_df["Demora Extra (min)"] < 0]
+                        if metric_col == "Demora Extra (min)"
+                        else valid_metric_df
+                    )
+                    top_lo = src_lo_t3.tail(int(top_n_rk)).copy()
                     top_lo = top_lo.sort_values(metric_col, ascending=False)
                     colors_lo = [
                         "#16a34a" if v <= 0 else ("#3b82f6" if v < 15 else "#f59e0b")
@@ -4435,7 +4462,7 @@ with tab3:
                         margin=dict(l=10, r=55, t=40, b=20),
                         xaxis_title=metric_lbl,
                         yaxis_title="",
-                        xaxis=dict(range=[min_lo * 1.26 if min_lo < 0 else 0.0, max(10.0, max_lo * 1.24)]),
+                        xaxis=dict(range=[min_lo * 1.42 if min_lo < 0 else 0.0, max(5.0, max_lo * 1.24)]),
                     )
                     st.plotly_chart(fig_lo, use_container_width=True)
 
@@ -5043,7 +5070,12 @@ with tab4:
                 col_int_hi, col_int_lo = st.columns(2)
 
                 with col_int_hi:
-                    top_int_hi = valid_int_df.head(int(top_n_int)).iloc[::-1].copy()
+                    src_hi_t4 = (
+                        valid_int_df[valid_int_df["Demora Extra (min)"] > 0]
+                        if m_col_i == "Demora Extra (min)"
+                        else valid_int_df
+                    )
+                    top_int_hi = src_hi_t4.head(int(top_n_int)).iloc[::-1].copy()
                     c_int_hi = [
                         "#1d4ed8"
                         if m_col_i == "Vel. Entre Paradas (km/h)"
@@ -5103,7 +5135,12 @@ with tab4:
                     st.plotly_chart(fig_int_hi, use_container_width=True)
 
                 with col_int_lo:
-                    top_int_lo = valid_int_df.tail(int(top_n_int)).copy()
+                    src_lo_t4 = (
+                        valid_int_df[valid_int_df["Demora Extra (min)"] < 0]
+                        if m_col_i == "Demora Extra (min)"
+                        else valid_int_df
+                    )
+                    top_int_lo = src_lo_t4.tail(int(top_n_int)).copy()
                     top_int_lo = top_int_lo.sort_values(m_col_i, ascending=False)
                     c_int_lo = [
                         "#f59e0b"
@@ -5160,7 +5197,7 @@ with tab4:
                         margin=dict(l=10, r=55, t=40, b=20),
                         xaxis_title=m_lbl_i,
                         yaxis_title="",
-                        xaxis=dict(range=[min_i_lo * 1.26 if min_i_lo < 0 else 0.0, max(10.0, max_i_lo * 1.24)]),
+                        xaxis=dict(range=[min_i_lo * 1.42 if min_i_lo < 0 else 0.0, max(5.0, max_i_lo * 1.24)]),
                     )
                     st.plotly_chart(fig_int_lo, use_container_width=True)
 
@@ -5922,7 +5959,12 @@ with tab5:
 
                             cv_hi, cv_lo = st.columns(2)
                             with cv_hi:
-                                top_v_hi = agg_vi.head(int(top_n_v)).iloc[::-1].copy()
+                                src_v_hi = (
+                                    agg_vi[agg_vi["Demora_Extra_hs"] > 0]
+                                    if m_col_v == "Demora_Extra_hs"
+                                    else agg_vi
+                                )
+                                top_v_hi = src_v_hi.head(int(top_n_v)).iloc[::-1].copy()
                                 col_vhi = [
                                     "#dc2626" if v >= 1.0 else ("#f59e0b" if v > 0 else "#16a34a")
                                     for v in top_v_hi["Demora_Extra_hs"]
@@ -5973,7 +6015,12 @@ with tab5:
                                 st.plotly_chart(fig_vhi, use_container_width=True)
 
                             with cv_lo:
-                                top_v_lo = agg_vi.tail(int(top_n_v)).copy().sort_values(m_col_v, ascending=False)
+                                src_v_lo = (
+                                    agg_vi[agg_vi["Demora_Extra_hs"] < 0]
+                                    if m_col_v == "Demora_Extra_hs"
+                                    else agg_vi
+                                )
+                                top_v_lo = src_v_lo.tail(int(top_n_v)).copy().sort_values(m_col_v, ascending=False)
                                 col_vlo = [
                                     "#16a34a" if v <= 0 else ("#3b82f6" if v <= 0.5 else "#f59e0b")
                                     for v in top_v_lo["Demora_Extra_hs"]
@@ -6020,7 +6067,7 @@ with tab5:
                                     margin=dict(l=10, r=55, t=40, b=20),
                                     xaxis_title=m_lbl_v,
                                     yaxis_title="",
-                                    xaxis=dict(range=[min_vl * 1.28 if min_vl < 0 else 0.0, max(0.5, max_vl * 1.25)]),
+                                    xaxis=dict(range=[min_vl * 1.45 if min_vl < 0 else 0.0, 0.15 if (m_col_v == 'Demora_Extra_hs' and max_vl <= 0) else max(0.5, max_vl * 1.25)]),
                                 )
                                 st.plotly_chart(fig_vlo, use_container_width=True)
                         else:
@@ -6139,7 +6186,12 @@ with tab5:
 
                             c_jhi, c_jlo = st.columns(2)
                             with c_jhi:
-                                top_j_hi = agg_ji.head(int(top_n_j)).iloc[::-1].copy()
+                                src_j_hi = (
+                                    agg_ji[agg_ji["Demora_Extra_hs"] > 0]
+                                    if m_col_j == "Demora_Extra_hs"
+                                    else agg_ji
+                                )
+                                top_j_hi = src_j_hi.head(int(top_n_j)).iloc[::-1].copy()
                                 col_jhi = [
                                     "#dc2626" if v >= 1.2 else ("#f59e0b" if v > 0 else "#16a34a")
                                     for v in top_j_hi["Demora_Extra_hs"]
@@ -6189,7 +6241,12 @@ with tab5:
                                 st.plotly_chart(fig_jhi, use_container_width=True)
 
                             with c_jlo:
-                                top_j_lo = agg_ji.tail(int(top_n_j)).copy().sort_values(m_col_j, ascending=False)
+                                src_j_lo = (
+                                    agg_ji[agg_ji["Demora_Extra_hs"] < 0]
+                                    if m_col_j == "Demora_Extra_hs"
+                                    else agg_ji
+                                )
+                                top_j_lo = src_j_lo.tail(int(top_n_j)).copy().sort_values(m_col_j, ascending=False)
                                 col_jlo = [
                                     "#16a34a" if v <= 0 else ("#3b82f6" if v <= 0.5 else "#f59e0b")
                                     for v in top_j_lo["Demora_Extra_hs"]
@@ -6235,7 +6292,7 @@ with tab5:
                                     margin=dict(l=10, r=55, t=40, b=20),
                                     xaxis_title=m_lbl_j,
                                     yaxis_title="",
-                                    xaxis=dict(range=[min_jl * 1.28 if min_jl < 0 else 0.0, max(0.5, max_jl * 1.25)]),
+                                    xaxis=dict(range=[min_jl * 1.45 if min_jl < 0 else 0.0, 0.15 if (m_col_j == 'Demora_Extra_hs' and max_jl <= 0) else max(0.5, max_jl * 1.25)]),
                                 )
                                 st.plotly_chart(fig_jlo, use_container_width=True)
                         else:
