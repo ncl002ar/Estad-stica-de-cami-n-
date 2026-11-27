@@ -789,10 +789,9 @@ def _add_clean_box_traces(
     group_name: str = "",
     show_legend: bool = False,
 ):
-    """Dibuja cajas limpias donde al apoyar el mouse sobre la caja se despliegan juntas
-    las 6 medidas exactas en español (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
+    """Dibuja cajas limpias con 1 sola leyenda por medida al apoyar el mouse (Bigote Máximo, Q3, Media, Mediana, Q1, Bigote Mínimo)
     sin repetir el nombre del segmento ni N."""
-    def _build_card_text(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float) -> str:
+    def _build_card(hi_w: float, q3_v: float, mean_v: float, med_v: float, q1_v: float, lo_w: float) -> str:
         header = f"<b>{group_name}</b><br>" if (show_legend and group_name) else ""
         return (
             f"{header}"
@@ -826,7 +825,7 @@ def _add_clean_box_traces(
             q3_l.append(round(q3_v, 1))
             uf_l.append(round(hi_w, 1))
             mean_l.append(round(mean_v, 1))
-            cards_l.append(_build_card_text(hi_w, q3_v, mean_v, med_v, q1_v, lo_w))
+            cards_l.append(_build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w))
 
         if not x_valid:
             return
@@ -844,14 +843,26 @@ def _add_clean_box_traces(
                 legendgroup=group_name,
                 showlegend=True,
                 marker_color=col_hex,
+                hoverinfo="skip",
+            )
+        )
+        # Puntos invisibles centrados en cada caja agrupada (offsetgroup=group_name) para desplegar 1 sola tarjeta limpia
+        fig.add_trace(
+            go.Scatter(
+                x=x_valid,
+                y=med_l,
+                mode="markers",
+                marker=dict(size=24, color=col_hex, opacity=0),
+                name=group_name,
+                legendgroup=group_name,
+                showlegend=False,
                 customdata=cards_l,
                 hovertemplate="%{customdata}<extra></extra>",
-                hoveron="boxes",
             )
         )
         return
 
-    # Caso sin sub-corte (1 caja por posición X, cada una con su color)
+    # Caso sin sub-corte (1 caja por posición X)
     for idx_b, (x_lbl, vals) in enumerate(zip(x_labels, series_list)):
         s = vals.dropna()
         if len(s) == 0:
@@ -867,7 +878,7 @@ def _add_clean_box_traces(
             hi_w = float(s.max())
 
         col_hex = colors[idx_b % len(colors)]
-        card_txt = _build_card_text(hi_w, q3_v, mean_v, med_v, q1_v, lo_w)
+        card_txt = _build_card(hi_w, q3_v, mean_v, med_v, q1_v, lo_w)
         fig.add_trace(
             go.Box(
                 x=[x_lbl],
@@ -881,9 +892,28 @@ def _add_clean_box_traces(
                 name="",
                 showlegend=False,
                 marker_color=col_hex,
-                customdata=[card_txt],
+                hoverinfo="skip",
+            )
+        )
+        # 5 puntos invisibles distribuidos a lo largo de toda la altura de la caja (de lo_w a hi_w)
+        # para que apoyando el mouse en CUALQUIER parte de la caja salga 1 sola tarjeta con todas las medidas
+        y_anchors = [
+            round(lo_w, 1),
+            round(q1_v, 1),
+            round(med_v, 1),
+            round(q3_v, 1),
+            round(hi_w, 1),
+        ]
+        fig.add_trace(
+            go.Scatter(
+                x=[x_lbl] * 5,
+                y=y_anchors,
+                mode="markers",
+                marker=dict(size=28, color=col_hex, opacity=0),
+                name="",
+                showlegend=False,
+                customdata=[card_txt] * 5,
                 hovertemplate="%{customdata}<extra></extra>",
-                hoveron="boxes",
             )
         )
 
